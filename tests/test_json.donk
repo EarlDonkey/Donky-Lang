@@ -1,7 +1,14 @@
 import "lib/json.donk";
 
-let obj = json_parse("{\"a\":1,\"b\":[true,false,null],\"c\":\"hi\"}");
-print(obj["a"]);
-print(obj["c"]);
-print(json_stringify({"x": 1, "y": "z"}));
-print(json_stringify([1, 2, 3]));
+fn main() {
+    let json_str = "{\"name\": \"Buddy\", \"age\": 3, \"good_boy\": true, \"skills\": [\"sit\", \"stay\"]}";
+    
+    let dog = json_parse(json_str);
+    
+    print("Name: " + dog["name"]);
+    print("Age: " + str(dog["age"]));
+    print("Good boy: " + str(dog["good_boy"]));
+    print("First skill: " + dog["skills"][0]);
+}
+
+main();

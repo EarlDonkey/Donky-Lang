@@ -1,190 +1,796 @@
-# Donky Programming Language
+# The Donky Programming Language Reference Manual
 
-**Donky** is a high-performance, lightweight, dynamically typed scripting language built in Rust. It features a versatile execution architecture capable of tree-walk interpretation, stack-based bytecode VM execution, Cranelift JIT compilation, and Ahead-Of-Time (AOT) compilation into standalone native executables (`.exe`).
-
----
-
-## Key Highlights & Features
-
-### 🚀 Execution Engines
-- **Tree-Walker Interpreter**: Instant script execution ideal for rapid prototyping and interactive REPL sessions.
-- **Bytecode VM**: Fast stack-based virtual machine with binary bytecode serialization (`.bc`) and a multi-pass peephole optimizer.
-- **Cranelift JIT Compiler**: Just-In-Time native code compilation for high-performance in-memory execution (`build-native`).
-- **AOT Native Compiler**: Compiles `.donk` source code down to native object files (`.obj`) and links them with a low-overhead C runtime via GCC into standalone Windows executables (`build-exe`).
-
-### 🧮 Data Representation & Garbage Collection
-- **64-bit NaN Boxing**: All primitive types, object pointers, string indices, and booleans are encoded into NaN-boxed `u64` values.
-- **Mark-and-Sweep Garbage Collector**: Built-in precise/stack-scanning memory management with automatic collection cycles.
-
-### 🎨 Native Win32 GUI Subsystem
-- **Double-Buffered Graphics Engine**: Render vector shapes (`gui_draw_rect`), text (`gui_draw_text`), and custom UI frames without flicker.
-- **Native Windows Controls**: Instantiate native buttons (`gui_add_button`), labels (`gui_add_label`), update text dynamically (`gui_update_text`), and handle click event loops (`gui_get_clicked`).
-- **WebView Integration**: Embedded web UI launcher (`gui_webview`) for hybrid web/desktop apps.
-
-### 📊 System Telemetry & Process Management
-- Query host CPU usage percentage (`cpu_usage`), active CPU cores (`cpu_cores`), and system uptime (`uptime`).
-- Inspect process tables (`get_processes`), inspect memory usage (`total_mem`, `used_mem`), disk space (`disk_info`), and terminate processes (`kill_process`).
-
-### 🌐 Concurrency & Networking
-- **TCP Sockets**: Non-blocking/blocking TCP server listening (`tcp_listen`), client connection accepting (`tcp_accept`), reading (`tcp_read`), writing (`tcp_write`), and socket closing (`tcp_close`).
-- **HTTP Client**: Built-in HTTP GET requests (`http_get`) powered by WinHTTP.
-- **Multithreading**: Spawn concurrent background threads (`spawn`) with synchronized execution locks.
+**Version:** 1.0.0  
+**Author:** EarlDonkey  
+**Repository:** https://github.com/EarlDonkey/Donky-Lang  
+**License:** MIT License  
 
 ---
 
-## Command Line Interface (CLI)
+## Table of Contents
+
+1. [Overview and Core Philosophy](#1-overview-and-core-philosophy)
+2. [Installation and Tooling](#2-installation-and-tooling)
+3. [Execution Architectures](#3-execution-architectures)
+4. [Lexical Structure](#4-lexical-structure)
+5. [Variables, Types, and Values](#5-variables-types-and-values)
+6. [Operators and Expression Precedence](#6-operators-and-expression-precedence)
+7. [Control Flow and Pattern Matching](#7-control-flow-and-pattern-matching)
+8. [Functions, Methods, and Closures](#8-functions-methods-and-closures)
+9. [Data Structures](#9-data-structures)
+10. [Native Win32 GUI and WebView Subsystem](#10-native-win32-gui-and-webview-subsystem)
+11. [System Telemetry and Process Management](#11-system-telemetry-and-process-management)
+12. [Networking, Sockets, and Concurrency](#12-networking-sockets-and-concurrency)
+13. [Error Handling](#13-error-handling)
+14. [Modules and Package Management](#14-modules-and-package-management)
+15. [Compiler Architecture and Optimizations](#15-compiler-architecture-and-optimizations)
+16. [Standard Library Reference](#16-standard-library-reference)
+17. [Appendix A: Complete EBNF Grammar](#17-appendix-a-complete-ebnf-grammar)
+18. [Appendix B: Bytecode Opcode Reference](#18-appendix-b-bytecode-opcode-reference)
+19. [Appendix C: Memory Architecture and NaN-Boxing Specs](#19-appendix-c-memory-architecture-and-nan-boxing-specs)
+20. [Appendix D: Technical Roadmap and Limitations](#20-appendix-d-technical-roadmap-and-limitations)
+
+---
+
+## 1. Overview and Core Philosophy
+
+Donky is a lightweight, dynamically typed scripting language implemented in Rust. It provides a multi-tiered execution pipeline ranging from instant tree-walk interpretation to high-performance stack VM bytecode execution, Cranelift JIT compilation, and native binary code generation (AOT compilation into standalone `.exe` binaries).
+
+### Design Principles
+
+- **Explicit Type Behavior:** Evaluated conditions require strict `bool` values. Truthy and falsy automatic conversions are omitted to avoid unexpected evaluation bugs.
+- **System & Network Native:** Built-in Win32 GUI controls, raw TCP sockets, HTTP clients, and host telemetry are built directly into the runtime standard library.
+- **Zero External Dependencies Executables:** AOT binary target output links C runtime primitives into standalone native Windows executables without requiring a host runtime or interpreter.
+- **Layered Execution Flexibility:** Developers can iterate instantly using the tree-walking REPL, run production scripts on the optimized VM, or compile performant background tasks down to machine code.
+
+---
+
+## 2. Installation and Tooling
+
+### CLI Utility Usage
+
+The main `donky-native` executable provides a unified command line interface for executing, building, profiling, and testing scripts.
 
 ```bash
-# Execute scripts via the Tree-Walker Interpreter
+# Direct Tree-Walker Execution
 donky-native <file.donk> [args...]
 
-# Run source or pre-compiled binary bytecode on the VM
+# Virtual Machine Bytecode Execution (Source or Pre-compiled .bc)
 donky-native run <file.donk | file.bc> [args...]
 
-# Compile source to optimized binary bytecode (.bc)
+# Compile Source Code into Optimized Binary Bytecode (.bc)
 donky-native build <file.donk>
 
-# JIT-compile and execute natively using Cranelift
+# In-Memory Cranelift JIT Compilation and Execution
 donky-native build-native <file.donk>
 
-# AOT-compile into a standalone Windows executable (.exe)
+# AOT Native Compilation to Standalone Executable (.exe)
 donky-native build-exe <file.donk>
 
-# Run test runner over a directory or file
-donky-native test [dir | file]
-
-# Benchmark execution speed across test suites
-donky-native bench [dir]
-
-# Profile VM execution and output stack traces
-donky-native profile <file.donk>
-
-# Interactive REPL session
+# Interactive REPL Session
 donky-native repl
 
-# Package Management
+# Run Integrated Test Suites over a Directory or File
+donky-native test [directory | file]
+
+# Benchmark Script Performance across Test Cases
+donky-native bench [directory]
+
+# Profile Virtual Machine Instruction Execution Counts
+donky-native profile <file.donk>
+
+# Dependency Management
 donky-native install
-donky-native add <name> <url|path>
+donky-native add <package_name> <url_or_path>
+```
+
+### The Interactive REPL
+
+Launching `donky-native repl` opens an interactive context that evaluates statements line-by-line while maintaining top-level bindings.
+
+```text
+donky> let base = 50;
+donky> fn add_base(n) { return base + n; }
+donky> add_base(25)
+75
+donky> :quit
 ```
 
 ---
 
-## Language Syntax & Code Examples
+## 3. Execution Architectures
 
-### 1. Variables, Control Flow & String Interpolation
+Donky provides four distinct execution pathways:
+
+1. **Tree-Walker Interpreter:** Directly walks the AST generated by the Pratt parser. Ideal for REPL evaluation, rapid prototyping, and quick debugging passes.
+2. **Stack-Based Virtual Machine (VM):** Compiles AST nodes into sequential register-less bytecode instructions (`.bc`). Includes a multi-pass peephole optimizer that fuses common operation pairs.
+3. **Cranelift JIT Compiler:** Translates bytecode and AST representations into Cranelift IR at runtime, compiling directly to native x86_64 machine instructions in memory.
+4. **Ahead-of-Time (AOT) Native Build Pipeline:** Emits native `.obj` files using Cranelift codegen, resolves closure call frames, executes static Dead Code Elimination (DCE), and links with MinGW GCC against Windows system libraries (`ws2_32`, `psapi`, `winhttp`, `gdi32`, `ole32`, `shell32`).
+
+---
+
+## 4. Lexical Structure
+
+### Comments
+
+Single-line comments begin with `//` and continue until the end of the line. Block comments begin with `/*` and terminate with `*/`.
+
 ```donky
-let name = "Donky";
-let version = 1.0;
+// This is a single-line comment
+let count = 1; /* This is an inline block comment */
+```
 
-if version >= 1.0 {
-    print("Welcome to ${name} v${version}!");
+### Identifiers
+
+Identifiers begin with an ASCII letter (`a-z`, `A-Z`) or an underscore (`_`), followed by any combination of letters, digits (`0-9`), or underscores.
+
+```donky
+let _private_value = 100;
+let totalCount2 = 200;
+```
+
+### Reserved Keywords
+
+The following identifiers are reserved keywords and cannot be used as variable or function names:
+
+```text
+let       fn        if        else      while     for       in        return
+print     true      false     div       break     continue  try       catch
+throw     import    struct    match     spawn     null
+```
+
+### Literal Representations
+
+- **Integer Literals:** `42`, `-105`, `0`
+- **Floating-Point Literals:** `3.14159`, `-0.001`
+- **String Literals:** `"Hello World"`, `"Escaped \n line break"`
+- **Boolean Literals:** `true`, `false`
+- **Array Literals:** `[1, 2, 3]`, `["a", "b", "c"]`
+- **Map Literals:** `{"key": "value", "count": 10}`
+
+### String Interpolation
+
+Expressions inside string literals enclosed in `${expression}` are dynamically converted to strings and concatenated.
+
+```donky
+let user = "Alice";
+let score = 95;
+print("Player ${user} scored ${score} points.");
+```
+
+---
+
+## 5. Variables, Types, and Values
+
+Donky uses dynamic typing at runtime backed by a 64-bit NaN-boxed representation. Static type signatures can optionally be declared on function parameters and struct fields to enforce compile-time verification.
+
+### Core Type Matrix
+
+| Type Identifier | Description | Example |
+| :--- | :--- | :--- |
+| `num` | Double-precision floating point or integer | `42`, `3.14` |
+| `str` | UTF-8 encoded string sequence | `"Donky"` |
+| `bool` | Boolean logical flag | `true`, `false` |
+| `array` | Dynamically resizable array list | `[10, 20, 30]` |
+| `map` | Hash map key-value store | `{"a": 1}` |
+| `struct` | Named composite record type | `Point { x: 1, y: 2 }` |
+| `function` | First-class function or closure | `fn(x) { return x * 2; }` |
+| `null` | Representational absence of value | `null` |
+
+### Variable Bindings
+
+Variables are declared using the `let` keyword. Reassignment is performed using the `=` operator.
+
+```donky
+let value = 10;
+value = 20; // Reassigned
+```
+
+---
+
+## 6. Operators and Expression Precedence
+
+### Arithmetic Operators
+
+| Operator | Operation | Behavior |
+| :--- | :--- | :--- |
+| `+` | Addition / Concatenation | Numeric addition or string joining |
+| `-` | Subtraction | Numeric subtraction |
+| `*` | Multiplication | Numeric multiplication |
+| `/` | Floating-Point Division | Returns double-precision float |
+| `div` | Truncating Integer Division | Truncates fractional remainder toward zero |
+| `%` | Modulo / Remainder | Integer remainder calculation |
+
+### Comparison Operators
+
+`==` (Equal), `!=` (Not Equal), `<` (Less Than), `<=` (Less Than or Equal), `>` (Greater Than), `>=` (Greater Than or Equal).
+
+### Logical Operators
+
+- `&&`: Short-circuiting Logical AND (Operands must be `bool`).
+- `||`: Short-circuiting Logical OR (Operands must be `bool`).
+- `!`: Unary Logical NOT.
+
+### Expression Precedence Hierarchy
+
+1. Primary Expressions: Literals, Identifier Lookups, Grouping `()`
+2. Postfix Operators: Field Access `.`, Indexing `[]`, Call Syntax `()`
+3. Unary Operators: Bitwise/Logical `!`, Negation `-`
+4. Multiplicative: `*`, `/`, `div`, `%`
+5. Additive: `+`, `-`
+6. Relational: `<`, `<=`, `>`, `>=`
+7. Equality: `==`, `!=`
+8. Logical AND: `&&`
+9. Logical OR: `||`
+10. Assignment: `=`
+
+---
+
+## 7. Control Flow and Pattern Matching
+
+### Conditional Branching (`if`, `else`)
+
+Conditions MUST strictly evaluate to a boolean type (`true` or `false`). Non-boolean values raise a runtime error.
+
+```donky
+let threshold = 50;
+let current = 75;
+
+if current > threshold {
+    print("Threshold exceeded.");
+} else if current == threshold {
+    print("At threshold boundary.");
 } else {
-    print("Pre-release version.");
-}
-
-// Loop over arrays
-let numbers = [10, 20, 30, 40];
-for n in numbers {
-    print("Value: ${n}");
+    print("Below threshold.");
 }
 ```
 
-### 2. Structs, Methods & Pattern Matching
+### Iterative Loops (`while`, `for`)
+
 ```donky
-struct Dog {
-    name: string,
-    age: number
+// While Loop
+let i = 0;
+while i < 5 {
+    print("Index: ${i}");
+    i = i + 1;
 }
 
-fn Dog.speak(self) {
-    print("${self.name} says Woof!");
+// For Loop over Array
+let items = ["Alpha", "Beta", "Gamma"];
+for item in items {
+    print("Item: ${item}");
 }
 
-let pet = Dog{ name: "Barnaby", age: 3 };
-pet.speak();
-
-// Pattern matching
-let status = 200;
-match status {
-    200 { print("Success"); }
-    404 { print("Not Found"); }
-    _   { print("Unknown status"); }
+// For Loop over Map Keys
+let metrics = {"cpu": 12, "mem": 45};
+for key in metrics {
+    print("Metric key: ${key}");
 }
 ```
 
-### 3. Error Handling (`try / catch / throw`)
+### Pattern Matching (`match`)
+
+The `match` expression provides concise structural matching against literals and default wildcards `_`.
+
 ```donky
-try {
-    let content = read_file("missing_file.txt");
-    print(content);
-} catch err {
-    print("Handled Exception: ${err}");
+let statusCode = 404;
+
+match statusCode {
+    200 { print("HTTP OK"); }
+    403 { print("Forbidden"); }
+    404 { print("Resource Not Found"); }
+    _   { print("Unhandled HTTP Status Code"); }
 }
 ```
 
-### 4. Native GUI & Window Creation
-```donky
-// Initialize a 800x600 window
-gui_init("Haven & Hope Sanctuary UI", 800, 600);
+---
 
-let btn_id = gui_add_button("Click Me", 50, 50, 120, 40);
-let lbl_handle = gui_add_label("Status: Ready", 50, 110, 200, 30);
+## 8. Functions, Methods, and Closures
+
+### Function Declarations and Return Annotations
+
+Functions are declared with `fn`. Return types can optionally be specified with `->`.
+
+```donky
+fn compute_area(width: num, height: num) -> num {
+    return width * height;
+}
+
+let area = compute_area(10, 20);
+```
+
+### Struct Methods
+
+Methods are declared by prefixing the function name with the target struct name and referencing `self`.
+
+```donky
+struct Rectangle {
+    width: num,
+    height: num
+}
+
+fn Rectangle.area(self) -> num {
+    return self.width * self.height;
+}
+
+let rect = Rectangle{ width: 12, height: 5 };
+print("Area: ${rect.area()}");
+```
+
+### Closures and Lexical Scoping
+
+Functions in Donky capture their lexical environment by reference.
+
+```donky
+fn create_multiplier(factor) {
+    return fn(value) {
+        return value * factor;
+    };
+}
+
+let double = create_multiplier(2);
+print(double(15)); // Emits 30
+```
+
+---
+
+## 9. Data Structures
+
+### Arrays
+
+Arrays are ordered, mutable sequences.
+
+```donky
+let list = [1, 2, 3];
+push(list, 4);        // Append item
+let last = pop(list); // Remove and return last item
+let total = len(list); // Length
+list[0] = 100;        // Element assignment
+```
+
+### Maps
+
+Maps are key-value associative stores.
+
+```donky
+let config = {"host": "127.0.0.1", "port": 8080};
+config["timeout"] = 30;
+
+if contains(config, "host") {
+    print("Host address: ${config["host"]}");
+}
+let all_keys = keys(config);
+```
+
+### Structs
+
+Structs provide type-checked composite records.
+
+```donky
+struct ServiceConfig {
+    name: str,
+    port: num,
+    enabled: bool
+}
+
+let service = ServiceConfig {
+    name: "AuthGateway",
+    port: 443,
+    enabled: true
+};
+
+service.port = 8443;
+```
+
+---
+
+## 10. Native Win32 GUI and WebView Subsystem
+
+Donky integrates directly with Win32 GDI and WebSockets/WebView API to allow rendering desktop user interfaces directly from code without external framework dependencies.
+
+### GUI Control API Reference
+
+- `gui_init(title: str, width: num, height: num)`: Initializes a top-level Win32 window context.
+- `gui_add_button(label: str, x: num, y: num, width: num, height: num) -> num`: Spawns a native Windows button control and returns its control ID.
+- `gui_add_label(text: str, x: num, y: num, width: num, height: num) -> num`: Spawns a native static text label and returns its control handle.
+- `gui_update_text(handle: num, text: str)`: Dynamically updates the text content of a label or button control.
+- `gui_get_clicked() -> num`: Polling helper that returns the ID of the last clicked control in the event queue, or `0` if idle.
+- `gui_draw_rect(x: num, y: num, width: num, height: num, hex_color: str)`: Draws a solid vector rectangle on the window double-buffer.
+- `gui_draw_text(text: str, x: num, y: num, hex_color: str)`: Draws text directly on the canvas buffer.
+- `gui_update()`: Flushes double-buffer rendering and dispatches pending Win32 window message loops.
+- `gui_webview(url_or_html: str, width: num, height: num)`: Spawns an embedded Microsoft Edge / MSHTML WebView renderer frame.
+
+### Complete Win32 GUI Application Example
+
+```donky
+// Create a 600x400 Win32 Desktop Window
+gui_init("System Monitor GUI", 600, 400);
+
+let btn_refresh = gui_add_button("Refresh Stats", 40, 40, 140, 35);
+let lbl_status = gui_add_label("Status: Idle", 40, 90, 300, 25);
 
 while true {
     gui_update();
-    let clicked = gui_get_clicked();
-    if clicked == btn_id {
-        gui_update_text(lbl_handle, "Status: Button Clicked!");
+    let clicked_id = gui_get_clicked();
+    
+    if clicked_id == btn_refresh {
+        let mem = used_mem();
+        gui_update_text(lbl_status, "Memory Used: ${mem} MB");
     }
-    sleep(16); // ~60 FPS
+    
+    // Render status indicator bar
+    gui_draw_rect(40, 130, 200, 15, "#6E8B74");
+    sleep(16); // ~60 FPS update rate
 }
 ```
 
-### 5. System Telemetry & Metrics
+---
+
+## 11. System Telemetry and Process Management
+
+Donky includes low-overhead API calls to query OS resource utilization, process tables, and memory counters via standard platform APIs (`psapi`).
+
+### API Method Summary
+
+- `cpu_usage() -> num`: Returns host CPU total workload percentage (0-100%).
+- `cpu_cores() -> num`: Returns count of active physical/logical CPU cores.
+- `uptime() -> num`: Returns total system uptime in seconds.
+- `total_mem() -> num`: Returns total physical RAM available in Megabytes.
+- `used_mem() -> num`: Returns currently consumed memory in Megabytes.
+- `get_processes() -> array`: Returns array of maps containing running process metadata `[{"pid": num, "name": str}]`.
+- `kill_process(pid: num) -> bool`: Sends termination signal to target process ID.
+- `disk_info() -> map`: Returns map containing disk usage statistics `{"total_gb": num, "free_gb": num}`.
+
+### Telemetry Example
+
 ```donky
-let cpu = cpu_usage();
 let cores = cpu_cores();
-let memory = used_mem();
+let cpu = cpu_usage();
+let mem_used = used_mem();
+let mem_total = total_mem();
 let disk = disk_info();
 
-print("CPU Usage: ${cpu}% across ${cores} cores");
-print("Memory Used: ${memory} MB");
-print("Disk Free: ${disk.free_gb} GB / ${disk.total_gb} GB");
+print("System Hardware Summary:");
+print("CPU Cores: ${cores}");
+print("CPU Utilization: ${cpu}%");
+print("RAM Usage: ${mem_used} MB / ${mem_total} MB");
+print("Disk Storage: ${disk.free_gb} GB free out of ${disk.total_gb} GB");
+
+let procs = get_processes();
+print("Active Running Processes: ${len(procs)}");
 ```
 
 ---
 
-## Compiler Architecture & Optimizations
+## 12. Networking, Sockets, and Concurrency
 
-```
-  +-------------------------------------------------------+
-  |                   .donk Source Code                   |
-  +-------------------------------------------------------+
-                              |
-                     [Lexer & Parser]
-                              |
-                        [AST Generation]
-                              |
-        +---------------------+---------------------+
-        |                     |                     |
-[Tree-Walker]          [VM Bytecode]       [Cranelift Codegen]
-  Interpreter            Compiler              & AOT Linker
-        |                     |                     |
-        v                     v                     v
- Direct Execution     Peephole Optimizer      DCE Optimization
-                     Binary Bytecode (.bc)   Object File (.obj)
-                              |                     |
-                              v               [GCC Linking]
-                           Stack VM                 |
-                           Execution                v
-                                            Standalone (.exe)
+### TCP Socket Server and Client
+
+- `tcp_listen(port: num) -> num`: Spawns a listening TCP socket on the specified port. Returns server socket handle ID.
+- `tcp_accept(server_id: num) -> num`: Accepts pending client connection. Returns client socket handle ID.
+- `tcp_read(client_id: num, max_bytes: num) -> str`: Reads string data from active client connection.
+- `tcp_write(client_id: num, data: str)`: Sends raw text packet over TCP client socket.
+- `tcp_close(socket_id: num)`: Closes target socket handle.
+- `tcp_connect(host: str, port: num, timeout_ms: num) -> num`: Establishes outbound connection to server.
+
+### Non-Blocking HTTP Client
+
+- `http_get(url: str) -> str`: Issues an HTTP GET request powered by `WinHTTP` and returns response body string.
+
+```donky
+let body = http_get("https://api.github.com/zen");
+print("GitHub Zen Response: ${body}");
 ```
 
-1. **Dead Code Elimination (DCE)**: The AOT compiler performs static variable read-analysis, safely stripping unreferenced variables before Cranelift IR generation.
-2. **Bytecode Peephole Optimizer**: Fuses repeated patterns like `GetLocal` + `GetLocal` + `BinaryOp` into single fused opcodes (`BinLocals`, `AddLocalMulLocal`, `IncLocalJump`, `PushLocalAddConst`), drastically cutting VM dispatch cycles.
-3. **Native Linkage**: Standalone builds automatically bundle required C runtime libraries (`ws2_32`, `psapi`, `winhttp`, `gdi32`, `ole32`, `shell32`).
+### Multithreading (`spawn`)
+
+Background threads are executed concurrently using system OS threads via `spawn`.
+
+```donky
+// Spawn asynchronous task
+spawn(fn() {
+    let count = 0;
+    while count < 5 {
+        print("Background worker heartbeat ${count}");
+        sleep(500);
+        count = count + 1;
+    }
+});
+
+print("Main thread continuing execution...");
+sleep(3000);
+```
 
 ---
 
-## License
-Distributed under the MIT License. Developed for software research, systems programming, and application development.
+## 13. Error Handling
+
+Donky utilizes explicit exception handling blocks (`try`, `catch`, `throw`).
+
+```donky
+fn calculate_ratio(a: num, b: num) -> num {
+    if b == 0 {
+        throw "DivisionByZeroError: Denominator cannot be zero.";
+    }
+    return a / b;
+}
+
+try {
+    let result = calculate_ratio(100, 0);
+    print("Result: ${result}");
+} catch err {
+    print("Trapped Exception: ${err}");
+}
+```
+
+---
+
+## 14. Modules and Package Management
+
+### Importing Modules
+
+Files are loaded into the primary AST using relative import paths.
+
+```donky
+import "lib/strings.donk";
+import "lib/math.donk";
+
+let upper = to_upper("hello donky");
+```
+
+### Package Manager Config (`donky.json`)
+
+Dependencies are listed in a project manifest file `donky.json`:
+
+```json
+{
+  "name": "my-donky-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "list_utils": "https://raw.githubusercontent.com/EarlDonkey/Donky-Lang/main/lib/list.donk"
+  }
+}
+```
+
+Running `donky-native install` parses the manifest and downloads external modules directly into `donky_modules/`.
+
+---
+
+## 15. Compiler Architecture and Optimizations
+
+```text
+               +----------------------------------+
+               |        .donk Source Code         |
+               +----------------------------------+
+                                |
+                       [ Lexer & Parser ]
+                                |
+                      [ AST Representation ]
+                                |
+        +-----------------------+-----------------------+
+        |                       |                       |
+[ Interpreter ]         [ Bytecode VM ]        [ Cranelift Codegen ]
+  Tree-Walker          Compiler Pipeline            & AOT Linker
+        |                       |                       |
+        v                       v                       v
+ Direct AST Exec       Peephole Optimizer      Static DCE Pass
+                       Binary File (.bc)      Object File (.obj)
+                                |                       |
+                                v                [ GCC Linker ]
+                           Virtual Machine              |
+                              Execution                 v
+                                                Standalone (.exe)
+```
+
+### Bytecode Peephole Optimizer Rules
+
+The bytecode compiler applies multi-pass peephole optimizations to reduce instruction fetch overhead:
+
+1. **Local Operation Fusion:** `LOAD_LOCAL x` + `LOAD_LOCAL y` + `ADD` is fused into a single `BinLocals(x, y, OpAdd)` instruction.
+2. **Local Constant Increment:** `LOAD_LOCAL x` + `CONST c` + `ADD` + `STORE_LOCAL x` is fused into `IncLocalJump(x, c)`.
+3. **Fused Jump Comparisons:** `COMPARE_LT` + `JUMP_IF_FALSE target` is fused into a single `JumpIfGe target` opcode, bypassing intermediate boolean allocation.
+
+### Ahead-of-Time Dead Code Elimination (DCE)
+
+During AOT executable generation (`build-exe`), `aot_6.rs` runs variable usage scanning (`optimize_block`). Local allocations that are written to but never read in subsequent basic blocks are removed prior to Cranelift IR generation.
+
+---
+
+## 16. Standard Library Reference
+
+### Utility Libraries
+
+#### `lib/list.donk`
+- `map(arr, fn)`: Returns new array mapped through transforming closure.
+- `filter(arr, fn)`: Returns new array containing elements satisfying predicate.
+- `reduce(arr, fn, initial)`: Folds array values into a single accumulator.
+- `reverse(arr)`: Reverses array elements in place.
+- `unique(arr)`: Strips duplicated values.
+
+#### `lib/strings.donk`
+- `starts_with(str, prefix) -> bool`
+- `ends_with(str, suffix) -> bool`
+- `slice(str, start, end) -> str`
+- `index_of(str, needle) -> num`
+- `to_upper(str) -> str`
+- `to_lower(str) -> str`
+
+#### `lib/math.donk`
+- `min(a, b)`, `max(a, b)`, `abs(n)`
+- `pow(base, exp)`
+- `sqrt(n)`
+- `floor(n)`, `ceil(n)`, `round(n)`
+
+---
+
+## 17. Appendix A: Complete EBNF Grammar
+
+```ebnf
+program        = { statement } ;
+
+statement      = let_stmt
+               | assign_stmt
+               | print_stmt
+               | if_stmt
+               | while_stmt
+               | for_stmt
+               | match_stmt
+               | fn_stmt
+               | return_stmt
+               | break_stmt
+               | continue_stmt
+               | try_stmt
+               | throw_stmt
+               | import_stmt
+               | struct_stmt
+               | block
+               | expr_stmt ;
+
+let_stmt       = "let" , IDENTIFIER , [ ":" , type_spec ] , "=" , expression , ";" ;
+assign_stmt    = target_expr , "=" , expression , ";" ;
+print_stmt     = "print" , "(" , expression , ")" , ";" ;
+
+if_stmt        = "if" , expression , block , [ "else" , ( if_stmt | block ) ] ;
+while_stmt     = "while" , expression , block ;
+for_stmt       = "for" , IDENTIFIER , "in" , expression , block ;
+
+match_stmt     = "match" , expression , "{" , { match_arm } , "}" ;
+match_arm      = ( expression | "_" ) , block ;
+
+fn_stmt        = "fn" , [ IDENTIFIER , "." ] , IDENTIFIER , "(" , [ parameter_list ] , ")" , [ "->" , type_spec ] , block ;
+parameter_list = parameter , { "," , parameter } ;
+parameter      = IDENTIFIER , [ ":" , type_spec ] ;
+
+return_stmt    = "return" , [ expression ] , ";" ;
+break_stmt     = "break" , ";" ;
+continue_stmt  = "continue" , ";" ;
+
+try_stmt       = "try" , block , "catch" , IDENTIFIER , block ;
+throw_stmt     = "throw" , expression , ";" ;
+import_stmt    = "import" , STRING_LITERAL , ";" ;
+
+struct_stmt    = "struct" , IDENTIFIER , "{" , [ struct_fields ] , "}" ;
+struct_fields  = struct_field , { "," , struct_field } ;
+struct_field   = IDENTIFIER , ":" , type_spec ;
+
+type_spec      = "num" | "str" | "bool" | "array" | "map" | "any" | "void" | IDENTIFIER ;
+
+block          = "{" , { statement } , "}" ;
+expr_stmt      = expression , ";" ;
+
+expression     = logic_or ;
+logic_or       = logic_and , { "||" , logic_and } ;
+logic_and      = equality , { "&&" , equality } ;
+equality       = comparison , { ( "==" | "!=" ) , comparison } ;
+comparison     = additive , { ( "<" | "<=" | ">" | ">=" ) , additive } ;
+additive       = multiplicative , { ( "+" | "-" ) , multiplicative } ;
+multiplicative = unary , { ( "*" | "/" | "div" | "%" ) , unary } ;
+unary          = ( "!" | "-" ) , unary | postfix ;
+
+postfix        = primary , { call_suffix | field_suffix | index_suffix } ;
+call_suffix    = "(" , [ argument_list ] , ")" ;
+field_suffix   = "." , IDENTIFIER ;
+index_suffix   = "[" , expression , "]" ;
+
+argument_list  = expression , { "," , expression } ;
+
+primary        = NUMBER_LITERAL
+               | STRING_LITERAL
+               | "true"
+               | "false"
+               | "null"
+               | IDENTIFIER
+               | array_literal
+               | map_literal
+               | struct_instantiation
+               | "(" , expression , ")" ;
+
+array_literal  = "[" , [ argument_list ] , "]" ;
+map_literal    = "{" , [ map_entries ] , "}" ;
+map_entries    = map_entry , { "," , map_entry } ;
+map_entry      = expression , ":" , expression ;
+
+struct_instantiation = IDENTIFIER , "{" , [ struct_init_fields ] , "}" ;
+struct_init_fields   = struct_init_field , { "," , struct_init_field } ;
+struct_init_field    = IDENTIFIER , ":" , expression ;
+```
+
+---
+
+## 18. Appendix B: Bytecode Opcode Reference
+
+| Opcode Mnemonic | Operands | Stack Transition | Description |
+| :--- | :--- | :--- | :--- |
+| `PUSH_CONST` | `idx: u16` | `-> val` | Pushes constant pool item onto stack. |
+| `PUSH_TRUE` | None | `-> true` | Pushes boolean `true`. |
+| `PUSH_FALSE` | None | `-> false` | Pushes boolean `false`. |
+| `PUSH_NULL` | None | `-> null` | Pushes `null` value. |
+| `POP` | None | `val ->` | Discards top item from stack. |
+| `LOAD_LOCAL` | `slot: u16` | `-> val` | Loads value from local frame slot. |
+| `STORE_LOCAL` | `slot: u16` | `val ->` | Stores value into local frame slot. |
+| `LOAD_GLOBAL` | `name_idx: u16`| `-> val` | Fetches global scope variable. |
+| `STORE_GLOBAL` | `name_idx: u16`| `val ->` | Writes global scope variable. |
+| `ADD` | None | `a, b -> c` | Pops two values, pushes sum or concatenated string. |
+| `SUB` | None | `a, b -> c` | Pops two numbers, pushes difference. |
+| `MUL` | None | `a, b -> c` | Pops two numbers, pushes product. |
+| `DIV` | None | `a, b -> c` | Pops two numbers, pushes floating division result. |
+| `DIV_INT` | None | `a, b -> c` | Pops two numbers, pushes truncated integer division. |
+| `MOD` | None | `a, b -> c` | Pops two numbers, pushes modulo remainder. |
+| `EQ` / `NE` | None | `a, b -> bool` | Equality evaluation. |
+| `LT` / `LE` / `GT` / `GE` | None | `a, b -> bool` | Relational evaluation. |
+| `JUMP` | `target: u32` | None | Unconditional IP jump to target offset. |
+| `JUMP_IF_FALSE` | `target: u32` | `bool ->` | Pops boolean; jumps to target offset if `false`. |
+| `CALL` | `argc: u8` | `fn, args... -> res` | Invokes callable object with `argc` arguments. |
+| `RETURN` | None | `val ->` | Returns current frame with top stack value. |
+| `BIN_LOCALS` | `slot_a, slot_b, op` | `-> val` | Peephole fused opcode: loads two locals and executes binary operation. |
+| `INC_LOCAL_JUMP` | `slot, const_idx` | None | Peephole fused opcode: directly increments local variable by constant. |
+| `PUSH_LOCAL_ADD_CONST` | `slot, const_idx` | `-> val` | Peephole fused opcode: pushes local variable added to constant pool value. |
+
+---
+
+## 19. Appendix C: Memory Architecture and NaN-Boxing Specs
+
+Donky encodes dynamically typed values into 64-bit IEEE 754 floating-point values (NaN-Boxing).
+
+### Bit Layout Diagram
+
+```text
+Double Precision IEEE 754 NaN Pattern:
+S EEEEEEEEEEE MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+1 11111111111 11.................................................
+
+Donky Tagged Values Layout (Sign bit + Exponent bits reserved for NaN):
+0x7FF8_0000_0000_0000 (Quiet NaN Base Prefix)
+
+[ Bit 63..48: NaN Mask ] [ Bit 47..32: Type Tag ] [ Bit 31..0: Payload Data ]
+
+Tag Values (Bits 47..32):
+- 0x0000: Standard 64-bit Double Precision Float (Pointer/Number fallback)
+- 0x0001: Boolean True (0x7FF8_0001_0000_0001)
+- 0x0002: Boolean False (0x7FF8_0002_0000_0000)
+- 0x0003: Null Value (0x7FF8_0003_0000_0000)
+- 0x0004: Heap Object Pointer Handle (Bits 31..0 store GC Heap Slot Index)
+- 0x0005: String Intern Table Index (Bits 31..0 store String ID)
+```
+
+### Garbage Collector (GC)
+
+Donky utilizes a precise **Mark-and-Sweep Garbage Collector**:
+
+1. **Mark Phase:** Sweeps root references located on the active VM evaluation stack, local variable frames, and global environment maps.
+2. **Sweep Phase:** Traverses heap-allocated objects (arrays, maps, closures, struct records) and frees memory for unmarked references, returning slots to the heap pool allocator.
+
+---
+
+## 20. Appendix D: Technical Roadmap and Limitations
+
+### Known Current Limitations
+
+1. **Platform Binaries:** Native executable linking (`build-exe`) relies on GCC toolchains targeting Windows x86_64 binaries (`.exe`). macOS/Linux targets run via interpreted bytecode.
+2. **Object-Oriented Inheritance:** Structs support methods but intentionally omit class inheritance hierarchies in favor of composition.
+
+### Future Development Milestones
+
+- Extended cross-compilation target triples (`x86_64-unknown-linux-gnu`).
+- Async/Await non-blocking event loop runtime.
+- Multi-threaded shared-memory channel abstractions.

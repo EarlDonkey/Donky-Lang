@@ -1,3 +1,0 @@
-let res = http_get("https://api.github.com/users/torvalds");
-// The response is a JSON string. Let's just print the first 100 characters to prove it worked.
-print(byte_substr(res, 0, 100));
