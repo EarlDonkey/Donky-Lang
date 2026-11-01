@@ -1,0 +1,7 @@
+fn expensive_work() {
+    print("Doing expensive work...");
+    return 42;
+}
+
+let unused = expensive_work();
+print("Program finished.");

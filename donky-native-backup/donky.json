@@ -1,0 +1,10 @@
+{
+  "name": "my-donky-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "github-readme": {
+      "url": "https://raw.githubusercontent.com/EarlDonkey/Donky-Lang/main/README.md",
+      "sha256": "d1fe69225a1abb863bab0e00fcf520936472cfb77211411d6aa8c9a891df5bb8"
+    }
+  }
+}

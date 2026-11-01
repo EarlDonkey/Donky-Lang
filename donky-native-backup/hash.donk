@@ -1,0 +1,74 @@
+// Convert character to standard ASCII decimal code
+fn ord(ch) -> num {
+    let ascii_map = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let idx = index_of(ascii_map, ch);
+    if idx != -1 {
+        return idx + 32;
+    }
+    // Fallback for control chars (e.g. newline/tab)
+    if ch == "\n" { return 10; }
+    if ch == "\r" { return 13; }
+    if ch == "\t" { return 9; }
+    return 0;
+}
+
+// Convert a decimal number to an 8-character hex string
+fn to_hex(n) -> str {
+    let hex_chars = "0123456789abcdef";
+    let val = n;
+    if val < 0 {
+        val = -val;
+    }
+    
+    let result = "";
+    let count = 0;
+    
+    while count < 8 {
+        let digit = val % 16;
+        let char_idx = num(digit);
+        result = hex_chars[char_idx] + result;
+        val = (val - digit) / 16;
+        count = count + 1;
+    }
+    
+    return result;
+}
+
+// FNV-1a 32-bit Hash Implementation
+fn hash_fnv1a(text) -> str {
+    // 32-bit FNV offset basis: 2166136261
+    let hash = 2166136261;
+    // 32-bit FNV prime: 16777619
+    let fnv_prime = 16777619;
+    let modulus = 4294967296; // 2^32
+    
+    let i = 0;
+    while i < len(text) {
+        let code = ord(text[i]);
+        
+        // Step 1: XOR byte into hash
+        // Bitwise XOR emulation via mathematical modulo combination
+        let temp_xor = hash + code - (2 * (hash % 256));
+        if temp_xor < 0 {
+            temp_xor = -temp_xor;
+        }
+        hash = temp_xor;
+        
+        // Step 2: Multiply by FNV prime
+        hash = hash * fnv_prime;
+        
+        // Keep within 32-bit boundary
+        hash = hash % modulus;
+        
+        i = i + 1;
+    }
+    
+    return to_hex(hash);
+}
+
+// --- Driver Script ---
+let input_data = "Donky-Lang Hash Generator";
+print("Original Input : " + input_data);
+
+let hex_hash = hash_fnv1a(input_data);
+print("FNV-1a Hash    : 0x" + hex_hash);

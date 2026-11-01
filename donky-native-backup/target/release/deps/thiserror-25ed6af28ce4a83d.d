@@ -1,0 +1,14 @@
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\thiserror-25ed6af28ce4a83d.d: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\aserror.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\display.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\var.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\private.rs C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\build\thiserror-5a8957f8614b8b88\out/private.rs
+
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\libthiserror-25ed6af28ce4a83d.rlib: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\aserror.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\display.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\var.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\private.rs C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\build\thiserror-5a8957f8614b8b88\out/private.rs
+
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\libthiserror-25ed6af28ce4a83d.rmeta: C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\lib.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\aserror.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\display.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\var.rs C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\private.rs C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\build\thiserror-5a8957f8614b8b88\out/private.rs
+
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\lib.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\aserror.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\display.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\var.rs:
+C:\Users\user\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.21\src\private.rs:
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\build\thiserror-5a8957f8614b8b88\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\user\\Desktop\\Donky-Lang\\donky-native\\target\\release\\build\\thiserror-5a8957f8614b8b88\\out

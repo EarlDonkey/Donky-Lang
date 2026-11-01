@@ -1,0 +1,6 @@
+fn main() {
+    print("Inside main...");
+    print("3 + 4 = " + str(7));
+}
+
+main();

@@ -1,0 +1,321 @@
+// parser.donk — Self-Hosted Donky Pratt Parser
+// Usage: .\target\release\donky-native.exe vm parser.donk <file.donk>
+
+import "lexer.donk";
+
+struct Parser {
+    tokens: array,
+    current: number
+}
+
+fn make_parser(tokens) -> map {
+    return { "tokens": tokens, "current": 0 };
+}
+
+fn peek(p) -> map { return p["tokens"][p["current"]]; }
+fn previous(p) -> map { return p["tokens"][p["current"] - 1]; }
+fn is_at_end(p) -> bool { return peek(p)["type"] == "Eof"; }
+fn advance(p) -> map {
+    if !is_at_end(p) { p["current"] = p["current"] + 1; }
+    return previous(p);
+}
+fn check(p, ttype) -> bool {
+    if is_at_end(p) { return false; }
+    return peek(p)["type"] == ttype;
+}
+fn match_token(p, types) -> bool {
+    for t in types {
+        if check(p, t) { advance(p); return true; }
+    }
+    return false;
+}
+fn consume(p, ttype, message) -> map {
+    if check(p, ttype) { return advance(p); }
+    throw message + " at " + str(peek(p)["line"]) + ":" + str(peek(p)["col"]) + " (got " + peek(p)["type"] + ")";
+}
+
+// ============================================================
+// Pratt Parser Binding Power
+// ============================================================
+fn infix_bp(ttype) -> array {
+    if ttype == "Or" { return [1, 2]; }
+    if ttype == "And" { return [3, 4]; }
+    if ttype == "EqEq" || ttype == "NotEq" { return [5, 6]; }
+    if ttype == "Lt" || ttype == "LtEq" || ttype == "Gt" || ttype == "GtEq" { return [7, 8]; }
+    if ttype == "Plus" || ttype == "Minus" { return [9, 10]; }
+    if ttype == "Star" || ttype == "Slash" || ttype == "Percent" || ttype == "Div" { return [11, 12]; }
+    return [0, 0]; // Not an infix operator
+}
+
+fn parse_expression(p, min_bp) -> map {
+    let left = prefix(p);
+
+    // 1. Postfix operators: Index [] and Dot .
+    while true {
+        if match_token(p, ["LBracket"]) {
+            let index = parse_expression(p, 0);
+            consume(p, "RBracket", "Expected ']'");
+            left = { "type": "Index", "target": left, "index": index };
+        } else if match_token(p, ["Dot"]) {
+            let field = consume(p, "Ident", "Expected field name")["lexeme"];
+            if match_token(p, ["LParen"]) {
+                let args = [];
+                if !check(p, "RParen") {
+                    while true {
+                        push(args, parse_expression(p, 0));
+                        if !match_token(p, ["Comma"]) { break; }
+                    }
+                }
+                consume(p, "RParen", "Expected ')'");
+                left = { "type": "MethodCall", "target": left, "method": field, "args": args };
+            } else {
+                left = { "type": "FieldAccess", "target": left, "field": field };
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 2. Infix (Binary) operators
+    while true {
+        let ttype = peek(p)["type"];
+        let bp = infix_bp(ttype);
+        let l_bp = bp[0];
+        let r_bp = bp[1];
+        
+        if l_bp == 0 || l_bp < min_bp { break; }
+        
+        let op = advance(p)["type"];
+        let right = parse_expression(p, r_bp);
+        
+        left = {
+            "type": "Binary",
+            "left": left,
+            "op": op,
+            "right": right
+        };
+    }
+    return left;
+}
+
+fn prefix(p) -> map {
+    let t = advance(p);
+    
+    if t["type"] == "Number" {
+        return { "type": "Number", "value": num(t["literal"]) };
+    }
+    if t["type"] == "String" {
+        return { "type": "String", "value": t["literal"] };
+    }
+    if t["type"] == "True" { return { "type": "Bool", "value": true }; }
+    if t["type"] == "False" { return { "type": "Bool", "value": false }; }
+    if t["type"] == "Ident" {
+        let name = t["lexeme"];
+        if match_token(p, ["LParen"]) {
+            let args = [];
+            if !check(p, "RParen") {
+                while true {
+                    push(args, parse_expression(p, 0));
+                    if !match_token(p, ["Comma"]) { break; }
+                }
+            }
+            consume(p, "RParen", "Expected ')'");
+            return { "type": "Call", "name": name, "args": args };
+        }
+        return { "type": "Ident", "name": name };
+    }
+    if t["type"] == "LParen" {
+        let expr = parse_expression(p, 0);
+        consume(p, "RParen", "Expected ')'");
+        return expr;
+    }
+    if t["type"] == "Minus" || t["type"] == "Bang" {
+        let right = parse_expression(p, 13);
+        return { "type": "Unary", "op": t["type"], "right": right };
+    }
+    if t["type"] == "LBracket" {
+        let elements = [];
+        if !check(p, "RBracket") {
+            while true {
+                push(elements, parse_expression(p, 0));
+                if !match_token(p, ["Comma"]) { break; }
+            }
+        }
+        consume(p, "RBracket", "Expected ']'");
+        return { "type": "Array", "elements": elements };
+    }
+    if t["type"] == "LBrace" {
+        let pairs = [];
+        if !check(p, "RBrace") {
+            while true {
+                let key = parse_expression(p, 0);
+                consume(p, "Colon", "Expected ':'");
+                let val = parse_expression(p, 0);
+                push(pairs, [key, val]);
+                if !match_token(p, ["Comma"]) { break; }
+            }
+        }
+        consume(p, "RBrace", "Expected '}'");
+        return { "type": "Map", "pairs": pairs };
+    }
+    if t["type"] == "Fn" {
+        consume(p, "LParen", "Expected '('");
+        let params = [];
+        if !check(p, "RParen") {
+            while true {
+                push(params, consume(p, "Ident", "Expected param")["lexeme"]);
+                if !match_token(p, ["Comma"]) { break; }
+            }
+        }
+        consume(p, "RParen", "Expected ')'");
+        if match_token(p, ["Minus"]) { match_token(p, ["Gt"]); if check(p, "Ident") { advance(p); } }
+        let body = statement(p);
+        return { "type": "Function", "params": params, "body": body };
+    }
+    throw "Unexpected token in prefix: " + t["type"];
+}
+
+fn statement(p) -> map {
+    if match_token(p, ["Import"]) {
+        let path = consume(p, "String", "Expected path string")["literal"];
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Import", "path": path };
+    }
+    
+    if match_token(p, ["Struct"]) {
+        let name = consume(p, "Ident", "Expected struct name")["lexeme"];
+        consume(p, "LBrace", "Expected '{'");
+        let fields = [];
+        while !check(p, "RBrace") && !is_at_end(p) {
+            let f_name = consume(p, "Ident", "Expected field name")["lexeme"];
+            consume(p, "Colon", "Expected ':'");
+            let f_type = consume(p, "Ident", "Expected type")["lexeme"];
+            push(fields, { "name": f_name, "type": f_type });
+            match_token(p, ["Comma"]);
+        }
+        consume(p, "RBrace", "Expected '}'");
+        return { "type": "Struct", "name": name, "fields": fields };
+    }
+
+    if match_token(p, ["Let"]) {
+        let name = consume(p, "Ident", "Expected var name")["lexeme"];
+        consume(p, "Eq", "Expected '='");
+        let expr = parse_expression(p, 0);
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Let", "name": name, "expr": expr };
+    }
+    
+    if match_token(p, ["Print"]) {
+        consume(p, "LParen", "Expected '('");
+        let expr = parse_expression(p, 0);
+        consume(p, "RParen", "Expected ')'");
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Print", "expr": expr };
+    }
+    
+    if match_token(p, ["LBrace"]) {
+        let stmts = [];
+        while !check(p, "RBrace") && !is_at_end(p) {
+            push(stmts, statement(p));
+        }
+        consume(p, "RBrace", "Expected '}'");
+        return { "type": "Block", "stmts": stmts };
+    }
+    
+    if match_token(p, ["If"]) {
+        let cond = parse_expression(p, 0);
+        let then_b = statement(p);
+        let else_b = null;
+        if match_token(p, ["Else"]) {
+            else_b = statement(p);
+        }
+        return { "type": "If", "cond": cond, "then": then_b, "else": else_b };
+    }
+    
+    if match_token(p, ["While"]) {
+        let cond = parse_expression(p, 0);
+        let body = statement(p);
+        return { "type": "While", "cond": cond, "body": body };
+    }
+    
+    if match_token(p, ["For"]) {
+        let name = consume(p, "Ident", "Expected loop var")["lexeme"];
+        consume(p, "In", "Expected 'in'");
+        let iter = parse_expression(p, 0);
+        let body = statement(p);
+        return { "type": "For", "var": name, "iter": iter, "body": body };
+    }
+    
+    if match_token(p, ["Fn"]) {
+        let name = consume(p, "Ident", "Expected function name")["lexeme"];
+        consume(p, "LParen", "Expected '('");
+        let params = [];
+        if !check(p, "RParen") {
+            while true {
+                push(params, consume(p, "Ident", "Expected param")["lexeme"]);
+                if !match_token(p, ["Comma"]) { break; }
+            }
+        }
+        consume(p, "RParen", "Expected ')'");
+        if match_token(p, ["Minus"]) { match_token(p, ["Gt"]); if check(p, "Ident") { advance(p); } }
+        let body = statement(p);
+        return { "type": "Function", "name": name, "params": params, "body": body };
+    }
+    
+    if match_token(p, ["Return"]) {
+        let expr = null;
+        if !check(p, "Semi") { expr = parse_expression(p, 0); }
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Return", "expr": expr };
+    }
+    
+    if match_token(p, ["Throw"]) {
+        let expr = parse_expression(p, 0);
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Throw", "expr": expr };
+    }
+    
+    if match_token(p, ["Break"]) {
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Break" };
+    }
+    
+    if match_token(p, ["Continue"]) {
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Continue" };
+    }
+
+    if match_token(p, ["Semi"]) { return { "type": "Empty" }; }
+
+    let expr = parse_expression(p, 0);
+    if match_token(p, ["Eq"]) {
+        let val = parse_expression(p, 0);
+        consume(p, "Semi", "Expected ';'");
+        return { "type": "Assign", "target": expr, "val": val };
+    }
+    consume(p, "Semi", "Expected ';'");
+    return { "type": "ExprStmt", "expr": expr };
+}
+
+fn parse(tokens) -> array {
+    let p = make_parser(tokens);
+    let statements = [];
+    while !is_at_end(p) {
+        push(statements, statement(p));
+    }
+    return statements;
+}
+
+fn main() {
+    if len(args) < 1 {
+        print("Usage: donky-native vm parser.donk <file.donk>");
+        return;
+    }
+    let source = read_file(args[0]);
+    let tokens = tokenize(source);
+    print("Lexed " + str(len(tokens)) + " tokens. Parsing...");
+    let ast = parse(tokens);
+    print("Parsed successfully! Top-level statements: " + str(len(ast)));
+}
+
+//main();

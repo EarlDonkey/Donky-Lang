@@ -1,0 +1,16 @@
+let x = 10;
+let y = 20;
+
+print(x + y);
+
+if x < y {
+    print(111);
+} else {
+    print(222);
+}
+
+let i = 0;
+while i < 3 {
+    print(i);
+    i = i + 1;
+}

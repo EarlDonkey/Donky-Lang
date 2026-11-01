@@ -1,0 +1,69 @@
+// Donky Full-Stack System Task Manager Application
+
+fn handle_client(client) {
+    let req = tcp_read(client, 65536);
+    if len(req) == 0 {
+        tcp_close(client);
+        return 0;
+    }
+
+    // Serve Telemetry Endpoint
+    if contains(req, "GET /api/system") {
+        let cpu = cpu_usage();
+        let total = total_mem();
+        let used = used_mem();
+        
+        let json = "{\"cpu\":" + str(cpu) + ",\"total_mem\":" + str(total) + ",\"used_mem\":" + str(used) + "}";
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + json;
+        tcp_write(client, res);
+        tcp_close(client);
+        return 0;
+    }
+
+    // Serve Processes Endpoint
+    if contains(req, "GET /api/processes") {
+        let procs = get_processes();
+        let json = "[";
+        let i = 0;
+        
+        while i < len(procs) && i < 100 {
+            let p = procs[i];
+            json = json + "{\"pid\":" + str(p["pid"]) + ",\"name\":\"" + p["name"] + "\",\"mem\":" + str(p["mem"]) + "}";
+            if i < len(procs) - 1 && i < 99 {
+                json = json + ",";
+            }
+            i = i + 1;
+        }
+        json = json + "]";
+        
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + json;
+        tcp_write(client, res);
+        tcp_close(client);
+        return 0;
+    }
+
+    // Serve Main Task Manager HTML Page
+    let html = read_file("task_manager.html");
+    let res = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + str(len(html)) + "\r\n\r\n" + html;
+    tcp_write(client, res);
+    tcp_close(client);
+    return 0;
+}
+
+fn start_server() {
+    let server = tcp_listen(8081);
+    print("Donky Task Manager Server listening on http://localhost:8081...");
+    while true {
+        let client = tcp_accept(server);
+        if client > 0 {
+            spawn(handle_client, client);
+        }
+    }
+}
+
+// 1. Launch HTTP Web Server on Background Thread
+spawn(start_server, 0);
+
+// 2. Open Native Desktop WebView Window
+sleep(500);
+gui_webview("http://localhost:8081");

@@ -1,0 +1,18 @@
+let success = gui_init("Donky GUI Test", 800, 600);
+if success == 0 {
+    print("Failed to create window.");
+} else {
+    print("Window created! Look at your screen.");
+    
+    let frame = 0;
+    while frame < 1000 {
+        gui_update();
+        
+        // Draw the counter
+        gui_draw_text("Frame: " + str(frame), 50, 50);
+        
+        sleep(16);
+        frame = frame + 1;
+    }
+    print("Render loop finished.");
+}

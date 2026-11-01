@@ -31,6 +31,12 @@ pub struct RuntimeFuncs {
     pub tcp_listen_id: FuncId, pub tcp_accept_id: FuncId,
     pub tcp_read_id: FuncId, pub tcp_write_id: FuncId, pub tcp_close_id: FuncId,
     pub http_get_id: FuncId, pub mod_id: FuncId, pub spawn_id: FuncId, pub gc_id: FuncId,
+    pub gui_init_id: FuncId, pub gui_draw_text_id: FuncId, pub gui_update_id: FuncId,
+    pub gui_add_button_id: FuncId, pub gui_add_label_id: FuncId, pub gui_update_text_id: FuncId, 
+    pub gui_get_clicked_id: FuncId, pub gui_clear_id: FuncId, pub gui_repaint_id: FuncId,
+    pub gui_draw_rect_id: FuncId, pub cpu_usage_id: FuncId, pub gui_webview_id: FuncId,
+    pub kill_process_id: FuncId, pub uptime_id: FuncId, pub cpu_cores_id: FuncId,
+    pub disk_info_id: FuncId, pub sub_id: FuncId, pub mul_id: FuncId, pub div_id: FuncId,
 }
 
 pub struct AotCompiler {
@@ -39,6 +45,7 @@ pub struct AotCompiler {
     module: ObjectModule,
     user_functions: HashMap<String, FuncId>,
     runtime: RuntimeFuncs,
+    pending_closures: Vec<(String, Vec<String>, Box<Stmt>)>,
 }
 
 struct FunctionContext {
@@ -121,10 +128,29 @@ impl AotCompiler {
             mod_id: declare("donky_mod", &[types::I64, types::I64], Some(types::I64)),
             spawn_id: declare("donky_spawn", &[types::I64, types::I64], Some(types::I64)),
             gc_id: declare("donky_gc", &[], Some(types::I64)),
+            gui_init_id: declare("donky_gui_init", &[types::I64, types::I64, types::I64], Some(types::I64)),
+            gui_draw_text_id: declare("donky_gui_draw_text", &[types::I64, types::I64, types::I64], Some(types::I64)),
+            gui_update_id: declare("donky_gui_update", &[], Some(types::I64)),
+            gui_add_button_id: declare("donky_gui_add_button", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            gui_add_label_id: declare("donky_gui_add_label", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            gui_update_text_id: declare("donky_gui_update_text", &[types::I64, types::I64], Some(types::I64)),
+            gui_get_clicked_id: declare("donky_gui_get_clicked", &[], Some(types::I64)),
+            gui_clear_id: declare("donky_gui_clear", &[], Some(types::I64)),
+            gui_repaint_id: declare("donky_gui_repaint", &[], Some(types::I64)),
+            gui_draw_rect_id: declare("donky_gui_draw_rect", &[types::I64, types::I64, types::I64, types::I64, types::I64], Some(types::I64)),
+            cpu_usage_id: declare("donky_get_cpu_usage", &[], Some(types::I64)),
+            gui_webview_id: declare("donky_gui_webview", &[types::I64], Some(types::I64)),
+            kill_process_id: declare("donky_kill_process", &[types::I64], Some(types::I64)),
+            uptime_id: declare("donky_get_uptime", &[], Some(types::I64)),
+            cpu_cores_id: declare("donky_get_cpu_cores", &[], Some(types::I64)),
+            disk_info_id: declare("donky_get_disk_info", &[], Some(types::I64)),
+            sub_id: declare("donky_sub", &[types::I64, types::I64], Some(types::I64)),
+            mul_id: declare("donky_mul", &[types::I64, types::I64], Some(types::I64)),
+            div_id: declare("donky_div", &[types::I64, types::I64], Some(types::I64)),
             
         };
         
-        AotCompiler { builder_context: FunctionBuilderContext::new(), ctx: codegen::Context::new(), module, user_functions: HashMap::new(), runtime }
+        AotCompiler { builder_context: FunctionBuilderContext::new(), ctx: codegen::Context::new(), module, user_functions: HashMap::new(), runtime, pending_closures: Vec::new() }
     }
 
     pub fn compile_to_object(mut self, stmts: &[Stmt], output_path: &str) -> Result<(), String> {
@@ -179,10 +205,12 @@ impl AotCompiler {
             self.user_functions.insert(name.clone(), func_id);
         }
 
+        let mut pc = std::mem::take(&mut self.pending_closures);
         for (name, (params, body)) in latest_funcs {
             let func_id = self.user_functions[&name];
-            self.compile_function(func_id, &params, &body);
+            self.compile_function(func_id, &params, &body, &mut pc);
         }
+        self.pending_closures = pc;
 
         let mut sig = self.module.make_signature();
         sig.returns.push(AbiParam::new(types::I64));
@@ -206,13 +234,20 @@ impl AotCompiler {
             builder.def_var(args_var, args_val);
             fctx.variables.insert("args".to_string(), args_var);
             
+            // --- NEW: DCE Optimization ---
+            let optimized_stmts = Self::optimize_block(stmts.to_vec());
             let mut terminated = false;
-            for stmt in stmts {
+            
+            for stmt in &optimized_stmts {
                 if !matches!(stmt, Stmt::Function(_, _, _)) {
-                    terminated = Self::compile_stmt(&mut builder, &mut self.module, &self.runtime, &self.user_functions, &mut fctx, stmt);
+                    terminated = Self::compile_stmt(
+                        &mut builder, &mut self.module, &self.runtime, &self.user_functions, 
+                        &mut self.pending_closures, &mut fctx, stmt
+                    );
                     if terminated { break; }
                 }
             }
+            
             if !terminated { 
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().return_(&[zero]); 
@@ -221,13 +256,103 @@ impl AotCompiler {
         }
         self.module.define_function(main_id, &mut self.ctx).unwrap();
         self.module.clear_context(&mut self.ctx);
+
+        // --- NEW: COMPILE PENDING CLOSURES (THE FIX) ---
+        // We do this AFTER donky_toplevel is defined, so the queue is fully populated.
+        let mut i = 0;
+        while i < self.pending_closures.len() {
+            let (name, params, body) = self.pending_closures[i].clone();
+            let mut sig = self.module.make_signature();
+            for _ in 0..params.len() { sig.params.push(AbiParam::new(types::I64)); }
+            sig.returns.push(AbiParam::new(types::I64));
+            let func_id = self.module.declare_function(&format!("donky_fn_{}", name), Linkage::Export, &sig).unwrap();
+            self.user_functions.insert(name.clone(), func_id);
+            
+            // We use a temporary vec here too, so we don't double-borrow
+            let mut pc = std::mem::take(&mut self.pending_closures);
+            self.compile_function(func_id, &params, &body, &mut pc);
+            self.pending_closures = pc;
+            
+            i += 1;
+        }
+
         let product = self.module.finish();
         let bytes = product.emit().unwrap();
         std::fs::write(output_path, bytes).map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    fn compile_function(&mut self, func_id: FuncId, params: &[String], body: &Stmt) {
+    fn optimize_block(stmts: Vec<Stmt>) -> Vec<Stmt> {
+        // Count how many times each variable is read
+        let mut reads: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        
+        fn count_reads(stmt: &Stmt, reads: &mut std::collections::HashMap<String, usize>) {
+            match stmt {
+                Stmt::Let(_, expr) => count_expr_reads(expr, reads),
+                Stmt::Assign(_, expr) => count_expr_reads(expr, reads),
+                Stmt::Print(expr) => count_expr_reads(expr, reads),
+                Stmt::ExprStmt(expr) => count_expr_reads(expr, reads),
+                Stmt::Return(Some(expr)) => count_expr_reads(expr, reads),
+                Stmt::If(cond, then_b, else_b) => {
+                    count_expr_reads(cond, reads);
+                    count_reads(then_b, reads);
+                    if let Some(eb) = else_b { count_reads(eb, reads); }
+                }
+                Stmt::While(cond, body) => {
+                    count_expr_reads(cond, reads);
+                    count_reads(body, reads);
+                }
+                Stmt::For(var, iter, body) => {
+                    count_expr_reads(iter, reads);
+                    count_reads(body, reads);
+                    *reads.entry(var.clone()).or_insert(0) += 1; // Loop variable is read
+                }
+                Stmt::Block(inner) => {
+                    for s in inner { count_reads(s, reads); }
+                }
+                _ => {}
+            }
+        }
+        
+        fn count_expr_reads(expr: &Expr, reads: &mut std::collections::HashMap<String, usize>) {
+            match expr {
+                Expr::Ident(name) => { *reads.entry(name.clone()).or_insert(0) += 1; }
+                Expr::Binary(l, _, r) => { count_expr_reads(l, reads); count_expr_reads(r, reads); }
+                Expr::Unary(_, e) => count_expr_reads(e, reads),
+                Expr::Call(_, args) => { for a in args { count_expr_reads(a, reads); } }
+                Expr::MethodCall(obj, _, args) => { 
+                    count_expr_reads(obj, reads); 
+                    for a in args { count_expr_reads(a, reads); } 
+                }
+                Expr::Index(obj, idx) => { count_expr_reads(obj, reads); count_expr_reads(idx, reads); }
+                Expr::FieldAccess(obj, _) => count_expr_reads(obj, reads),
+                Expr::Array(elems) => { for e in elems { count_expr_reads(e, reads); } }
+                Expr::Map(pairs) => { for (k, v) in pairs { count_expr_reads(k, reads); count_expr_reads(v, reads); } }
+                Expr::InterpolatedString(parts) => { for p in parts { count_expr_reads(p, reads); } }
+                Expr::StructInit(_, fields) => { for (_, v) in fields { count_expr_reads(v, reads); } }
+                Expr::Ternary(c, t, f) => { count_expr_reads(c, reads); count_expr_reads(t, reads); count_expr_reads(f, reads); }
+                _ => {}
+            }
+        }
+
+        for stmt in &stmts { count_reads(stmt, &mut reads); }
+
+        // Filter out dead `let` statements
+        let mut optimized = Vec::new();
+        for stmt in stmts {
+            if let Stmt::Let(name, _) = &stmt {
+                // If the variable is never read, and it's not named '_' (unused marker),
+                // we can safely drop the allocation.
+                if !reads.contains_key(name) {
+                    continue; // Skip this statement entirely
+                }
+            }
+            optimized.push(stmt);
+        }
+        optimized
+    }
+
+    fn compile_function(&mut self, func_id: FuncId, params: &[String], body: &Stmt, pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>) {
         let mut sig = self.module.make_signature();
         for _ in 0..params.len() { sig.params.push(AbiParam::new(types::I64)); }
         sig.returns.push(AbiParam::new(types::I64));
@@ -253,7 +378,17 @@ impl AotCompiler {
             builder.declare_var(args_var, types::I64);
             builder.def_var(args_var, args_val);
             fctx.variables.insert("args".to_string(), args_var);
-            let terminated = Self::compile_stmt(&mut builder, &mut self.module, &self.runtime, &self.user_functions, &mut fctx, body);
+            let mut pc = std::mem::take(pending_closures);
+            let terminated = Self::compile_stmt(
+                &mut builder, 
+                &mut self.module, 
+                &self.runtime, 
+                &self.user_functions, 
+                &mut pc, 
+                &mut fctx, 
+                body
+            );
+            *pending_closures = pc;
             if !terminated { 
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().return_(&[zero]); 
@@ -272,28 +407,30 @@ impl AotCompiler {
 
     fn compile_stmt(
         builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs,
-        user_funcs: &HashMap<String, FuncId>, fctx: &mut FunctionContext, stmt: &Stmt,
+        user_funcs: &HashMap<String, FuncId>, 
+        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>, // <-- ADD
+        fctx: &mut FunctionContext, stmt: &Stmt,
     ) -> bool {
         match stmt {
             Stmt::Let(name, expr) => {
-                let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, expr);
+                let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let var = Variable::new(fctx.next_var); fctx.next_var += 1;
                 builder.declare_var(var, types::I64); builder.def_var(var, val);
                 fctx.variables.insert(name.clone(), var); false
             }
             Stmt::Assign(name, expr) => {
-                let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, expr);
+                let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let var = fctx.variables.get(name).unwrap(); builder.def_var(*var, val); false
             }
             Stmt::IndexSet(target, index, val) => {
-                let t = Self::compile_expr(builder, module, runtime, user_funcs, fctx, target);
-                let i = Self::compile_expr(builder, module, runtime, user_funcs, fctx, index);
-                let v = Self::compile_expr(builder, module, runtime, user_funcs, fctx, val);
+                let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, target);
+                let i = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, index);
+                let v = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, val);
                 let local_callee = module.declare_func_in_func(runtime.index_set_id, builder.func);
                 builder.ins().call(local_callee, &[t, i, v]); false
             }
             Stmt::FieldSet(obj, field, val) => {
-                let t = Self::compile_expr(builder, module, runtime, user_funcs, fctx, obj);
+                let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, obj);
                 let key_idx = STRING_COUNTER.fetch_add(1, Ordering::SeqCst);
                 let data_id = module.declare_data(&format!("str_{}", key_idx), Linkage::Export, true, false).unwrap();
                 let mut data_ctx = DataDescription::new();
@@ -305,20 +442,20 @@ impl AotCompiler {
                 let call = builder.ins().call(alloc_str_func, &[key_ptr]);
                 let key = builder.inst_results(call)[0];
                 
-                let v = Self::compile_expr(builder, module, runtime, user_funcs, fctx, val);
+                let v = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, val);
                 let set_func = module.declare_func_in_func(runtime.index_set_id, builder.func);
                 builder.ins().call(set_func, &[t, key, v]);
                 false
             }
             Stmt::Print(expr) => {
-                let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, expr);
+                let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let local_callee = module.declare_func_in_func(runtime.print_id, builder.func);
                 builder.ins().call(local_callee, &[val]); false
             }
-            Stmt::ExprStmt(expr) => { Self::compile_expr(builder, module, runtime, user_funcs, fctx, expr); false }
+            Stmt::ExprStmt(expr) => { Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr); false }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr { 
-                    Self::compile_expr(builder, module, runtime, user_funcs, fctx, e) 
+                    Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, e) 
                 } else { 
                     builder.ins().iconst(types::I64, 0) 
                 };
@@ -339,7 +476,7 @@ impl AotCompiler {
                 true
             }
             Stmt::Throw(expr) => {
-                let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, expr);
+                let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let throw_func = module.declare_func_in_func(runtime.throw_id, builder.func);
                 builder.ins().call(throw_func, &[val]);
                 if let Some((target, vars)) = &fctx.exception_target {
@@ -361,7 +498,7 @@ impl AotCompiler {
                 }
                 let prev_target = fctx.exception_target.clone();
                 fctx.exception_target = Some((catch_block, vars.clone()));
-                let try_term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, try_b);
+                let try_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, try_b);
                 fctx.exception_target = prev_target;
                 if !try_term {
                     let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
@@ -383,7 +520,7 @@ impl AotCompiler {
                 builder.declare_var(err_var, types::I64);
                 builder.def_var(err_var, exc_val);
                 fctx.variables.insert(err_name.clone(), err_var);
-                let catch_term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, catch_b);
+                let catch_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, catch_b);
                 if !catch_term {
                     let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                     builder.ins().jump(merge_block, &args);
@@ -410,7 +547,7 @@ impl AotCompiler {
                     builder.append_block_param(else_block, types::I64);
                     builder.append_block_param(merge_block, types::I64);
                 }
-                let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, cond);
+                let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
                 let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
                 let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
                 let truthy_val = builder.inst_results(truthy_call)[0];
@@ -426,7 +563,7 @@ impl AotCompiler {
                 for (i, var) in vars.iter().enumerate() {
                     builder.def_var(*var, then_params[i]);
                 }
-                let then_term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, then_b);
+                let then_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, then_b);
                 if !then_term {
                     let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                     builder.ins().jump(merge_block, &args);
@@ -437,7 +574,7 @@ impl AotCompiler {
                     builder.def_var(*var, else_params[i]);
                 }
                 let else_term = if let Some(eb) = else_b {
-                    Self::compile_stmt(builder, module, runtime, user_funcs, fctx, eb)
+                    Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, eb)
                 } else {
                     false
                 };
@@ -474,7 +611,7 @@ impl AotCompiler {
                 for (i, var) in vars.iter().enumerate() {
                     builder.def_var(*var, header_params[i]);
                 }
-                let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, cond);
+                let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
                 let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
                 let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
                 let truthy_val = builder.inst_results(truthy_call)[0];
@@ -492,7 +629,7 @@ impl AotCompiler {
                 for (i, var) in vars.iter().enumerate() {
                     builder.def_var(*var, body_params[i]);
                 }
-                let body_term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, body);
+                let body_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
                 fctx.loop_stack.pop();
                 if !body_term {
                     let loop_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
@@ -510,7 +647,7 @@ impl AotCompiler {
             Stmt::For(var_name, iter_expr, body) => {
                 let iter_var = Variable::new(fctx.next_var); fctx.next_var += 1;
                 let idx_var = Variable::new(fctx.next_var); fctx.next_var += 1;
-                let iter_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, iter_expr);
+                let iter_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, iter_expr);
                 builder.declare_var(iter_var, types::I64);
                 builder.def_var(iter_var, iter_val);
                 let zero = builder.ins().iconst(types::I64, 0);
@@ -563,7 +700,7 @@ impl AotCompiler {
                 builder.declare_var(loop_var, types::I64);
                 builder.def_var(loop_var, item_val);
                 fctx.variables.insert(var_name.clone(), loop_var);
-                let term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, body);
+                let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
                 if !term {
                     let incr_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                     builder.ins().jump(incr_block, &incr_args);
@@ -603,7 +740,7 @@ impl AotCompiler {
                     for b in &check_blocks { builder.append_block_param(*b, types::I64); }
                     if let Some(b) = else_check_block { builder.append_block_param(b, types::I64); }
                 }
-                let target_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, target);
+                let target_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, target);
                 let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                 builder.ins().jump(check_blocks[0], &args);
                 builder.seal_block(check_blocks[0]);
@@ -613,7 +750,7 @@ impl AotCompiler {
                     for (j, var) in vars.iter().enumerate() {
                         builder.def_var(*var, block_params[j]);
                     }
-                    let case_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, case_expr);
+                    let case_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, case_expr);
                     let eq_func = module.declare_func_in_func(runtime.eq_id, builder.func);
                     let eq_call = builder.ins().call(eq_func, &[target_val, case_val]);
                     let is_eq = builder.inst_results(eq_call)[0];
@@ -633,7 +770,7 @@ impl AotCompiler {
                     for (j, var) in vars.iter().enumerate() {
                         builder.def_var(*var, body_params[j]);
                     }
-                    let term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, body);
+                    let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
                     if !term {
                         let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                         builder.ins().jump(merge_block, &args);
@@ -647,7 +784,7 @@ impl AotCompiler {
                         for (j, var) in vars.iter().enumerate() {
                             builder.def_var(*var, block_params[j]);
                         }
-                        let term = Self::compile_stmt(builder, module, runtime, user_funcs, fctx, eb);
+                        let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, eb);
                         if !term {
                             let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
                             builder.ins().jump(merge_block, &args);
@@ -664,7 +801,7 @@ impl AotCompiler {
             }
             Stmt::Block(stmts) => {
                 for s in stmts {
-                    if Self::compile_stmt(builder, module, runtime, user_funcs, fctx, s) {
+                    if Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, s) {
                         return true;
                     }
                 }
@@ -680,9 +817,24 @@ impl AotCompiler {
 
     fn compile_expr(
         builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs,
-        user_funcs: &HashMap<String, FuncId>, fctx: &mut FunctionContext, expr: &Expr,
+        user_funcs: &HashMap<String, FuncId>, 
+        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>, // <-- ADD
+        fctx: &mut FunctionContext, expr: &Expr,
     ) -> Value {
         match expr {
+            Expr::Function(params, body) => {
+                let anon_name = format!("anon_fn_{}", STRING_COUNTER.fetch_add(1, Ordering::SeqCst));
+                pending_closures.push((anon_name.clone(), params.clone(), body.clone()));
+                
+                let mut sig = module.make_signature();
+                for _ in 0..params.len() { sig.params.push(AbiParam::new(types::I64)); }
+                sig.returns.push(AbiParam::new(types::I64));
+                
+                let func_id = module.declare_function(&format!("donky_fn_{}", anon_name), Linkage::Export, &sig).unwrap();
+                let func_ref = module.declare_func_in_func(func_id, builder.func);
+                let addr = builder.ins().func_addr(types::I64, func_ref);
+                addr
+            }
             Expr::Number(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
             Expr::Bool(b) => {
                 let tag_base: u64 = 0x7FF8_0000_0000_0000;
@@ -719,7 +871,7 @@ impl AotCompiler {
                 }
             }
             Expr::Unary(op, right) => {
-                let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, right);
+                let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, right);
                 match op {
                     TokenType::Minus => {
                         let v_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), val);
@@ -744,7 +896,7 @@ impl AotCompiler {
                 if let Some(func_id) = user_funcs.get(name) {
                     let local_callee = module.declare_func_in_func(*func_id, builder.func);
                     let mut arg_vals = Vec::new();
-                    for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, fctx, arg)); }
+                    for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, arg)); }
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let ret_val = builder.inst_results(call)[0];
                     let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
@@ -806,11 +958,30 @@ impl AotCompiler {
                         "http_get" => runtime.http_get_id,
                         "spawn" => runtime.spawn_id,
                         "gc" => runtime.gc_id,
+                        "gui_init" => runtime.gui_init_id,
+                        "gui_draw_text" => runtime.gui_draw_text_id,
+                        "gui_update" => runtime.gui_update_id,
+                        "gui_add_button" => runtime.gui_add_button_id,     // <-- ADD
+                        "gui_add_label" => runtime.gui_add_label_id,       // <-- ADD
+                        "gui_update_text" => runtime.gui_update_text_id,   // <-- ADD
+                        "gui_get_clicked" => runtime.gui_get_clicked_id,
+                        "gui_clear" => runtime.gui_clear_id,
+                        "gui_repaint" => runtime.gui_repaint_id,
+                        "gui_draw_rect" => runtime.gui_draw_rect_id,
+                        "cpu_usage" => runtime.cpu_usage_id,
+                        "gui_webview" => runtime.gui_webview_id,
+                        "kill_process" => runtime.kill_process_id,
+                        "uptime" => runtime.uptime_id,
+                        "cpu_cores" => runtime.cpu_cores_id,
+                        "disk_info" => runtime.disk_info_id,
+                        "sub" => runtime.sub_id,
+                        "mul" => runtime.mul_id,
+                        "div" => runtime.div_id,
                         _ => panic!("Unknown builtin function: {}", name),
                     };
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
                     let mut arg_vals = Vec::new();
-                    for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, fctx, arg)); }
+                    for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, arg)); }
                     
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let results = builder.inst_results(call);
@@ -862,7 +1033,7 @@ impl AotCompiler {
                 let call = builder.ins().call(arr_func, &[]);
                 let arr_handle = builder.inst_results(call)[0];
                 for el in elements {
-                    let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, el);
+                    let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, el);
                     let push_func = module.declare_func_in_func(runtime.array_push_id, builder.func);
                     builder.ins().call(push_func, &[arr_handle, val]);
                 }
@@ -873,8 +1044,8 @@ impl AotCompiler {
                 let call = builder.ins().call(map_func, &[]);
                 let map_handle = builder.inst_results(call)[0];
                 for (k, v) in pairs {
-                    let key = Self::compile_expr(builder, module, runtime, user_funcs, fctx, k);
-                    let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, v);
+                    let key = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, k);
+                    let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, v);
                     let set_func = module.declare_func_in_func(runtime.map_set_id, builder.func);
                     builder.ins().call(set_func, &[map_handle, key, val]);
                 }
@@ -924,20 +1095,20 @@ impl AotCompiler {
                     let field_key_call = builder.ins().call(alloc_str_func, &[field_ptr]);
                     let field_key = builder.inst_results(field_key_call)[0];
 
-                    let val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, field_val);
+                    let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, field_val);
                     builder.ins().call(set_func, &[map_handle, field_key, val]);
                 }
                 map_handle
             }
             Expr::Index(target, index) => {
-                let t = Self::compile_expr(builder, module, runtime, user_funcs, fctx, target);
-                let i = Self::compile_expr(builder, module, runtime, user_funcs, fctx, index);
+                let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, target);
+                let i = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, index);
                 let get_func = module.declare_func_in_func(runtime.index_get_id, builder.func);
                 let call = builder.ins().call(get_func, &[t, i]);
                 builder.inst_results(call)[0]
             }
             Expr::FieldAccess(obj, field) => {
-                let t = Self::compile_expr(builder, module, runtime, user_funcs, fctx, obj);
+                let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, obj);
                 let key_idx = STRING_COUNTER.fetch_add(1, Ordering::SeqCst);
                 let data_id = module.declare_data(&format!("str_{}", key_idx), Linkage::Export, true, false).unwrap();
                 let mut data_ctx = DataDescription::new();
@@ -954,8 +1125,30 @@ impl AotCompiler {
                 builder.inst_results(call)[0]
             }
             Expr::Binary(left, op, right) => {
-                let lhs = Self::compile_expr(builder, module, runtime, user_funcs, fctx, left);
-                let rhs = Self::compile_expr(builder, module, runtime, user_funcs, fctx, right);
+                // --- NEW: Constant Folding ---
+                if let (Expr::Number(l), Expr::Number(r)) = (left.as_ref(), right.as_ref()) {
+                    let result = match op {
+                        TokenType::Plus => Some(l + r),
+                        TokenType::Minus => Some(l - r),
+                        TokenType::Star => Some(l * r),
+                        TokenType::Slash => if *r != 0.0 { Some(l / r) } else { None },
+                        TokenType::Percent => Some(l % r),
+                        TokenType::EqEq => Some(if l == r { 1.0 } else { 0.0 }),
+                        TokenType::NotEq => Some(if l != r { 1.0 } else { 0.0 }),
+                        TokenType::Lt => Some(if l < r { 1.0 } else { 0.0 }),
+                        TokenType::LtEq => Some(if l <= r { 1.0 } else { 0.0 }),
+                        TokenType::Gt => Some(if l > r { 1.0 } else { 0.0 }),
+                        TokenType::GtEq => Some(if l >= r { 1.0 } else { 0.0 }),
+                        _ => None,
+                    };
+                    if let Some(val) = result {
+                        return builder.ins().iconst(types::I64, val.to_bits() as i64);
+                    }
+                }
+                // --- END Constant Folding ---
+                
+                let lhs = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, left);
+                let rhs = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, right);
                 let cmp = match op {
                     TokenType::EqEq => Some(FloatCC::Equal), TokenType::NotEq => Some(FloatCC::NotEqual),
                     TokenType::Lt => Some(FloatCC::LessThan), TokenType::LtEq => Some(FloatCC::LessThanOrEqual),
@@ -1047,9 +1240,9 @@ impl AotCompiler {
             }
             Expr::InterpolatedString(parts) => {
                 if parts.is_empty() {
-                    return Self::compile_expr(builder, module, runtime, user_funcs, fctx, &Expr::String("".into()));
+                    return Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Expr::String("".into()));
                 }
-                let mut acc = Self::compile_expr(builder, module, runtime, user_funcs, fctx, &parts[0]);
+                let mut acc = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &parts[0]);
                 let str_func = module.declare_func_in_func(runtime.str_id, builder.func);
                 let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
                 
@@ -1058,7 +1251,7 @@ impl AotCompiler {
                 acc = builder.inst_results(acc_str_call)[0];
 
                 for part in &parts[1..] {
-                    let p_val = Self::compile_expr(builder, module, runtime, user_funcs, fctx, part);
+                    let p_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, part);
                     let p_str_call = builder.ins().call(str_func, &[p_val]);
                     let p_str = builder.inst_results(p_str_call)[0];
                     let add_call = builder.ins().call(add_func, &[acc, p_str]);

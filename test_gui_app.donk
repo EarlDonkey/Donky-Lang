@@ -1,0 +1,39 @@
+let success = gui_init("Donky Video Editor", 1000, 700);
+if success == 0 {
+    print("Failed to create window.");
+} else {
+    // 1. Create UI Elements
+    let lbl_title = gui_add_label("NIGHT DRIVE", 400, 50, 200, 30);
+    let btn_play = gui_add_button("Play", 400, 100, 100, 40);
+    let btn_stop = gui_add_button("Stop", 510, 100, 100, 40);
+    
+    // 2. Main Event Loop
+    let running = true;
+    let is_playing = false;
+    let frame = 0;
+    
+    while running {
+        // Process Windows messages (keeps the window responsive)
+        gui_update();
+        
+        // Check if a button was clicked
+        let clicked = gui_get_clicked();
+        if clicked == btn_play {
+            is_playing = true;
+        }
+        if clicked == btn_stop {
+            is_playing = false;
+            frame = 0;
+        }
+        
+        // Update UI based on state
+        if is_playing {
+            frame = frame + 1;
+            gui_update_text(lbl_title, "PLAYING: Frame " + str(frame));
+        } else {
+            gui_update_text(lbl_title, "STOPPED");
+        }
+        
+        sleep(16); // ~60 FPS
+    }
+}

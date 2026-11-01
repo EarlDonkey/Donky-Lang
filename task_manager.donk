@@ -1,0 +1,124 @@
+fn handle_client(client) {
+    let req = tcp_read(client, 65536);
+    if len(req) == 0 {
+        tcp_close(client);
+        return 0;
+    }
+
+    // 1. Extended System Metrics Endpoint
+    if contains(req, "GET /api/system") {
+        let cpu = cpu_usage();
+        let total = total_mem();
+        let used = used_mem();
+        let up = uptime();
+        let cores = cpu_cores();
+        let disk = disk_info();
+
+        let json = "{"
+            + "\"cpu\":" + str(cpu) + ","
+            + "\"total_mem\":" + str(total) + ","
+            + "\"used_mem\":" + str(used) + ","
+            + "\"uptime\":" + str(up) + ","
+            + "\"cores\":" + str(cores) + ","
+            + "\"disk_total\":" + str(disk["total_gb"]) + ","
+            + "\"disk_free\":" + str(disk["free_gb"]) + ","
+            + "\"disk_used\":" + str(disk["used_gb"])
+            + "}";
+
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + json;
+        tcp_write(client, res);
+        tcp_close(client);
+        return 0;
+    }
+
+    // 2. Process List Endpoint
+    if contains(req, "GET /api/processes") {
+        let procs = get_processes();
+        let json = "[";
+        let i = 0;
+        
+        while i < len(procs) && i < 120 {
+            let p = procs[i];
+            json = json + "{"
+                + "\"pid\":" + str(p["pid"]) + ","
+                + "\"name\":\"" + p["name"] + "\","
+                + "\"mem\":" + str(p["mem"]) + ","
+                + "\"threads\":" + str(p["threads"])
+                + "}";
+            if i < len(procs) - 1 && i < 119 {
+                json = json + ",";
+            }
+            i = i + 1;
+        }
+        json = json + "]";
+
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + json;
+        tcp_write(client, res);
+        tcp_close(client);
+        return 0;
+    }
+
+    // 3. Process Termination Endpoint
+    if contains(req, "/api/kill") {
+        let parts = split(req, "pid=");
+        let success = 0;
+        if len(parts) > 1 {
+            let pid_raw = split(parts[1], " ")[0];
+            let pid_clean = split(split(pid_raw, "\r")[0], "\n")[0];
+            let target_pid = num(pid_clean);
+            success = kill_process(target_pid);
+        }
+        let json = "{\"success\":" + str(success) + "}";
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + json;
+        tcp_write(client, res);
+        tcp_close(client);
+        return 0;
+    }
+
+    // 4. Serve HTML Frontend
+    let html = "";
+    try {
+        html = read_file("C:/Users/user/Desktop/Donky-Lang/task_manager.html");
+    } catch err {
+        html = "<html><body><h1>UI File Missing</h1><p>Save task_manager.html in your app directory.</p></body></html>";
+    }
+
+    let res = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + str(len(html)) + "\r\n\r\n" + html;
+    tcp_write(client, res);
+    tcp_close(client);
+    return 0;
+}
+
+fn start_server() {
+    let server = tcp_listen(8081);
+    print("Donky Server Active on http://localhost:8081");
+    while true {
+        let client = tcp_accept(server);
+        if client > 0 {
+            spawn(handle_client, client);
+        }
+    }
+}
+
+spawn(start_server, 0);
+
+// Wait for the server to be reachable (poll it)
+let ready = false;
+let tries = 0;
+while !ready && tries < 30 {
+    sleep(100);
+    try {
+        let test = http_get("http://localhost:8081/");
+        if len(test) > 0 { ready = true; }
+    } catch e {
+        ready = false;
+    }
+    tries = tries + 1;
+}
+
+if ready {
+    print("Server ready! Opening WebView...");
+    gui_webview("http://localhost:8081");
+} else {
+    print("Server failed to start.");
+}

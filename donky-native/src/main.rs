@@ -64,7 +64,7 @@ fn main() {
             
             println!("Linking with GCC...");
             let status = std::process::Command::new("gcc")
-                .args(&[obj_path, "runtime.c", "-o", "donky_app.exe", "-lws2_32", "-lpsapi", "-lm", "-lwinhttp"])
+                .args(&[obj_path, "runtime.c", "-o", "donky_app.exe", "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"])
                 .status()
                 .expect("Failed to run gcc. Make sure GCC/MinGW is in your PATH.");
                 
