@@ -25,7 +25,9 @@
 
 static int rand_seeded = 0;
 
+#define MAX_THREADS 64
 static volatile int active_threads = 0;
+static HANDLE active_threads_handles[MAX_THREADS];
 
 #define TAG_MASK 0xFFF8000000000000ULL
 #define TAG_BASE 0x7FF8000000000000ULL
@@ -33,6 +35,12 @@ static volatile int active_threads = 0;
 #define TAG_STRING 2ULL
 #define TAG_ARRAY 3ULL
 #define TAG_MAP 4ULL
+
+CRITICAL_SECTION gc_lock;
+
+void gc_init() {
+    InitializeCriticalSection(&gc_lock);
+}
 
 // --- Garbage Collector Structures ---
 typedef struct GCHeader {
@@ -43,12 +51,13 @@ typedef struct GCHeader {
 
 static GCHeader* gc_head = NULL;
 static size_t gc_bytes_allocated = 0;
-static size_t gc_threshold = 1024 * 1024; // Trigger GC after 1MB of allocations
+static size_t gc_threshold = 1024 * 50; // Trigger GC after 1MB of allocations
 
 void gc_collect(); // Forward declaration
 
 // The custom allocator
 void* gc_malloc(size_t size) {
+    EnterCriticalSection(&gc_lock);
     GCHeader* header = (GCHeader*)malloc(sizeof(GCHeader) + size);
     if (!header) { printf("OOM!\n"); exit(1); }
     
@@ -56,9 +65,10 @@ void* gc_malloc(size_t size) {
     header->marked = 0;
     header->size = size;
     gc_head = header;
-    
+
     gc_bytes_allocated += size;
-    
+
+    LeaveCriticalSection(&gc_lock);
     return (void*)(header + 1); // Return pointer AFTER the header
 }
 
@@ -727,6 +737,7 @@ uint64_t donky_get_args() { return donky_args_array; }
 typedef struct {
     uint64_t func_ptr;
     uint64_t arg1;
+    int slot;
 } ThreadArgs;
 
 unsigned __stdcall donky_thread_runner(void* raw_args) {
@@ -734,33 +745,50 @@ unsigned __stdcall donky_thread_runner(void* raw_args) {
     
     uintptr_t fp = (uintptr_t)args->func_ptr;
     uint64_t a1 = args->arg1;
+    int slot = args->slot;
     
-    // Cast to a function that takes one uint64_t
     typedef uint64_t (*DonkyFn)(uint64_t);
     DonkyFn fn = (DonkyFn)fp;
     
     fn(a1); 
     
-    free(args);
+    // Thread is done. Clean up under lock.
+    EnterCriticalSection(&gc_lock);
+    CloseHandle(active_threads_handles[slot]);
+    active_threads_handles[slot] = NULL;
     active_threads--;
+    LeaveCriticalSection(&gc_lock);
+    
+    free(args);
     return 0;
 }
 
+#define MAX_THREADS 64
+static HANDLE active_threads_handles[MAX_THREADS];
+
+// In donky_spawn:
 uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
+    EnterCriticalSection(&gc_lock);
+    if (active_threads >= MAX_THREADS) {
+        LeaveCriticalSection(&gc_lock);
+        return make_number(-1.0);
+    }
+    // Find a free slot
+    int slot = -1;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (active_threads_handles[i] == NULL) { slot = i; break; }
+    }
+    
+    // Spawn the thread with the slot index
     ThreadArgs* args = malloc(sizeof(ThreadArgs));
     args->func_ptr = func_val;
     args->arg1 = arg1;
+    args->slot = slot;
     
+    active_threads_handles[slot] = (HANDLE)_beginthreadex(NULL, 0, donky_thread_runner, args, CREATE_SUSPENDED, NULL);
+    ResumeThread(active_threads_handles[slot]);
     active_threads++;
-    uintptr_t thread_handle = _beginthreadex(NULL, 0, donky_thread_runner, args, 0, NULL);
-    
-    if (thread_handle == 0) {
-        active_threads--;
-        free(args);
-        return make_number(-1.0);
-    }
-    
-    CloseHandle((HANDLE)thread_handle);
+    LeaveCriticalSection(&gc_lock);
     return make_number(0.0);
 }
 
@@ -794,14 +822,10 @@ void gc_mark_stack() {
 }
 
 void gc_collect() {
-    // Reset the allocation counter
-    size_t before_bytes = 0;
-    for (GCHeader* h = gc_head; h != NULL; h = h->next) {
-        before_bytes += h->size;
-    }
-    printf("[GC] Before: %zu bytes | ", before_bytes);
-    gc_bytes_allocated = 0; 
+    EnterCriticalSection(&gc_lock);
 
+    gc_bytes_allocated = 0;
+    
     // 1. Mark globals
     extern uint64_t donky_args_array;
     if (donky_args_array != 0) gc_mark(donky_args_array);
@@ -809,19 +833,13 @@ void gc_collect() {
     extern uint64_t current_exception;
     if (current_exception != 0) gc_mark(current_exception);
     
-    // 2. Scan the stack
+    // 2. Scan the main stack
     gc_mark_stack();
     
     // 3. Sweep
     gc_sweep();
-
-    size_t after_bytes = 0;
-    size_t live_count = 0;
-    for (GCHeader* h = gc_head; h != NULL; h = h->next) {
-        after_bytes += h->size;
-        live_count++;
-    }
-    printf("[GC] After sweep: %zu bytes | Live objects: %zu\n", after_bytes, live_count);
+    
+    LeaveCriticalSection(&gc_lock);
 }
 
 uint64_t donky_gc() {
@@ -830,6 +848,7 @@ uint64_t donky_gc() {
 }
 
 int main(int argc, char** argv) {
+    gc_init();
     donky_set_args(argc, argv);
     extern int64_t donky_toplevel();
     donky_toplevel();
