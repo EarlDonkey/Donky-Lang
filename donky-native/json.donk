@@ -6,12 +6,12 @@
 // Parser state — byte-based to handle UTF-8 safely
 // ============================================================
 
-fn json_ws(b) -> bool {
+fn json_ws(b) {
     // space, tab, lf, cr
     return b == 32 || b == 9 || b == 10 || b == 13;
 }
 
-fn json_skip_ws(input, pos) -> num {
+fn json_skip_ws(input, pos) {
     let i = pos;
     while i < len(input) {
         if !json_ws(byte_at(input, i)) { break; }
@@ -21,7 +21,7 @@ fn json_skip_ws(input, pos) -> num {
 }
 
 // Returns a 2-element array: [value, new_pos]
-fn json_parse_string(input, pos) -> array {
+fn json_parse_string(input, pos) {
     // input[pos] must be `"` (byte 34)
     let i = pos + 1;
     let bytes = [];
@@ -49,7 +49,7 @@ fn json_parse_string(input, pos) -> array {
     throw "json: unterminated string";
 }
 
-fn json_parse_number(input, pos) -> array {
+fn json_parse_number(input, pos) {
     let i = pos;
     // optional minus
     if byte_at(input, i) == 45 { i = i + 1; }
@@ -81,7 +81,7 @@ fn json_parse_number(input, pos) -> array {
     return [num(s), i];
 }
 
-fn json_parse_array(input, pos) -> array {
+fn json_parse_array(input, pos) {
     // input[pos] == '['
     let i = json_skip_ws(input, pos + 1);
     let arr = [];
@@ -100,7 +100,7 @@ fn json_parse_array(input, pos) -> array {
     }
 }
 
-fn json_parse_object(input, pos) -> array {
+fn json_parse_object(input, pos) {
     // input[pos] == '{'
     let i = json_skip_ws(input, pos + 1);
     let obj = {};
@@ -124,7 +124,7 @@ fn json_parse_object(input, pos) -> array {
     }
 }
 
-fn json_parse_value(input, pos) -> array {
+fn json_parse_value(input, pos) {
     let i = json_skip_ws(input, pos);
     let b = byte_at(input, i);
     if b == 34 { return json_parse_string(input, i); }
@@ -145,7 +145,7 @@ fn json_parse_value(input, pos) -> array {
 }
 
 // Public: parse a JSON string into a Donky value
-fn json_parse(input) -> any {
+fn json_parse(input) {
     if type(input) != "string" || len(trim(input)) == 0 {
         return {};
     }
@@ -157,7 +157,7 @@ fn json_parse(input) -> any {
 // Serializer
 // ============================================================
 
-fn json_escape_string(s) -> string {
+fn json_escape_string(s) {
     let out = [];
     let i = 0;
     while i < len(s) {
@@ -175,7 +175,7 @@ fn json_escape_string(s) -> string {
     return join(out, "");
 }
 
-fn json_stringify(value) -> string {
+fn json_stringify(value) {
     let t = type(value);
     if t == "number" {
         return str(value);
@@ -210,7 +210,7 @@ fn json_stringify(value) -> string {
 // Convenience: safe map access (no throw on missing)
 // ============================================================
 
-fn json_get(obj, key, default_value) -> any {
+fn json_get(obj, key, default_value) {
     if type(obj) != "map" { return default_value; }
     if !contains(obj, key) { return default_value; }
     return obj[key];

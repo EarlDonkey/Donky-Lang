@@ -1,20 +1,33 @@
 import "lib/http.donk";
+import "lib/json.donk";
 
 fn handle_client(client) {
     let raw_req = read_until(client, "\r\n\r\n", 8192);
     let path = get_path(raw_req);
-    let full_path = "examples/public" + path; // Note: fix this path to your actual folder!
     
     let body = "";
     let status = "200 OK";
     let mime = mime_for(path);
     
-    try {
-        body = read_file(full_path);
-    } catch e {
-        status = "404 Not Found";
-        mime = "text/plain";
-        body = "Donky says: " + str(e);
+    if path == "/api/dogs" {
+        // API Route!
+        let dogs = [
+            Dog { name: "Buddy", age: 3, breed: "Corgi" },
+            Dog { name: "Max", age: 5, breed: "Terrier" }
+        ];
+        body = json_stringify(dogs);
+        mime = "application/json";
+        status = "200 OK";
+    } else {
+        // Static File Route
+        let full_path = "examples/public" + path; // Make sure this matches your folder!
+        try {
+            body = read_file(full_path);
+        } catch e {
+            status = "404 Not Found";
+            mime = "text/plain";
+            body = "Donky says: " + str(e);
+        }
     }
     
     let response = "HTTP/1.1 ${status}\r\n" +
@@ -32,7 +45,7 @@ let server = tcp_listen(port);
 print("Concurrent server running on http://localhost:${port} ...");
 
 while true {
-    gc(); // Safe point: collect garbage before accepting a new connection
+    gc();
     let client = tcp_accept(server);
     spawn(handle_client, client);
 }
