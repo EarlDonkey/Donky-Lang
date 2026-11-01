@@ -18,10 +18,11 @@
 #include <process.h> // for _beginthreadex
 #include <inttypes.h>
 #include <setjmp.h>
-
+#include <winhttp.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "winhttp.lib")
 
 static int rand_seeded = 0;
 
@@ -239,30 +240,91 @@ uint64_t donky_tcp_close(uint64_t client_val) {
 uint64_t donky_http_get(uint64_t url_val) {
     if (get_tag(url_val) != TAG_STRING) return 0;
     char* url = (char*)as_index(url_val);
+
+    // 1. Convert the URL to a wide string (WinHTTP requires LPCWSTR)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, url, -1, NULL, 0);
+    wchar_t* wurl = malloc(wlen * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, wlen);
+
+    // 2. Parse the URL into components (host, path, port, scheme)
+    URL_COMPONENTS urlComp;
+    ZeroMemory(&urlComp, sizeof(urlComp));
+    urlComp.dwStructSize = sizeof(urlComp);
     
-    // Use Windows built-in curl to fetch the URL
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "curl -s \"%s\"", url);
-    
-    FILE* pipe = _popen(cmd, "r");
-    if (!pipe) return donky_alloc_string("");
-    
-    char buffer[4096];
-    char* result = malloc(1);
-    result[0] = 0;
-    size_t total_len = 0;
-    
-    while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-        size_t len = strlen(buffer);
-        result = realloc(result, total_len + len + 1);
-        strcpy(result + total_len, buffer);
-        total_len += len;
+    // Allocate buffers for the components
+    wchar_t hostName[256];
+    wchar_t urlPath[2048];
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 256;
+    urlComp.lpszUrlPath = urlPath;
+    urlComp.dwUrlPathLength = 2048;
+
+    if (!WinHttpCrackUrl(wurl, 0, 0, &urlComp)) {
+        free(wurl);
+        return donky_alloc_string(""); // Failed to parse URL
     }
-    
-    _pclose(pipe);
-    uint64_t res = donky_alloc_string(result);
-    free(result);
-    return res;
+
+    // 3. Initialize WinHTTP session
+    HINTERNET hSession = WinHttpOpen(L"Donky/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) { free(wurl); return donky_alloc_string(""); }
+
+    // 4. Connect to the host
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); free(wurl); return donky_alloc_string(""); }
+
+    // 5. Open the request (Handling HTTPS vs HTTP)
+    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath, NULL, 
+                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) { 
+        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); free(wurl); 
+        return donky_alloc_string(""); 
+    }
+
+    // 6. Send the request
+    BOOL bResults = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, 
+                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (bResults) {
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+    }
+
+    // 7. Read the response body
+    char* response_body = NULL;
+    size_t total_size = 0;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+
+    if (bResults) {
+        do {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+            if (dwSize == 0) break;
+
+            char* buffer = malloc(dwSize + 1);
+            ZeroMemory(buffer, dwSize + 1);
+
+            if (WinHttpReadData(hRequest, (LPVOID)buffer, dwSize, &dwDownloaded)) {
+                // Append to our growing response body
+                response_body = realloc(response_body, total_size + dwDownloaded + 1);
+                memcpy(response_body + total_size, buffer, dwDownloaded);
+                total_size += dwDownloaded;
+                response_body[total_size] = 0; // Null terminate
+            }
+            free(buffer);
+        } while (dwSize > 0);
+    }
+
+    // 8. Clean up handles
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    free(wurl);
+
+    // 9. Return the Donky string
+    uint64_t result = donky_alloc_string(response_body ? response_body : "");
+    free(response_body);
+    return result;
 }
 
 uint64_t donky_alloc_array() {
@@ -741,51 +803,49 @@ typedef struct {
 } ThreadArgs;
 
 unsigned __stdcall donky_thread_runner(void* raw_args) {
-    ThreadArgs* args = (ThreadArgs*)raw_args;
+    ThreadArgs* targs = (ThreadArgs*)raw_args;
     
-    uintptr_t fp = (uintptr_t)args->func_ptr;
-    uint64_t a1 = args->arg1;
-    int slot = args->slot;
+    uintptr_t fp = (uintptr_t)targs->func_ptr;
+    uint64_t a1 = targs->arg1;
+    int slot = targs->slot;
     
     typedef uint64_t (*DonkyFn)(uint64_t);
     DonkyFn fn = (DonkyFn)fp;
     
     fn(a1); 
     
-    // Thread is done. Clean up under lock.
     EnterCriticalSection(&gc_lock);
     CloseHandle(active_threads_handles[slot]);
     active_threads_handles[slot] = NULL;
     active_threads--;
     LeaveCriticalSection(&gc_lock);
     
-    free(args);
+    free(targs);
     return 0;
 }
 
-#define MAX_THREADS 64
-static HANDLE active_threads_handles[MAX_THREADS];
-
-// In donky_spawn:
 uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
     EnterCriticalSection(&gc_lock);
     if (active_threads >= MAX_THREADS) {
         LeaveCriticalSection(&gc_lock);
         return make_number(-1.0);
     }
-    // Find a free slot
+    
     int slot = -1;
     for (int i = 0; i < MAX_THREADS; i++) {
         if (active_threads_handles[i] == NULL) { slot = i; break; }
     }
+    if (slot == -1) {
+        LeaveCriticalSection(&gc_lock);
+        return make_number(-1.0);
+    }
     
-    // Spawn the thread with the slot index
-    ThreadArgs* args = malloc(sizeof(ThreadArgs));
-    args->func_ptr = func_val;
-    args->arg1 = arg1;
-    args->slot = slot;
+    ThreadArgs* targs = malloc(sizeof(ThreadArgs));
+    targs->func_ptr = func_val;
+    targs->arg1 = arg1;
+    targs->slot = slot;
     
-    active_threads_handles[slot] = (HANDLE)_beginthreadex(NULL, 0, donky_thread_runner, args, CREATE_SUSPENDED, NULL);
+    active_threads_handles[slot] = (HANDLE)_beginthreadex(NULL, 0, donky_thread_runner, targs, CREATE_SUSPENDED, NULL);
     ResumeThread(active_threads_handles[slot]);
     active_threads++;
     LeaveCriticalSection(&gc_lock);

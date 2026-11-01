@@ -121,6 +121,7 @@ impl AotCompiler {
             mod_id: declare("donky_mod", &[types::I64, types::I64], Some(types::I64)),
             spawn_id: declare("donky_spawn", &[types::I64, types::I64], Some(types::I64)),
             gc_id: declare("donky_gc", &[], Some(types::I64)),
+            
         };
         
         AotCompiler { builder_context: FunctionBuilderContext::new(), ctx: codegen::Context::new(), module, user_functions: HashMap::new(), runtime }
@@ -810,6 +811,7 @@ impl AotCompiler {
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
                     let mut arg_vals = Vec::new();
                     for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, fctx, arg)); }
+                    
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let results = builder.inst_results(call);
                     let ret_val = if results.is_empty() { builder.ins().iconst(types::I64, 0) } else { results[0] };

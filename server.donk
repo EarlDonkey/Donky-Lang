@@ -1,6 +1,60 @@
 import "lib/http.donk";
 import "lib/json.donk";
 
+// =========================================================
+// FLEX 1: In-Memory Database (using Structs and Maps)
+// =========================================================
+let db = {
+    "users": [
+        User { id: 1, name: "Henri", role: "admin", active: true },
+        User { id: 2, name: "Alice", role: "user", active: true },
+        User { id: 3, name: "Bob", role: "user", active: false }
+    ],
+    "metrics": { "requests": 0, "errors": 0 }
+};
+
+// =========================================================
+// FLEX 2: Background Worker Thread (Concurrency)
+// =========================================================
+fn background_cleanup() {
+    while true {
+        sleep(5000); // Wait 5 seconds
+        // Simulate background work (e.g., clearing caches, health checks)
+        let users = db["users"];
+        for u in users {
+            if u["active"] == false {
+                // Just simulating a log for inactive users
+                // print("[Worker] Found inactive user: " + u["name"]);
+            }
+        }
+    }
+}
+
+// =========================================================
+// FLEX 3: Dynamic API Routing with JSON Responses
+// =========================================================
+fn api_router(path) {
+    if path == "/api/users" {
+        return json_stringify(db["users"]);
+    }
+    if path == "/api/metrics" {
+        return json_stringify(db["metrics"]);
+    }
+    if path == "/api/status" {
+        let status_report = {
+            "status": "healthy",
+            "version": "1.0.0",
+            "timestamp": now(),
+            "gc_managed": true
+        };
+        return json_stringify(status_report);
+    }
+    throw "API route not found: " + path;
+}
+
+// =========================================================
+// FLEX 4: The HTTP Handler
+// =========================================================
 fn handle_client(client) {
     let raw_req = read_until(client, "\r\n\r\n", 8192);
     let path = get_path(raw_req);
@@ -9,30 +63,34 @@ fn handle_client(client) {
     let status = "200 OK";
     let mime = mime_for(path);
     
-    if path == "/api/dogs" {
-        // API Route!
-        let dogs = [
-            Dog { name: "Buddy", age: 3, breed: "Corgi" },
-            Dog { name: "Max", age: 5, breed: "Terrier" }
-        ];
-        body = json_stringify(dogs);
-        mime = "application/json";
-        status = "200 OK";
-    } else {
-        // Static File Route
-        let full_path = "examples/public" + path; // Make sure this matches your folder!
-        try {
+    // Increment metrics (demonstrating mutable state across threads)
+    db["metrics"]["requests"] = db["metrics"]["requests"] + 1;
+
+    try {
+        if contains(path, "/api/") {
+            // API Route
+            body = api_router(path);
+            mime = "application/json";
+            status = "200 OK";
+        } else {
+            // Static File Route
+            let full_path = "examples/public" + path;
             body = read_file(full_path);
-        } catch e {
-            status = "404 Not Found";
-            mime = "text/plain";
-            body = "Donky says: " + str(e);
         }
+    } catch e {
+        // FLEX 5: Exception Handling
+        db["metrics"]["errors"] = db["metrics"]["errors"] + 1;
+        status = "404 Not Found";
+        mime = "application/json";
+        body = json_stringify({ "error": str(e), "status": 404 });
     }
     
+    // FLEX 6: CORS Headers (so a frontend could consume this API)
     let response = "HTTP/1.1 ${status}\r\n" +
                    "Content-Type: ${mime}\r\n" +
                    "Content-Length: ${len(body)}\r\n" +
+                   "Access-Control-Allow-Origin: *\r\n" +
+                   "Server: Donky/1.0\r\n" +
                    "Connection: close\r\n\r\n" + 
                    body;
 
@@ -40,12 +98,22 @@ fn handle_client(client) {
     tcp_close(client);
 }
 
+// =========================================================
+// FLEX 7: The Main Event Loop
+// =========================================================
 let port = 8080;
 let server = tcp_listen(port);
-print("Concurrent server running on http://localhost:${port} ...");
+
+// Spawn the background worker
+spawn(background_cleanup, 0);
+
+print("=========================================");
+print("  Donky API Server running on :${port}  ");
+print("  Try: http://localhost:8081/api/users   ");
+print("=========================================");
 
 while true {
-    gc();
+    gc(); // Safe-point GC
     let client = tcp_accept(server);
     spawn(handle_client, client);
 }

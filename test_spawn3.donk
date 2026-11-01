@@ -1,0 +1,13 @@
+fn worker(a, b, c) {
+    print("Worker received: " + str(a) + ", " + str(b) + ", " + str(c));
+}
+
+fn main() {
+    print("Main starting...");
+    spawn(worker, 10, 20, 30);
+    print("Main ending...");
+    // Give the thread a moment to run
+    sleep(100); 
+}
+
+main();
