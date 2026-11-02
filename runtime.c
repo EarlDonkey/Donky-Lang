@@ -594,6 +594,10 @@ uint64_t donky_contains(uint64_t haystack, uint64_t needle) {
 
 uint64_t donky_now() { return make_number((double)time(NULL)); }
 
+uint64_t donky_now_ms() {
+    return make_number((double)GetTickCount64());
+}
+
 uint64_t donky_random(uint64_t max_val) {
     if (!rand_seeded) { srand((unsigned)time(NULL)); rand_seeded = 1; }
     int max = (int)as_number(max_val);

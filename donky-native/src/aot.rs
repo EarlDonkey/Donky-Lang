@@ -3,8 +3,9 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use cranelift_module::{Module, Linkage, FuncId, DataDescription};
 use crate::ast::{Expr, Stmt};
 use crate::lexer::TokenType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
 
 static STRING_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -50,9 +51,10 @@ pub struct AotCompiler {
 
 struct FunctionContext {
     variables: HashMap<String, Variable>,
+    num_vars: HashSet<String>,
     next_var: usize,
     exception_target: Option<Block>,
-    loop_stack: Vec<(Block, Block)>, // (exit_block, continue_block)
+    loop_stack: Vec<(Block, Block)>,
 }
 
 impl AotCompiler {
@@ -224,7 +226,13 @@ impl AotCompiler {
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
-            let mut fctx = FunctionContext { variables: HashMap::new(), next_var: 0, exception_target: None, loop_stack: Vec::new() };
+            let mut fctx = FunctionContext { 
+                variables: HashMap::new(), 
+                num_vars: HashSet::new(), 
+                next_var: 0, 
+                exception_target: None, 
+                loop_stack: Vec::new() 
+            };
             
             let get_args_func = self.module.declare_func_in_func(self.runtime.get_args_id, builder.func);
             let args_call = builder.ins().call(get_args_func, &[]);
@@ -236,6 +244,10 @@ impl AotCompiler {
             
             // --- DCE Optimization ---
             let optimized_stmts = Self::optimize_block(stmts.to_vec());
+
+            let root = Stmt::Block(optimized_stmts.clone());
+            fctx.num_vars = Self::analyze_numeric(&[], &root);
+            //fctx.num_vars = Self::analyze_numeric(&[], &optimized_stmts);
             let mut terminated = false;
             
             for stmt in &optimized_stmts {
@@ -364,13 +376,24 @@ impl AotCompiler {
             builder.append_block_params_for_function_params(entry_block);
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
-            let mut fctx = FunctionContext { variables: HashMap::new(), next_var: 0, exception_target: None, loop_stack: Vec::new() };
+            let mut fctx = FunctionContext { 
+                variables: HashMap::new(), 
+                num_vars: HashSet::new(), 
+                next_var: 0, 
+                exception_target: None, 
+                loop_stack: Vec::new() 
+            };
+            
+            // Analyze numeric types for this function
+            fctx.num_vars = Self::analyze_numeric(params, body);
+            
             let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
             for (i, param_name) in params.iter().enumerate() {
+                let (pname, _) = Self::split_param(param_name); // Strip ":int"
                 let var = Variable::new(fctx.next_var); fctx.next_var += 1;
                 builder.declare_var(var, types::I64);
                 builder.def_var(var, block_params[i]);
-                fctx.variables.insert(param_name.clone(), var);
+                fctx.variables.insert(pname.to_string(), var); // Use stripped name
             }
             let get_args_func = self.module.declare_func_in_func(self.runtime.get_args_id, builder.func);
             let args_call = builder.ins().call(get_args_func, &[]);
@@ -521,12 +544,8 @@ impl AotCompiler {
                 let else_block = builder.create_block();
                 let merge_block = builder.create_block();
                 let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
-                let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
-                let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
-                let truthy_val = builder.inst_results(truthy_call)[0];
-                let truthy_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), truthy_val);
-                let zero = builder.ins().f64const(0.0);
-                let is_true = builder.ins().fcmp(FloatCC::NotEqual, truthy_f64, zero);
+                let known = Self::is_num(cond, &fctx.num_vars);
+                let is_true = Self::cond_to_bool(builder, module, runtime, cond_val, known);
                 builder.ins().brif(is_true, then_block, &[], else_block, &[]);
                 builder.seal_block(then_block);
                 builder.seal_block(else_block);
@@ -559,12 +578,8 @@ impl AotCompiler {
                 builder.ins().jump(header, &[]);
                 builder.switch_to_block(header);
                 let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
-                let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
-                let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
-                let truthy_val = builder.inst_results(truthy_call)[0];
-                let truthy_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), truthy_val);
-                let zero = builder.ins().f64const(0.0);
-                let is_true = builder.ins().fcmp(FloatCC::NotEqual, truthy_f64, zero);
+                let known = Self::is_num(cond, &fctx.num_vars);
+                let is_true = Self::cond_to_bool(builder, module, runtime, cond_val, known);
                 builder.ins().brif(is_true, body_block, &[], exit_block, &[]);
                 builder.seal_block(body_block);
                 fctx.loop_stack.push((exit_block, header));
@@ -626,10 +641,10 @@ impl AotCompiler {
                 // Read idx fresh from incr_block (so body mutations to idx are honoured),
                 // and use the NaN-boxed representation of the number 1.0.
                 let cur_idx = builder.use_var(idx_var);
-                let one = builder.ins().iconst(types::I64, 1.0_f64.to_bits() as i64);
-                let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
-                let add_call = builder.ins().call(add_func, &[cur_idx, one]);
-                let next_idx = builder.inst_results(add_call)[0];
+                let cur_f = builder.ins().bitcast(types::F64, MemFlags::new(), cur_idx);
+                let one_f = builder.ins().f64const(1.0);
+                let sum_f = builder.ins().fadd(cur_f, one_f);
+                let next_idx = builder.ins().bitcast(types::I64, MemFlags::new(), sum_f);
                 builder.def_var(idx_var, next_idx);
                 builder.ins().jump(header, &[]);
                 builder.switch_to_block(exit_block);
@@ -1004,13 +1019,17 @@ impl AotCompiler {
                 
                 let lhs = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, left);
                 let rhs = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, right);
+
+                let both_num = Self::is_num(left, &fctx.num_vars) && Self::is_num(right, &fctx.num_vars);
+
+
                 let cmp = match op {
                     TokenType::EqEq => Some(FloatCC::Equal), TokenType::NotEq => Some(FloatCC::NotEqual),
                     TokenType::Lt => Some(FloatCC::LessThan), TokenType::LtEq => Some(FloatCC::LessThanOrEqual),
                     TokenType::Gt => Some(FloatCC::GreaterThan), TokenType::GtEq => Some(FloatCC::GreaterThanOrEqual),
                     _ => None,
                 };
-                if op == &TokenType::EqEq || op == &TokenType::NotEq {
+                if (op == &TokenType::EqEq || op == &TokenType::NotEq) && !both_num {
                     let eq_func = module.declare_func_in_func(runtime.eq_id, builder.func);
                     let call = builder.ins().call(eq_func, &[lhs, rhs]);
                     let is_eq = builder.inst_results(call)[0];
@@ -1030,9 +1049,16 @@ impl AotCompiler {
                 } else {
                     match op {
                         TokenType::Plus => {
-                            let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
-                            let call = builder.ins().call(add_func, &[lhs, rhs]);
-                            builder.inst_results(call)[0]
+                            if both_num {
+                                let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+                                let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+                                let res = builder.ins().fadd(a, b);
+                                builder.ins().bitcast(types::I64, MemFlags::new(), res)
+                            } else {
+                                let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
+                                let call = builder.ins().call(add_func, &[lhs, rhs]);
+                                builder.inst_results(call)[0]
+                            }
                         }
                         TokenType::Minus => { 
                             let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs); 
@@ -1116,5 +1142,78 @@ impl AotCompiler {
             }
             _ => panic!("Unsupported expression in native codegen"),
         }
+    }
+    fn split_param(p: &str) -> (&str, Option<&str>) {
+        match p.split_once(':') { Some((n, t)) => (n, Some(t)), None => (p, None) }
+    }
+
+    fn is_num(e: &Expr, num: &HashSet<String>) -> bool {
+        match e {
+            Expr::Number(_) => true,
+            Expr::Ident(n) => num.contains(n),
+            Expr::Unary(TokenType::Minus, x) => Self::is_num(x, num),
+            Expr::Unary(TokenType::Bang, _) => true,
+            Expr::Binary(l, op, r) => match op {
+                TokenType::Plus => Self::is_num(l, num) && Self::is_num(r, num),
+                TokenType::Minus | TokenType::Star | TokenType::Slash | TokenType::Percent
+                | TokenType::EqEq | TokenType::NotEq | TokenType::Lt | TokenType::LtEq
+                | TokenType::Gt | TokenType::GtEq | TokenType::And | TokenType::Or => true,
+                _ => false,
+            },
+            Expr::Ternary(_, t, f) => Self::is_num(t, num) && Self::is_num(f, num),
+            _ => false,
+        }
+    }
+
+    fn collect_defs<'a>(s: &'a Stmt, defs: &mut Vec<(String, Option<&'a Expr>)>) {
+        match s {
+            Stmt::Let(n, e) | Stmt::Assign(n, e) => defs.push((n.clone(), Some(e))),
+            Stmt::If(_, t, e) => { Self::collect_defs(t, defs); if let Some(e) = e { Self::collect_defs(e, defs); } }
+            Stmt::While(_, b) => Self::collect_defs(b, defs),
+            Stmt::For(v, _, b) => { defs.push((v.clone(), None)); Self::collect_defs(b, defs); }
+            Stmt::Try(t, n, c) => { Self::collect_defs(t, defs); defs.push((n.clone(), None)); Self::collect_defs(c, defs); }
+            Stmt::Match(_, cases, eb) => {
+                for (_, b) in cases { Self::collect_defs(b, defs); }
+                if let Some(b) = eb { Self::collect_defs(b, defs); }
+            }
+            Stmt::Block(v) => { for x in v { Self::collect_defs(x, defs); } }
+            _ => {}
+        }
+    }
+
+    /// A variable is numeric only if EVERY definition of it in the function is numeric.
+    fn analyze_numeric(params: &[String], body: &Stmt) -> HashSet<String> {
+        let mut defs = Vec::new();
+        Self::collect_defs(body, &mut defs);
+        let mut num: HashSet<String> = HashSet::new();
+        let mut untyped: HashSet<String> = HashSet::new();
+        for p in params {
+            match Self::split_param(p) {
+                (n, Some("int")) | (n, Some("float")) | (n, Some("num")) => { num.insert(n.to_string()); }
+                (n, _) => { untyped.insert(n.to_string()); }
+            }
+        }
+        for (n, _) in &defs { if !untyped.contains(n) { num.insert(n.clone()); } }
+        loop {
+            let mut changed = false;
+            for (n, e) in &defs {
+                if !num.contains(n) { continue; }
+                let ok = match e { Some(e) => Self::is_num(e, &num), None => false };
+                if !ok { num.remove(n); changed = true; }
+            }
+            if !changed { break; }
+        }
+        num
+    }
+
+    fn cond_to_bool(builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs, val: Value, known_num: bool) -> Value {
+        let v = if known_num { val } else {
+            let f = module.declare_func_in_func(runtime.truthy_id, builder.func);
+            let c = builder.ins().call(f, &[val]);
+            builder.inst_results(c)[0]
+        };
+        let vf = builder.ins().bitcast(types::F64, MemFlags::new(), v);
+        let zero = builder.ins().f64const(0.0);
+        builder.ins().fcmp(FloatCC::NotEqual, vf, zero)
     }
 }

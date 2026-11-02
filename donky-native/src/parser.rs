@@ -69,6 +69,14 @@ impl Parser {
             _ => Err("Invalid compound assignment target".to_string()),
         }
     }
+    fn parse_param(&mut self) -> Result<String, String> {
+        let name = self.consume(TokenType::Ident, "Expected parameter name")?.lexeme.clone();
+        if self.match_token(&[TokenType::Colon]) {
+            let ty = self.consume(TokenType::Ident, "Expected type")?.lexeme.clone();
+            return Ok(format!("{}:{}", name, ty));
+        }
+        Ok(name)
+    }
 
     fn statement(&mut self) -> Result<Stmt, String> {
         if self.match_token(&[TokenType::Import]) {
@@ -188,7 +196,7 @@ impl Parser {
             let mut params = Vec::new();
             if !self.check(TokenType::RParen) {
                 loop {
-                    params.push(self.consume(TokenType::Ident, "Expected parameter name")?.lexeme.clone());
+                    params.push(self.parse_param()?);
                     if !self.match_token(&[TokenType::Comma]) { break; }
                 }
             }
@@ -371,7 +379,7 @@ impl Parser {
                 let mut params = Vec::new();
                 if !self.check(TokenType::RParen) {
                     loop {
-                        params.push(self.consume(TokenType::Ident, "Expected parameter name")?.lexeme.clone());
+                        params.push(self.parse_param()?);
                         if !self.match_token(&[TokenType::Comma]) { break; }
                     }
                 }
