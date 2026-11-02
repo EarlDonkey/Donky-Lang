@@ -51,8 +51,8 @@ pub struct AotCompiler {
 struct FunctionContext {
     variables: HashMap<String, Variable>,
     next_var: usize,
-    exception_target: Option<(Block, Vec<Variable>)>,
-    loop_stack: Vec<(Block, Block, Vec<Variable>)>,
+    exception_target: Option<Block>,
+    loop_stack: Vec<(Block, Block)>, // (exit_block, continue_block)
 }
 
 impl AotCompiler {
@@ -154,7 +154,7 @@ impl AotCompiler {
     }
 
     pub fn compile_to_object(mut self, stmts: &[Stmt], output_path: &str) -> Result<(), String> {
-        // --- NEW: Recursive Import Resolution ---
+        // --- Recursive Import Resolution ---
         use std::path::Path;
         use std::fs;
         
@@ -234,7 +234,7 @@ impl AotCompiler {
             builder.def_var(args_var, args_val);
             fctx.variables.insert("args".to_string(), args_var);
             
-            // --- NEW: DCE Optimization ---
+            // --- DCE Optimization ---
             let optimized_stmts = Self::optimize_block(stmts.to_vec());
             let mut terminated = false;
             
@@ -252,13 +252,14 @@ impl AotCompiler {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().return_(&[zero]); 
             }
+            builder.seal_all_blocks();
             builder.finalize();
         }
         self.module.define_function(main_id, &mut self.ctx).unwrap();
         self.module.clear_context(&mut self.ctx);
 
-        // --- NEW: COMPILE PENDING CLOSURES (THE FIX) ---
-        // We do this AFTER donky_toplevel is defined, so the queue is fully populated.
+        // --- COMPILE PENDING CLOSURES ---
+        // Done AFTER donky_toplevel is defined, so the queue is fully populated.
         let mut i = 0;
         while i < self.pending_closures.len() {
             let (name, params, body) = self.pending_closures[i].clone();
@@ -393,22 +394,17 @@ impl AotCompiler {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().return_(&[zero]); 
             }
+            builder.seal_all_blocks();
             builder.finalize();
         }
         self.module.define_function(func_id, &mut self.ctx).unwrap();
         self.module.clear_context(&mut self.ctx);
     }
 
-    fn get_sorted_vars(fctx: &FunctionContext) -> Vec<Variable> {
-        let mut vars: Vec<Variable> = fctx.variables.values().copied().collect();
-        vars.sort_by_key(|v| v.index());
-        vars
-    }
-
     fn compile_stmt(
         builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs,
         user_funcs: &HashMap<String, FuncId>, 
-        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>, // <-- ADD
+        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>,
         fctx: &mut FunctionContext, stmt: &Stmt,
     ) -> bool {
         match stmt {
@@ -462,16 +458,14 @@ impl AotCompiler {
                 builder.ins().return_(&[val]); true
             }
             Stmt::Break => {
-                if let Some((break_target, _, vars)) = fctx.loop_stack.last() {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(*break_target, &args);
+                if let Some((break_target, _)) = fctx.loop_stack.last() {
+                    builder.ins().jump(*break_target, &[]);
                 }
                 true
             }
             Stmt::Continue => {
-                if let Some((_, continue_target, vars)) = fctx.loop_stack.last() {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(*continue_target, &args);
+                if let Some((_, continue_target)) = fctx.loop_stack.last() {
+                    builder.ins().jump(*continue_target, &[]);
                 }
                 true
             }
@@ -479,9 +473,8 @@ impl AotCompiler {
                 let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let throw_func = module.declare_func_in_func(runtime.throw_id, builder.func);
                 builder.ins().call(throw_func, &[val]);
-                if let Some((target, vars)) = &fctx.exception_target {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(*target, &args);
+                if let Some(target) = &fctx.exception_target {
+                    builder.ins().jump(*target, &[]);
                 } else {
                     let zero = builder.ins().iconst(types::I64, 0);
                     builder.ins().return_(&[zero]);
@@ -489,27 +482,18 @@ impl AotCompiler {
                 true
             }
             Stmt::Try(try_b, err_name, catch_b) => {
-                let vars = Self::get_sorted_vars(fctx);
                 let catch_block = builder.create_block();
                 let merge_block = builder.create_block();
-                for _ in 0..vars.len() {
-                    builder.append_block_param(catch_block, types::I64);
-                    builder.append_block_param(merge_block, types::I64);
-                }
-                let prev_target = fctx.exception_target.clone();
-                fctx.exception_target = Some((catch_block, vars.clone()));
+                let prev_target = fctx.exception_target;
+                fctx.exception_target = Some(catch_block);
                 let try_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, try_b);
                 fctx.exception_target = prev_target;
                 if !try_term {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(merge_block, &args);
+                    builder.ins().jump(merge_block, &[]);
                 }
+                // All predecessors of catch_block (throws / exception checks in the try body) now exist.
                 builder.seal_block(catch_block);
                 builder.switch_to_block(catch_block);
-                let catch_params = builder.block_params(catch_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, catch_params[i]);
-                }
                 let get_exc_func = module.declare_func_in_func(runtime.get_exception_id, builder.func);
                 let exc_call = builder.ins().call(get_exc_func, &[]);
                 let exc_val = builder.inst_results(exc_call)[0];
@@ -522,31 +506,20 @@ impl AotCompiler {
                 fctx.variables.insert(err_name.clone(), err_var);
                 let catch_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, catch_b);
                 if !catch_term {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(merge_block, &args);
+                    builder.ins().jump(merge_block, &[]);
                 }
                 if !try_term || !catch_term {
                     builder.seal_block(merge_block);
                     builder.switch_to_block(merge_block);
-                    let merge_params = builder.block_params(merge_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, merge_params[i]);
-                    }
                     false
                 } else {
                     true
                 }
             }
             Stmt::If(cond, then_b, else_b) => {
-                let vars = Self::get_sorted_vars(fctx);
                 let then_block = builder.create_block();
                 let else_block = builder.create_block();
                 let merge_block = builder.create_block();
-                for _ in 0..vars.len() {
-                    builder.append_block_param(then_block, types::I64);
-                    builder.append_block_param(else_block, types::I64);
-                    builder.append_block_param(merge_block, types::I64);
-                }
                 let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
                 let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
                 let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
@@ -554,63 +527,37 @@ impl AotCompiler {
                 let truthy_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), truthy_val);
                 let zero = builder.ins().f64const(0.0);
                 let is_true = builder.ins().fcmp(FloatCC::NotEqual, truthy_f64, zero);
-                let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().brif(is_true, then_block, &args, else_block, &args);
+                builder.ins().brif(is_true, then_block, &[], else_block, &[]);
                 builder.seal_block(then_block);
                 builder.seal_block(else_block);
                 builder.switch_to_block(then_block);
-                let then_params = builder.block_params(then_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, then_params[i]);
-                }
                 let then_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, then_b);
                 if !then_term {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(merge_block, &args);
+                    builder.ins().jump(merge_block, &[]);
                 }
                 builder.switch_to_block(else_block);
-                let else_params = builder.block_params(else_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, else_params[i]);
-                }
                 let else_term = if let Some(eb) = else_b {
                     Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, eb)
                 } else {
                     false
                 };
                 if !else_term {
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(merge_block, &args);
+                    builder.ins().jump(merge_block, &[]);
                 }
                 if !then_term || !else_term {
                     builder.seal_block(merge_block);
                     builder.switch_to_block(merge_block);
-                    let merge_params = builder.block_params(merge_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, merge_params[i]);
-                    }
                     false
                 } else {
                     true
                 }
             }
             Stmt::While(cond, body) => {
-                let vars = Self::get_sorted_vars(fctx);
                 let header = builder.create_block();
                 let body_block = builder.create_block();
                 let exit_block = builder.create_block();
-                for _ in 0..vars.len() {
-                    builder.append_block_param(header, types::I64);
-                    builder.append_block_param(body_block, types::I64);
-                    builder.append_block_param(exit_block, types::I64);
-                }
-                let header_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().jump(header, &header_args);
+                builder.ins().jump(header, &[]);
                 builder.switch_to_block(header);
-                let header_params = builder.block_params(header).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, header_params[i]);
-                }
                 let cond_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, cond);
                 let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
                 let truthy_call = builder.ins().call(truthy_func, &[cond_val]);
@@ -618,29 +565,19 @@ impl AotCompiler {
                 let truthy_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), truthy_val);
                 let zero = builder.ins().f64const(0.0);
                 let is_true = builder.ins().fcmp(FloatCC::NotEqual, truthy_f64, zero);
-                let body_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                let exit_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().brif(is_true, body_block, &body_args, exit_block, &exit_args);
+                builder.ins().brif(is_true, body_block, &[], exit_block, &[]);
                 builder.seal_block(body_block);
-                //builder.seal_block(exit_block);
-                fctx.loop_stack.push((exit_block, header, vars.clone()));
+                fctx.loop_stack.push((exit_block, header));
                 builder.switch_to_block(body_block);
-                let body_params = builder.block_params(body_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, body_params[i]);
-                }
                 let body_term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
                 fctx.loop_stack.pop();
                 if !body_term {
-                    let loop_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(header, &loop_args);
+                    builder.ins().jump(header, &[]);
                 }
                 builder.switch_to_block(exit_block);
-                let exit_params = builder.block_params(exit_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, exit_params[i]);
-                }
+                // Back-edge (and any `continue`) now emitted: header has all predecessors.
                 builder.seal_block(header);
+                // Breaks (if any) now emitted: exit has all predecessors.
                 builder.seal_block(exit_block);
                 false
             }
@@ -653,26 +590,12 @@ impl AotCompiler {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.declare_var(idx_var, types::I64);
                 builder.def_var(idx_var, zero);
-                fctx.variables.insert(format!("__iter_{}", iter_var.index()), iter_var);
-                fctx.variables.insert(format!("__idx_{}", idx_var.index()), idx_var);
-                let vars = Self::get_sorted_vars(fctx);
                 let header = builder.create_block();
                 let body_block = builder.create_block();
                 let incr_block = builder.create_block();
                 let exit_block = builder.create_block();
-                for _ in 0..vars.len() {
-                    builder.append_block_param(header, types::I64);
-                    builder.append_block_param(body_block, types::I64);
-                    builder.append_block_param(incr_block, types::I64);
-                    builder.append_block_param(exit_block, types::I64);
-                }
-                let header_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().jump(header, &header_args);
+                builder.ins().jump(header, &[]);
                 builder.switch_to_block(header);
-                let header_params = builder.block_params(header).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, header_params[i]);
-                }
                 let len_func = module.declare_func_in_func(runtime.len_id, builder.func);
                 let iter_h = builder.use_var(iter_var);
                 let len_call = builder.ins().call(len_func, &[iter_h]);
@@ -681,18 +604,10 @@ impl AotCompiler {
                 let idx_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), idx_h);
                 let len_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), len_val);
                 let cond = builder.ins().fcmp(FloatCC::LessThan, idx_f64, len_f64);
-                let body_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                let exit_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().brif(cond, body_block, &body_args, exit_block, &exit_args);
+                builder.ins().brif(cond, body_block, &[], exit_block, &[]);
                 builder.seal_block(body_block);
-                builder.seal_block(incr_block);
-                builder.seal_block(exit_block);
-                fctx.loop_stack.push((exit_block, incr_block, vars.clone()));
+                fctx.loop_stack.push((exit_block, incr_block));
                 builder.switch_to_block(body_block);
-                let body_params = builder.block_params(body_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, body_params[i]);
-                }
                 let get_func = module.declare_func_in_func(runtime.index_get_id, builder.func);
                 let item_call = builder.ins().call(get_func, &[iter_h, idx_h]);
                 let item_val = builder.inst_results(item_call)[0];
@@ -701,55 +616,42 @@ impl AotCompiler {
                 builder.def_var(loop_var, item_val);
                 fctx.variables.insert(var_name.clone(), loop_var);
                 let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
-                if !term {
-                    let incr_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().jump(incr_block, &incr_args);
-                }
                 fctx.loop_stack.pop();
-                builder.switch_to_block(incr_block);
-                let incr_params = builder.block_params(incr_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, incr_params[i]);
+                if !term {
+                    builder.ins().jump(incr_block, &[]);
                 }
-                // FIXED: read idx fresh from incr_block (so body mutations to idx are honoured),
-                //        and use the NaN-boxed representation of the number 1.0, not raw 1_i64.
+                // Body end + all `continue`s are emitted: incr_block has all predecessors.
+                builder.seal_block(incr_block);
+                builder.switch_to_block(incr_block);
+                // Read idx fresh from incr_block (so body mutations to idx are honoured),
+                // and use the NaN-boxed representation of the number 1.0.
                 let cur_idx = builder.use_var(idx_var);
                 let one = builder.ins().iconst(types::I64, 1.0_f64.to_bits() as i64);
                 let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
                 let add_call = builder.ins().call(add_func, &[cur_idx, one]);
                 let next_idx = builder.inst_results(add_call)[0];
                 builder.def_var(idx_var, next_idx);
-                let loop_args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().jump(header, &loop_args);
+                builder.ins().jump(header, &[]);
                 builder.switch_to_block(exit_block);
-                let exit_params = builder.block_params(exit_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, exit_params[i]);
-                }
                 builder.seal_block(header);
+                builder.seal_block(exit_block);
                 false
             }
             Stmt::Match(target, cases, else_block) => {
-                let vars = Self::get_sorted_vars(fctx);
+                if cases.is_empty() {
+                    return if let Some(eb) = else_block {
+                        Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, eb)
+                    } else { false };
+                }
                 let merge_block = builder.create_block();
                 let mut check_blocks = Vec::new();
                 for _ in 0..cases.len() { check_blocks.push(builder.create_block()); }
                 let else_check_block = if else_block.is_some() { Some(builder.create_block()) } else { None };
-                for _ in 0..vars.len() {
-                    builder.append_block_param(merge_block, types::I64);
-                    for b in &check_blocks { builder.append_block_param(*b, types::I64); }
-                    if let Some(b) = else_check_block { builder.append_block_param(b, types::I64); }
-                }
                 let target_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, target);
-                let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                builder.ins().jump(check_blocks[0], &args);
+                builder.ins().jump(check_blocks[0], &[]);
                 builder.seal_block(check_blocks[0]);
                 for (i, (case_expr, body)) in cases.iter().enumerate() {
                     builder.switch_to_block(check_blocks[i]);
-                    let block_params = builder.block_params(check_blocks[i]).to_vec();
-                    for (j, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, block_params[j]);
-                    }
                     let case_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, case_expr);
                     let eq_func = module.declare_func_in_func(runtime.eq_id, builder.func);
                     let eq_call = builder.ins().call(eq_func, &[target_val, case_val]);
@@ -758,45 +660,28 @@ impl AotCompiler {
                     let zero = builder.ins().f64const(0.0);
                     let cond = builder.ins().fcmp(FloatCC::NotEqual, is_eq_f64, zero);
                     let body_block = builder.create_block();
-                    for _ in 0..vars.len() { builder.append_block_param(body_block, types::I64); }
-                    builder.seal_block(body_block);
                     let next_check = if i + 1 < cases.len() { check_blocks[i+1] } else { else_check_block.unwrap_or(merge_block) };
+                    builder.ins().brif(cond, body_block, &[], next_check, &[]);
+                    builder.seal_block(body_block);
                     if i + 1 < cases.len() { builder.seal_block(check_blocks[i+1]); }
-                    //if let Some(eb) = else_check_block { builder.seal_block(eb); }
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().brif(cond, body_block, &args, next_check, &args);
                     builder.switch_to_block(body_block);
-                    let body_params = builder.block_params(body_block).to_vec();
-                    for (j, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, body_params[j]);
-                    }
                     let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
                     if !term {
-                        let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                        builder.ins().jump(merge_block, &args);
+                        builder.ins().jump(merge_block, &[]);
                     }
                 }
                 if let Some(eb_block) = else_check_block { builder.seal_block(eb_block); }
                 if let Some(eb) = else_block {
                     if let Some(eb_block) = else_check_block {
                         builder.switch_to_block(eb_block);
-                        let block_params = builder.block_params(eb_block).to_vec();
-                        for (j, var) in vars.iter().enumerate() {
-                            builder.def_var(*var, block_params[j]);
-                        }
                         let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, eb);
                         if !term {
-                            let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                            builder.ins().jump(merge_block, &args);
+                            builder.ins().jump(merge_block, &[]);
                         }
                     }
                 }
                 builder.seal_block(merge_block);
                 builder.switch_to_block(merge_block);
-                let merge_params = builder.block_params(merge_block).to_vec();
-                for (i, var) in vars.iter().enumerate() {
-                    builder.def_var(*var, merge_params[i]);
-                }
                 false
             }
             Stmt::Block(stmts) => {
@@ -818,7 +703,7 @@ impl AotCompiler {
     fn compile_expr(
         builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs,
         user_funcs: &HashMap<String, FuncId>, 
-        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>, // <-- ADD
+        pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>,
         fctx: &mut FunctionContext, expr: &Expr,
     ) -> Value {
         match expr {
@@ -857,12 +742,12 @@ impl AotCompiler {
                 if name == "null" {
                     return builder.ins().iconst(types::I64, 0);
                 }
-                // FIXED: Don't panic on unknown identifiers. Return null so the program
+                // Don't panic on unknown identifiers. Return null so the program
                 // can continue and throw a proper runtime error if needed.
                 if let Some(var) = fctx.variables.get(name) {
                     builder.use_var(*var)
                 } else if let Some(func_id) = user_funcs.get(name) {
-                    // NEW: If it's a function name, return its memory address
+                    // If it's a function name, return its memory address
                     let func_ref = module.declare_func_in_func(*func_id, builder.func);
                     let addr = builder.ins().func_addr(types::I64, func_ref);
                     addr 
@@ -905,34 +790,19 @@ impl AotCompiler {
                     let zero = builder.ins().iconst(types::I32, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, has_exc, zero);
                     let cont_block = builder.create_block(); let exc_block = builder.create_block();
-                    let vars = Self::get_sorted_vars(fctx);
-                    for _ in 0..vars.len() {
-                        builder.append_block_param(exc_block, types::I64);
-                        builder.append_block_param(cont_block, types::I64);
-                    }
                     
-                    let args: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().brif(cmp, exc_block, &args, cont_block, &args);
+                    builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
                     builder.seal_block(exc_block); builder.seal_block(cont_block);
                     
                     builder.switch_to_block(exc_block);
-                    let exc_params = builder.block_params(exc_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, exc_params[i]);
-                    }
-                    if let Some((target, tvars)) = &fctx.exception_target {
-                        let args: Vec<Value> = tvars.iter().map(|v| builder.use_var(*v)).collect();
-                        builder.ins().jump(*target, &args);
+                    if let Some(target) = &fctx.exception_target {
+                        builder.ins().jump(*target, &[]);
                     } else {
                         let zero_val = builder.ins().iconst(types::I64, 0);
                         builder.ins().return_(&[zero_val]);
                     }
                     
                     builder.switch_to_block(cont_block);
-                    let cont_params = builder.block_params(cont_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, cont_params[i]);
-                    }
                     ret_val
                 } else {
                     let builtin_id = match name.as_str() {
@@ -961,9 +831,9 @@ impl AotCompiler {
                         "gui_init" => runtime.gui_init_id,
                         "gui_draw_text" => runtime.gui_draw_text_id,
                         "gui_update" => runtime.gui_update_id,
-                        "gui_add_button" => runtime.gui_add_button_id,     // <-- ADD
-                        "gui_add_label" => runtime.gui_add_label_id,       // <-- ADD
-                        "gui_update_text" => runtime.gui_update_text_id,   // <-- ADD
+                        "gui_add_button" => runtime.gui_add_button_id,
+                        "gui_add_label" => runtime.gui_add_label_id,
+                        "gui_update_text" => runtime.gui_update_text_id,
                         "gui_get_clicked" => runtime.gui_get_clicked_id,
                         "gui_clear" => runtime.gui_clear_id,
                         "gui_repaint" => runtime.gui_repaint_id,
@@ -987,7 +857,7 @@ impl AotCompiler {
                     let results = builder.inst_results(call);
                     let ret_val = if results.is_empty() { builder.ins().iconst(types::I64, 0) } else { results[0] };
 
-                    // --- NEW: Check for exceptions thrown by builtins ---
+                    // --- Check for exceptions thrown by builtins ---
                     let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
                     let exc_call = builder.ins().call(has_exc_func, &[]);
                     let has_exc = builder.inst_results(exc_call)[0];
@@ -996,35 +866,20 @@ impl AotCompiler {
                     
                     let cont_block = builder.create_block();
                     let exc_block = builder.create_block();
-                    let vars = Self::get_sorted_vars(fctx);
-                    for _ in 0..vars.len() {
-                        builder.append_block_param(exc_block, types::I64);
-                        builder.append_block_param(cont_block, types::I64);
-                    }
                     
-                    let args_vals: Vec<Value> = vars.iter().map(|v| builder.use_var(*v)).collect();
-                    builder.ins().brif(cmp, exc_block, &args_vals, cont_block, &args_vals);
+                    builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
                     builder.seal_block(exc_block);
                     builder.seal_block(cont_block);
                     
                     builder.switch_to_block(exc_block);
-                    let exc_params = builder.block_params(exc_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, exc_params[i]);
-                    }
-                    if let Some((target, tvars)) = &fctx.exception_target {
-                        let targs: Vec<Value> = tvars.iter().map(|v| builder.use_var(*v)).collect();
-                        builder.ins().jump(*target, &targs);
+                    if let Some(target) = &fctx.exception_target {
+                        builder.ins().jump(*target, &[]);
                     } else {
                         let zero_val = builder.ins().iconst(types::I64, 0);
                         builder.ins().return_(&[zero_val]);
                     }
                     
                     builder.switch_to_block(cont_block);
-                    let cont_params = builder.block_params(cont_block).to_vec();
-                    for (i, var) in vars.iter().enumerate() {
-                        builder.def_var(*var, cont_params[i]);
-                    }
                     ret_val
                 }
             }
@@ -1125,7 +980,7 @@ impl AotCompiler {
                 builder.inst_results(call)[0]
             }
             Expr::Binary(left, op, right) => {
-                // --- NEW: Constant Folding ---
+                // --- Constant Folding ---
                 if let (Expr::Number(l), Expr::Number(r)) = (left.as_ref(), right.as_ref()) {
                     let result = match op {
                         TokenType::Plus => Some(l + r),
