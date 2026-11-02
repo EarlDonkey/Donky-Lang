@@ -1,0 +1,13 @@
+print("1. Program started");
+let u = dll_load("user32.dll");
+print("2. Loaded user32.dll: " + str(u));
+
+let mb = dll_sym(u, "MessageBoxA");
+print("3. Found MessageBoxA: " + str(mb));
+
+dll_calli(mb, [0, "Hello from Donky FFI", "Donky", 0]);
+print("4. MessageBox returned");
+
+let k = dll_load("kernel32.dll");
+let tick = dll_sym(k, "GetTickCount64");
+print("5. Tick: " + str(dll_call(tick, [])));

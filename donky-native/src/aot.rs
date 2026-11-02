@@ -38,6 +38,8 @@ pub struct RuntimeFuncs {
     pub gui_draw_rect_id: FuncId, pub cpu_usage_id: FuncId, pub gui_webview_id: FuncId,
     pub kill_process_id: FuncId, pub uptime_id: FuncId, pub cpu_cores_id: FuncId,
     pub disk_info_id: FuncId, pub sub_id: FuncId, pub mul_id: FuncId, pub div_id: FuncId,
+    pub dll_load_id: FuncId, pub dll_sym_id: FuncId, pub dll_call_id: FuncId,
+    pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
 }
 
 pub struct AotCompiler {
@@ -149,6 +151,11 @@ impl AotCompiler {
             sub_id: declare("donky_sub", &[types::I64, types::I64], Some(types::I64)),
             mul_id: declare("donky_mul", &[types::I64, types::I64], Some(types::I64)),
             div_id: declare("donky_div", &[types::I64, types::I64], Some(types::I64)),
+            dll_load_id:  declare("donky_dll_load",  &[types::I64], Some(types::I64)),
+            dll_sym_id:   declare("donky_dll_sym",   &[types::I64, types::I64], Some(types::I64)),
+            dll_call_id:  declare("donky_dll_call",  &[types::I64, types::I64], Some(types::I64)),
+            dll_calli_id: declare("donky_dll_calli", &[types::I64, types::I64], Some(types::I64)),
+            ffi_cstr_id:  declare("donky_ffi_cstr",  &[types::I64], Some(types::I64)),
             
         };
         
@@ -862,6 +869,11 @@ impl AotCompiler {
                         "sub" => runtime.sub_id,
                         "mul" => runtime.mul_id,
                         "div" => runtime.div_id,
+                        "dll_load" => runtime.dll_load_id,
+                        "dll_sym" => runtime.dll_sym_id,
+                        "dll_call" => runtime.dll_call_id,
+                        "dll_calli" => runtime.dll_calli_id,
+                        "ffi_cstr" => runtime.ffi_cstr_id,
                         _ => panic!("Unknown builtin function: {}", name),
                     };
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);

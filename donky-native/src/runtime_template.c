@@ -659,6 +659,62 @@ uint64_t donky_sleep(uint64_t ms_val) {
     return 0;
 }
 
+// --- Native FFI ---
+// Pointers are passed as numbers (user-space pointers fit in 48 bits, so they are exact as doubles).
+// Args: number -> int64, string -> char*, bool -> 0/1. Up to 8 args (Win64: extra args are harmless).
+typedef uint64_t (*DonkyFfiFn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t, uint64_t);
+
+static uint64_t ffi_convert_arg(uint64_t v) {
+    if (is_number(v)) return (uint64_t)(int64_t)as_number(v);
+    if (get_tag(v) == TAG_BOOL) return v & 1;
+    if (get_tag(v) == TAG_STRING) return as_index(v);
+    return 0;
+}
+
+static uint64_t ffi_invoke(uint64_t fn_val, uint64_t args_val) {
+    if (!is_number(fn_val)) return 0;
+    uint64_t fn = (uint64_t)as_number(fn_val);
+    if (!fn) return 0;
+    uint64_t a[8] = {0,0,0,0,0,0,0,0};
+    if (get_tag(args_val) == TAG_ARRAY) {
+        Array* arr = (Array*)as_index(args_val);
+        for (size_t i = 0; i < arr->len && i < 8; i++) a[i] = ffi_convert_arg(arr->data[i]);
+    }
+    return ((DonkyFfiFn)fn)(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
+}
+
+uint64_t donky_dll_load(uint64_t name_val) {
+    if (get_tag(name_val) != TAG_STRING) return make_number(0.0);
+    HMODULE h = LoadLibraryA((char*)as_index(name_val));
+    return make_number((double)(uint64_t)h);
+}
+
+uint64_t donky_dll_sym(uint64_t lib_val, uint64_t name_val) {
+    if (!is_number(lib_val) || get_tag(name_val) != TAG_STRING) return make_number(0.0);
+    HMODULE h = (HMODULE)(uint64_t)as_number(lib_val);
+    if (!h) return make_number(0.0);
+    FARPROC p = GetProcAddress(h, (char*)as_index(name_val));
+    return make_number((double)(uint64_t)p);
+}
+
+// Returns full 64-bit rax as a number (use for pointers/handles)
+uint64_t donky_dll_call(uint64_t fn_val, uint64_t args_val) {
+    return make_number((double)(int64_t)ffi_invoke(fn_val, args_val));
+}
+
+// Returns eax sign-extended (use for functions returning int/BOOL/DWORD)
+uint64_t donky_dll_calli(uint64_t fn_val, uint64_t args_val) {
+    return make_number((double)(int32_t)ffi_invoke(fn_val, args_val));
+}
+
+// Read a NUL-terminated char* (as returned by dll_call) into a Donky string
+uint64_t donky_ffi_cstr(uint64_t ptr_val) {
+    if (!is_number(ptr_val)) return donky_alloc_string("");
+    const char* p = (const char*)(uint64_t)as_number(ptr_val);
+    return donky_alloc_string(p ? p : "");
+}
+
 // --- System Telemetry Metrics ---
 uint64_t donky_get_total_mem() {
     MEMORYSTATUSEX memInfo;
