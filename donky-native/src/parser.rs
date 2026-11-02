@@ -107,7 +107,12 @@ impl Parser {
         if self.match_token(&[TokenType::Try]) {
             let try_block = Box::new(self.statement()?);
             self.consume(TokenType::Catch, "Expected 'catch'")?;
+            // Optional parentheses
+            let has_paren = self.match_token(&[TokenType::LParen]);
             let err_name = self.consume(TokenType::Ident, "Expected error variable")?.lexeme.clone();
+            if has_paren {
+                self.consume(TokenType::RParen, "Expected ')'")?;
+            }
             let catch_block = Box::new(self.statement()?);
             return Ok(Stmt::Try(try_block, err_name, catch_block));
         }

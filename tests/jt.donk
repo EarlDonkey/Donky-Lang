@@ -1,0 +1,6 @@
+import "lib/json.donk";
+let d = json_parse("{\"a\":[1,2.5,true,null],\"s\":\"h\\u00e9\\n\"}");
+print(d["a"][1]);
+print(json_stringify(d));
+print(json_pretty(d));
+try { json_parse("[1,"); } catch (e) { print(e); }

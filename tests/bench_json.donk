@@ -1,0 +1,17 @@
+import "lib/json.donk";
+
+fn main() {
+    let raw = read_file("big.json");
+    print("File size: " + str(len(raw)) + " bytes");
+
+    let start = now_ms();
+    let i = 0;
+    while i < 100 {
+        let doc = json_parse(raw);
+        i = i + 1;
+    }
+    let end = now_ms();
+    print("Donky: " + str(end - start) + "ms for 100 parses");
+}
+
+main();

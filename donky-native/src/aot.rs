@@ -20,7 +20,7 @@ pub struct RuntimeFuncs {
     pub add_id: FuncId, pub eq_id: FuncId, pub byte_at_id: FuncId,
     pub substr_id: FuncId, pub byte_substr_id: FuncId, pub truthy_id: FuncId,
     pub upper_id: FuncId, pub lower_id: FuncId, pub split_id: FuncId,
-    pub join_id: FuncId, pub now_id: FuncId, pub contains_id: FuncId,
+    pub join_id: FuncId, pub now_id: FuncId, pub now_ms_id: FuncId, pub contains_id: FuncId,
     pub type_id: FuncId, pub random_id: FuncId, pub keys_id: FuncId,
     pub floor_id: FuncId, pub bytes_to_str_id: FuncId, pub char_code_id: FuncId,
     pub throw_id: FuncId, pub has_exception_id: FuncId,
@@ -40,6 +40,8 @@ pub struct RuntimeFuncs {
     pub disk_info_id: FuncId, pub sub_id: FuncId, pub mul_id: FuncId, pub div_id: FuncId,
     pub dll_load_id: FuncId, pub dll_sym_id: FuncId, pub dll_call_id: FuncId,
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
+    pub json_decode_id: FuncId, pub json_encode_id: FuncId,
+    pub json_pretty_id: FuncId, pub json_error_id: FuncId,
 }
 
 pub struct AotCompiler {
@@ -103,6 +105,7 @@ impl AotCompiler {
             split_id: declare("donky_split", &[types::I64, types::I64], Some(types::I64)),
             join_id: declare("donky_join", &[types::I64, types::I64], Some(types::I64)),
             now_id: declare("donky_now", &[], Some(types::I64)),
+            now_ms_id: declare("donky_now_ms", &[], Some(types::I64)),
             contains_id: declare("donky_contains", &[types::I64, types::I64], Some(types::I64)),
             type_id: declare("donky_type", &[types::I64], Some(types::I64)),
             random_id: declare("donky_random", &[types::I64], Some(types::I64)),
@@ -156,6 +159,10 @@ impl AotCompiler {
             dll_call_id:  declare("donky_dll_call",  &[types::I64, types::I64], Some(types::I64)),
             dll_calli_id: declare("donky_dll_calli", &[types::I64, types::I64], Some(types::I64)),
             ffi_cstr_id:  declare("donky_ffi_cstr",  &[types::I64], Some(types::I64)),
+            json_decode_id: declare("donky_json_decode", &[types::I64], Some(types::I64)),
+            json_encode_id: declare("donky_json_encode", &[types::I64], Some(types::I64)),
+            json_pretty_id: declare("donky_json_pretty", &[types::I64], Some(types::I64)),
+            json_error_id:  declare("donky_json_error",  &[], Some(types::I64)),
             
         };
         
@@ -874,6 +881,11 @@ impl AotCompiler {
                         "dll_call" => runtime.dll_call_id,
                         "dll_calli" => runtime.dll_calli_id,
                         "ffi_cstr" => runtime.ffi_cstr_id,
+                        "json_decode" => runtime.json_decode_id,
+                        "json_encode" => runtime.json_encode_id,
+                        "json_pretty" => runtime.json_pretty_id,
+                        "json_error" => runtime.json_error_id,
+                        "now_ms" => runtime.now_ms_id,
                         _ => panic!("Unknown builtin function: {}", name),
                     };
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
