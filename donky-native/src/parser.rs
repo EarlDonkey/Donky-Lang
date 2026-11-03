@@ -338,7 +338,8 @@ impl Parser {
     }
 
     fn prefix(&mut self) -> Result<Expr, String> {
-        let token = self.advance().clone();
+    if self.is_at_end() { return Err("Parse error: unexpected end of input".to_string()); }
+    let token = self.advance().clone();
         match token.ttype {
             TokenType::Number => Ok(Expr::Number(token.literal.unwrap().parse().unwrap())),
             TokenType::String => Ok(Expr::String(token.literal.unwrap())),

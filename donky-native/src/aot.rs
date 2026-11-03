@@ -342,77 +342,61 @@ impl AotCompiler {
     }
 
     fn optimize_block(stmts: Vec<Stmt>) -> Vec<Stmt> {
-        // Count how many times each variable is read
-        let mut reads: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        
-        fn count_reads(stmt: &Stmt, reads: &mut std::collections::HashMap<String, usize>) {
-            match stmt {
-                Stmt::Let(_, expr) => count_expr_reads(expr, reads),
-                Stmt::Assign(_, expr) => count_expr_reads(expr, reads),
-                Stmt::Print(expr) => count_expr_reads(expr, reads),
-                Stmt::ExprStmt(expr) => count_expr_reads(expr, reads),
-                Stmt::Return(Some(expr)) => count_expr_reads(expr, reads),
-                Stmt::If(cond, then_b, else_b) => {
-                    count_expr_reads(cond, reads);
-                    count_reads(then_b, reads);
-                    if let Some(eb) = else_b { count_reads(eb, reads); }
-                }
-                Stmt::While(cond, body) => {
-                    count_expr_reads(cond, reads);
-                    count_reads(body, reads);
-                }
-                Stmt::For(var, iter, body) => {
-                    count_expr_reads(iter, reads);
-                    count_reads(body, reads);
-                    *reads.entry(var.clone()).or_insert(0) += 1; // Loop variable is read
-                }
-                Stmt::ForRange(_, a, b, body) => {
-                    count_expr_reads(a, reads); count_expr_reads(b, reads);
-                    count_reads(body, reads);
-                }
-                Stmt::Block(inner) => {
-                    for s in inner { count_reads(s, reads); }
-                }
-                _ => {}
-            }
-        }
-        
-        fn count_expr_reads(expr: &Expr, reads: &mut std::collections::HashMap<String, usize>) {
-            match expr {
-                Expr::Ident(name) => { *reads.entry(name.clone()).or_insert(0) += 1; }
-                Expr::Binary(l, _, r) => { count_expr_reads(l, reads); count_expr_reads(r, reads); }
-                Expr::Unary(_, e) => count_expr_reads(e, reads),
-                Expr::Call(_, args) => { for a in args { count_expr_reads(a, reads); } }
-                Expr::MethodCall(obj, _, args) => { 
-                    count_expr_reads(obj, reads); 
-                    for a in args { count_expr_reads(a, reads); } 
-                }
-                Expr::Index(obj, idx) => { count_expr_reads(obj, reads); count_expr_reads(idx, reads); }
-                Expr::FieldAccess(obj, _) => count_expr_reads(obj, reads),
-                Expr::Array(elems) => { for e in elems { count_expr_reads(e, reads); } }
-                Expr::Map(pairs) => { for (k, v) in pairs { count_expr_reads(k, reads); count_expr_reads(v, reads); } }
-                Expr::InterpolatedString(parts) => { for p in parts { count_expr_reads(p, reads); } }
-                Expr::StructInit(_, fields) => { for (_, v) in fields { count_expr_reads(v, reads); } }
-                Expr::Ternary(c, t, f) => { count_expr_reads(c, reads); count_expr_reads(t, reads); count_expr_reads(f, reads); }
+        use std::collections::HashSet;
+
+        fn ex(e: &Expr, u: &mut HashSet<String>) {
+            match e {
+                Expr::Ident(n) => { u.insert(n.clone()); }
+                Expr::Binary(l, _, r) => { ex(l, u); ex(r, u); }
+                Expr::Unary(_, x) => ex(x, u),
+                Expr::Call(_, args) => { for a in args { ex(a, u); } }
+                Expr::MethodCall(obj, _, args) => { ex(obj, u); for a in args { ex(a, u); } }
+                Expr::Index(o, i) => { ex(o, u); ex(i, u); }
+                Expr::FieldAccess(o, _) => ex(o, u),
+                Expr::Array(v) => { for a in v { ex(a, u); } }
+                Expr::Map(p) => { for (k, v) in p { ex(k, u); ex(v, u); } }
+                Expr::InterpolatedString(p) => { for a in p { ex(a, u); } }
+                Expr::StructInit(_, f) => { for (_, v) in f { ex(v, u); } }
+                Expr::Ternary(c, t, f) => { ex(c, u); ex(t, u); ex(f, u); }
                 _ => {}
             }
         }
 
-        for stmt in &stmts { count_reads(stmt, &mut reads); }
-
-        // Filter out dead `let` statements
-        let mut optimized = Vec::new();
-        for stmt in stmts {
-            if let Stmt::Let(name, _) = &stmt {
-                // If the variable is never read, and it's not named '_' (unused marker),
-                // we can safely drop the allocation.
-                if !reads.contains_key(name) {
-                    continue; // Skip this statement entirely
+        fn st(s: &Stmt, u: &mut HashSet<String>) {
+            match s {
+                Stmt::Let(_, e) => ex(e, u),
+                Stmt::Assign(n, e) => { u.insert(n.clone()); ex(e, u); }
+                Stmt::IndexSet(t, i, v) => { ex(t, u); ex(i, u); ex(v, u); }
+                Stmt::FieldSet(o, _, v) => { ex(o, u); ex(v, u); }
+                Stmt::Print(e) | Stmt::ExprStmt(e) | Stmt::Throw(e) => ex(e, u),
+                Stmt::Return(Some(e)) => ex(e, u),
+                Stmt::If(c, t, e) => { ex(c, u); st(t, u); if let Some(e) = e { st(e, u); } }
+                Stmt::While(c, b) => { ex(c, u); st(b, u); }
+                Stmt::For(_, it, b) => { ex(it, u); st(b, u); }
+                Stmt::ForRange(_, a, b, body) => { ex(a, u); ex(b, u); st(body, u); }
+                Stmt::Try(t, _, c) => { st(t, u); st(c, u); }
+                Stmt::Match(t, cases, eb) => {
+                    ex(t, u);
+                    for (c, b) in cases { ex(c, u); st(b, u); }
+                    if let Some(b) = eb { st(b, u); }
                 }
+                Stmt::Block(v) => { for x in v { st(x, u); } }
+                _ => {}
             }
-            optimized.push(stmt);
         }
-        optimized
+
+        // Only literals/identifiers are safe to drop; calls may throw or have side effects.
+        fn pure(e: &Expr) -> bool {
+            matches!(e, Expr::Number(_) | Expr::Bool(_) | Expr::String(_) | Expr::Ident(_))
+        }
+
+        let mut used: HashSet<String> = HashSet::new();
+        for s in &stmts { st(s, &mut used); }
+
+        stmts.into_iter().filter(|s| match s {
+            Stmt::Let(name, e) => used.contains(name) || !pure(e),
+            _ => true,
+        }).collect()
     }
 
     fn compile_function(&mut self, func_id: FuncId, params: &[String], body: &Stmt, pending_closures: &mut Vec<(String, Vec<String>, Box<Stmt>)>) {
@@ -531,14 +515,16 @@ impl AotCompiler {
                 builder.ins().return_(&[val]); true
             }
             Stmt::Break => {
-                if let Some((break_target, _)) = fctx.loop_stack.last() {
-                    builder.ins().jump(*break_target, &[]);
+                match fctx.loop_stack.last() {
+                    Some((break_target, _)) => { builder.ins().jump(*break_target, &[]); }
+                    None => panic!("`break` used outside of a loop"),
                 }
                 true
             }
             Stmt::Continue => {
-                if let Some((_, continue_target)) = fctx.loop_stack.last() {
-                    builder.ins().jump(*continue_target, &[]);
+                match fctx.loop_stack.last() {
+                    Some((_, continue_target)) => { builder.ins().jump(*continue_target, &[]); }
+                    None => panic!("`continue` used outside of a loop"),
                 }
                 true
             }
@@ -930,6 +916,7 @@ impl AotCompiler {
                     let local_callee = module.declare_func_in_func(*func_id, builder.func);
                     let mut arg_vals = Vec::new();
                     for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, arg)); }
+                    Self::pad_args(builder, local_callee, &mut arg_vals);
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let ret_val = builder.inst_results(call)[0];
                     let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
@@ -1013,7 +1000,7 @@ impl AotCompiler {
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
                     let mut arg_vals = Vec::new();
                     for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, arg)); }
-                    
+                    Self::pad_args(builder, local_callee, &mut arg_vals);
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let results = builder.inst_results(call);
                     let ret_val = if results.is_empty() { builder.ins().iconst(types::I64, 0) } else { results[0] };
@@ -1302,6 +1289,15 @@ impl AotCompiler {
             }
         }
         Expr::InterpolatedString(parts)
+    }
+    fn pad_args(builder: &mut FunctionBuilder, callee: codegen::ir::FuncRef, args: &mut Vec<Value>) {
+        let sig = builder.func.dfg.ext_funcs[callee].signature;
+        let n = builder.func.dfg.signatures[sig].params.len();
+        while args.len() < n {
+            let z = builder.ins().iconst(types::I64, 0);
+            args.push(z);
+        }
+        args.truncate(n);
     }
 
     fn is_num(e: &Expr, num: &HashSet<String>) -> bool {

@@ -52,51 +52,48 @@ fn main() {
             let source = match fs::read_to_string(path) { Ok(s) => s, Err(e) => { eprintln!("Runtime Error: build-exe: {}", e); return; } };
             let tokens = match lexer::Lexer::new(&source).tokenize() { Ok(t) => t, Err(e) => { eprintln!("Lex Error: {}", e); return; } };
             let ast = match parser::Parser::new(tokens).parse() { Ok(a) => a, Err(e) => { eprintln!("Parse Error: {}", e); return; } };
-            
+
             println!("Compiling to object file...");
             let aot = aot::AotCompiler::new();
             let obj_path = "donky_app.obj";
             aot.compile_to_object(&ast, obj_path).unwrap();
-            
-            println!("Writing C runtime...");
-            let c_rt = include_str!("runtime_template.c");
-            fs::write("runtime.c", c_rt).unwrap();
-            
-println!("Linking with GCC...");
-            
-            let mut gcc_args = vec![obj_path, "runtime.c"];
-            
-            #[cfg(target_os = "windows")]
-            {
-                gcc_args.extend_from_slice(&[
-                    "-o", "donky_app.exe", 
-                    "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", 
-                    "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"
-                ]);
-            }
-            
-            #[cfg(target_os = "linux")]
-            {
-                gcc_args.extend_from_slice(&[
-                    "-o", "donky_app", 
-                    "-lpthread", "-lcurl", "-lm", "-ldl"
-                ]);
-            }
-            
-            #[cfg(target_os = "macos")]
-            {
-                gcc_args.extend_from_slice(&[
-                    "-o", "donky_app", 
-                    "-lcurl"
-                ]);
-            }
 
-            let status = std::process::Command::new("gcc")
+            #[cfg(target_os = "windows")]
+            let (gcc_bin, gcc_args): (String, Vec<String>) = {
+                let rt = match find_runtime_obj() { Ok(p) => p, Err(e) => { eprintln!("{}", e); return; } };
+                let mut a: Vec<String> = vec![
+                    obj_path.to_string(),
+                    rt.to_string_lossy().into_owned(),
+                    "-o".to_string(), "donky_app.exe".to_string(),
+                    "-static".to_string(), "-static-libgcc".to_string(),
+                ];
+                for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-Wl,--stack,67108864"] { a.push(l.to_string()); }
+                (find_gcc(), a)
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let (gcc_bin, gcc_args): (String, Vec<String>) = {
+                println!("Writing C runtime...");
+                fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
+                #[allow(unused_mut)]
+                let mut a: Vec<String> = vec![
+                    obj_path.to_string(), "runtime.c".to_string(),
+                    "-o".to_string(), "donky_app".to_string(),
+                ];
+                #[cfg(target_os = "linux")]
+                { for l in ["-lpthread", "-lcurl", "-lm", "-ldl"] { a.push(l.to_string()); } }
+                #[cfg(target_os = "macos")]
+                { a.push("-lcurl".to_string()); }
+                ("gcc".to_string(), a)
+            };
+
+            println!("Linking with GCC...");
+            let status = std::process::Command::new(&gcc_bin)
                 .args(&gcc_args)
                 .status()
                 .expect("Failed to run gcc. Make sure GCC/MinGW is in your PATH.");
-                
-            if status.success() { println!("Successfully built donky_app.exe!"); }
+
+            if status.success() { println!("Successfully built donky_app!"); }
             else { eprintln!("Linker failed."); }
         }
         "build" => {
@@ -129,6 +126,34 @@ fn print_usage() {
     println!("  donky-native repl                        REPL");
     println!("  donky-native install                     install packages");
     println!("  donky-native add <name> <url|path>       add dependency");
+}
+
+#[cfg(target_os = "windows")]
+fn install_root() -> Option<std::path::PathBuf> {
+    // <root>\bin\donky.exe -> <root>
+    std::env::current_exe().ok()?.parent()?.parent().map(|p| p.to_path_buf())
+}
+
+#[cfg(target_os = "windows")]
+fn find_runtime_obj() -> Result<std::path::PathBuf, String> {
+    let mut c: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(root) = install_root() { c.push(root.join("lib").join("runtime.o")); }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() { c.push(d.join("runtime.o")); }
+    }
+    c.push("runtime.o".into());
+    c.push("dist/lib/runtime.o".into());
+    for p in c { if p.exists() { return Ok(p); } }
+    Err("runtime.o not found (expected <install>\\lib\\runtime.o). Run build.ps1.".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn find_gcc() -> String {
+    if let Some(root) = install_root() {
+        let g = root.join("toolchain").join("bin").join("gcc.exe");
+        if g.exists() { return g.to_string_lossy().into_owned(); }
+    }
+    "gcc".to_string()
 }
 
 fn cmd_tree(path: &str, script_args: Vec<String>) -> Result<(), String> {

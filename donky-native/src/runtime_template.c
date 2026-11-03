@@ -289,7 +289,7 @@ static uint64_t g_globals = 0;
 
 int is_number(uint64_t v) { return (v & TAG_MASK) != TAG_BASE; }
 double as_number(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
-uint64_t get_tag(uint64_t v) { return (v >> 48) & 0x7; }
+uint64_t get_tag(uint64_t v) { return is_number(v) ? 0 : ((v >> 48) & 0x7); }
 uint64_t as_index(uint64_t v) { return v & 0x0000FFFFFFFFFFFFULL; }
 uint64_t make_number(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
 
@@ -326,7 +326,8 @@ void print_value(uint64_t val) {
 }
 
 void donky_print(uint64_t val) {
-    print_value(val);
+    if (!is_number(val) && get_tag(val) == TAG_STRING) printf("%s", (char*)as_index(val));
+    else print_value(val);
     printf("\n");
 }
 
@@ -906,18 +907,38 @@ uint64_t donky_num(uint64_t val) {
 }
 
 uint64_t donky_read_file(uint64_t path_val) {
-    if (get_tag(path_val) != TAG_STRING) return 0;
+    if (get_tag(path_val) != TAG_STRING) {
+        donky_throw(donky_alloc_string("read_file: path must be a string"));
+        return 0;
+    }
     char* path = (char*)as_index(path_val);
+    char err_buf[600];
     FILE* f = fopen(path, "rb");
     if (!f) {
-        char err_buf[512];
         snprintf(err_buf, sizeof(err_buf), "File not found: %s", path);
         donky_throw(donky_alloc_string(err_buf));
         return 0;
     }
-    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
-    char* buf = malloc(len + 1); fread(buf, 1, len, f); buf[len] = 0; fclose(f);
-    uint64_t res = donky_alloc_string(buf); free(buf); return res;
+    long len = -1;
+    if (fseek(f, 0, SEEK_END) == 0) len = ftell(f);
+    if (len < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        snprintf(err_buf, sizeof(err_buf), "Cannot read file: %s", path);
+        donky_throw(donky_alloc_string(err_buf));
+        return 0;
+    }
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        donky_throw(donky_alloc_string("read_file: out of memory"));
+        return 0;
+    }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    buf[got] = 0;
+    uint64_t res = donky_alloc_string(buf);
+    free(buf);
+    return res;
 }
 
 uint64_t donky_write_file(uint64_t path_val, uint64_t content_val) {
@@ -1089,8 +1110,10 @@ uint64_t donky_input(uint64_t prompt_val) {
         printf("%s", (char*)as_index(prompt_val));
         fflush(stdout);
     }
-    char buf[256];
-    if (fgets(buf, 256, stdin) == NULL) return donky_alloc_string("");
+    char buf[4096];
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        return donky_alloc_string("");
+    }
     buf[strcspn(buf, "\r\n")] = 0;
     return donky_alloc_string(buf);
 }

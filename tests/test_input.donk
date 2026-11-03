@@ -1,0 +1,3 @@
+print("Before input");
+let name = input("Name: ");
+print("After input: " + name);

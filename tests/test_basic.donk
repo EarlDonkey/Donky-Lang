@@ -1,0 +1,4 @@
+print("Start");
+let s = "hello";
+print(s);
+print(len(s));
