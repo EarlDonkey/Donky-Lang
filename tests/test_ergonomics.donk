@@ -1,0 +1,42 @@
+// 1. escapes
+print("a\tb\\c \"q\"");        // a<TAB>b\c "q"
+print("line1\nline2");
+
+// 2. raw string
+print(`<p class="x">\n stays</p>
+second line`);                  // literal \n, real newline kept
+
+// 3. else if
+fn grade(n) {
+    if n >= 90 { return "A"; } else if n >= 80 { return "B"; } else { return "C"; }
+}
+print(grade(95));               // A
+print(grade(85));               // B
+print(grade(10));               // C
+
+// 4. compound assignment
+let x = 10;
+x += 5; x -= 3; x *= 2; x /= 4; x %= 4;
+print(x);                       // 2
+
+// 5. range loop (continue must still advance)
+let sum = 0;
+for i in 0..10 {
+    if i == 5 { continue; }
+    sum += i;
+}
+print(sum);                     // 40
+
+// 6. format
+let name = "Donky";
+print("Hello, {}!".format(name));        // Hello, Donky!
+print(format("{} + {} = {}", [1, 2, 3])); // 1 + 2 = 3
+
+// 7. method calls
+print("hello".upper());                  // HELLO
+print("a,b,c".split(",").len());         // 3
+
+// 8. ternary
+let t = x > 1 ? "big" : "small";
+print(t);                                // big
+print(x > 5 ? "a" : x > 100 || x < 0 ? "b" : "c");  // c

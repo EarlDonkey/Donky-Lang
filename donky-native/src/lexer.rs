@@ -4,7 +4,7 @@ pub enum TokenType {
     Let, Fn, If, Else, While, For, In, Return, Print, True, False, Div, Break, Continue, Try, Catch, Throw, Import, Struct, Asm, Match,
     Plus, Minus, Star, Slash, Percent, Bang, And, Or, Eq, EqEq, NotEq, Lt, LtEq, Gt, GtEq,
     PlusEq, MinusEq, StarEq, SlashEq, PlusPlus, MinusMinus, Question,
-    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Semi, Comma, Colon, Dot, Eof,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Semi, Comma, Colon, Dot, Eof, PercentEq, DotDot,
 }
 
 #[derive(Debug, Clone)]
@@ -69,19 +69,32 @@ impl Lexer {
                 '{' => TokenType::LBrace, '}' => TokenType::RBrace,
                 '[' => TokenType::LBracket, ']' => TokenType::RBracket,
                 ';' => TokenType::Semi, ',' => TokenType::Comma,
-                ':' => TokenType::Colon, '.' => TokenType::Dot,
+                ':' => TokenType::Colon,
                 '?' => TokenType::Question,
                 '+' => if self.match_char('=') { TokenType::PlusEq } else if self.match_char('+') { TokenType::PlusPlus } else { TokenType::Plus },
                 '-' => if self.match_char('=') { TokenType::MinusEq } else if self.match_char('-') { TokenType::MinusMinus } else { TokenType::Minus },
                 '*' => if self.match_char('=') { TokenType::StarEq } else { TokenType::Star },
                 '/' => if self.match_char('=') { TokenType::SlashEq } else { TokenType::Slash },
-                '%' => TokenType::Percent,
+                '.' => {
+                    if self.match_char('.') { TokenType::DotDot } else { TokenType::Dot }
+                }
+                '%' => {
+                    if self.match_char('=') { TokenType::PercentEq } else { TokenType::Percent }
+                }
                 '=' => if self.match_char('=') { TokenType::EqEq } else { TokenType::Eq },
                 '!' => if self.match_char('=') { TokenType::NotEq } else { TokenType::Bang },
                 '<' => if self.match_char('=') { TokenType::LtEq } else { TokenType::Lt },
                 '>' => if self.match_char('=') { TokenType::GtEq } else { TokenType::Gt },
                 '&' => { if self.match_char('&') { TokenType::And } else { return Err("Unexpected &".into()); } },
                 '|' => { if self.match_char('|') { TokenType::Or } else { return Err("Unexpected |".into()); } },
+                '`' => {
+                    let mut val = String::new();
+                    while !self.at_end() && self.peek(0) != '`' { val.push(self.advance()); }
+                    if self.at_end() { return Err("Unterminated raw string".into()); }
+                    self.advance();
+                    tokens.push(Token { ttype: TokenType::String, lexeme: format!("`{}`", val), literal: Some(val), line: start_line, col: start_col });
+                    continue;
+                },
                 '"' => {
                     let mut val = String::new();
                     let mut has_interp = false;
@@ -112,8 +125,17 @@ impl Lexer {
                 _ => {
                     if c.is_ascii_digit() {
                         let mut num_str = c.to_string();
-                        while self.peek(0).is_ascii_digit() || self.peek(0) == '.' {
-                            num_str.push(self.advance());
+                        let mut seen_dot = false;
+                        loop {
+                            let p = self.peek(0);
+                            if p.is_ascii_digit() {
+                                num_str.push(self.advance());
+                            } else if p == '.' && !seen_dot && self.peek(1).is_ascii_digit() {
+                                seen_dot = true;
+                                num_str.push(self.advance());
+                            } else {
+                                break;
+                            }
                         }
                         tokens.push(Token { ttype: TokenType::Number, lexeme: num_str.clone(), literal: Some(num_str), line: start_line, col: start_col });
                         continue;

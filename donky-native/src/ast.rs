@@ -21,4 +21,5 @@ pub enum Stmt {
     Function(String, Vec<String>, Box<Stmt>), Return(Option<Expr>),
     Break, Continue, StructDef(String, Vec<(String, String)>),
     Try(Box<Stmt>, String, Box<Stmt>), Throw(Expr), Import(String), Asm(String),
+    ForRange(String, Expr, Expr, Box<Stmt>),
 }

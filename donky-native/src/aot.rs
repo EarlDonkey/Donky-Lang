@@ -366,6 +366,10 @@ impl AotCompiler {
                     count_reads(body, reads);
                     *reads.entry(var.clone()).or_insert(0) += 1; // Loop variable is read
                 }
+                Stmt::ForRange(_, a, b, body) => {
+                    count_expr_reads(a, reads); count_expr_reads(b, reads);
+                    count_reads(body, reads);
+                }
                 Stmt::Block(inner) => {
                     for s in inner { count_reads(s, reads); }
                 }
@@ -698,6 +702,50 @@ impl AotCompiler {
                 builder.seal_block(exit_block);
                 false
             }
+            Stmt::ForRange(var_name, start_expr, end_expr, body) => {
+                let idx_var = Variable::new(fctx.next_var); fctx.next_var += 1;
+                let end_var = Variable::new(fctx.next_var); fctx.next_var += 1;
+                let start_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, start_expr);
+                let end_val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, end_expr);
+                builder.declare_var(idx_var, types::I64); builder.def_var(idx_var, start_val);
+                builder.declare_var(end_var, types::I64); builder.def_var(end_var, end_val);
+                let header = builder.create_block();
+                let body_block = builder.create_block();
+                let incr_block = builder.create_block();
+                let exit_block = builder.create_block();
+                builder.ins().jump(header, &[]);
+                builder.switch_to_block(header);
+                let cur = builder.use_var(idx_var);
+                let endv = builder.use_var(end_var);
+                let cur_f = builder.ins().bitcast(types::F64, MemFlags::new(), cur);
+                let end_f = builder.ins().bitcast(types::F64, MemFlags::new(), endv);
+                let cond = builder.ins().fcmp(FloatCC::LessThan, cur_f, end_f);
+                builder.ins().brif(cond, body_block, &[], exit_block, &[]);
+                builder.seal_block(body_block);
+                fctx.loop_stack.push((exit_block, incr_block));
+                builder.switch_to_block(body_block);
+                let loop_var = Variable::new(fctx.next_var); fctx.next_var += 1;
+                builder.declare_var(loop_var, types::I64);
+                let cur_b = builder.use_var(idx_var);
+                builder.def_var(loop_var, cur_b);
+                fctx.variables.insert(var_name.clone(), loop_var);
+                let term = Self::compile_stmt(builder, module, runtime, user_funcs, pending_closures, fctx, body);
+                fctx.loop_stack.pop();
+                if !term { builder.ins().jump(incr_block, &[]); }
+                builder.seal_block(incr_block);
+                builder.switch_to_block(incr_block);
+                let c2 = builder.use_var(idx_var);
+                let c2f = builder.ins().bitcast(types::F64, MemFlags::new(), c2);
+                let one = builder.ins().f64const(1.0);
+                let sum = builder.ins().fadd(c2f, one);
+                let nxt = builder.ins().bitcast(types::I64, MemFlags::new(), sum);
+                builder.def_var(idx_var, nxt);
+                builder.ins().jump(header, &[]);
+                builder.switch_to_block(exit_block);
+                builder.seal_block(header);
+                builder.seal_block(exit_block);
+                false
+            }
             Stmt::Match(target, cases, else_block) => {
                 if cases.is_empty() {
                     return if let Some(eb) = else_block {
@@ -837,6 +885,45 @@ impl AotCompiler {
                     }
                     _ => val,
                 }
+            }
+            Expr::Call(name, args) if name == "format" && !user_funcs.contains_key("format")
+                && matches!(args.first(), Some(Expr::String(_))) => {
+                let fmt = match &args[0] { Expr::String(s) => s.clone(), _ => unreachable!() };
+                let vals: Vec<Expr> = match &args[1..] { [Expr::Array(e)] => e.clone(), rest => rest.to_vec() };
+                Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Self::desugar_format(&fmt, &vals))
+            }
+            Expr::MethodCall(obj, method, args) => {
+                if method == "format" {
+                    if let Expr::String(fmt) = obj.as_ref() {
+                        let vals: Vec<Expr> = match args.as_slice() { [Expr::Array(e)] => e.clone(), _ => args.clone() };
+                        return Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Self::desugar_format(fmt, &vals));
+                    }
+                }
+                let mut full = Vec::with_capacity(args.len() + 1);
+                full.push((**obj).clone());
+                full.extend(args.iter().cloned());
+                Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Expr::Call(method.clone(), full))
+            }
+            Expr::Ternary(c, t, f) => {
+                let cv = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, c);
+                let known = Self::is_num(c, &fctx.num_vars);
+                let cb = Self::cond_to_bool(builder, module, runtime, cv, known);
+                let then_b = builder.create_block();
+                let else_b = builder.create_block();
+                let merge = builder.create_block();
+                builder.append_block_param(merge, types::I64);
+                builder.ins().brif(cb, then_b, &[], else_b, &[]);
+                builder.seal_block(then_b);
+                builder.seal_block(else_b);
+                builder.switch_to_block(then_b);
+                let tv = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, t);
+                builder.ins().jump(merge, &[tv]);
+                builder.switch_to_block(else_b);
+                let fv = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, f);
+                builder.ins().jump(merge, &[fv]);
+                builder.seal_block(merge);
+                builder.switch_to_block(merge);
+                builder.block_params(merge)[0]
             }
             Expr::Call(name, args) => {
                 if let Some(func_id) = user_funcs.get(name) {
@@ -1205,6 +1292,17 @@ impl AotCompiler {
     fn split_param(p: &str) -> (&str, Option<&str>) {
         match p.split_once(':') { Some((n, t)) => (n, Some(t)), None => (p, None) }
     }
+    fn desugar_format(fmt: &str, vals: &[Expr]) -> Expr {
+        let segs: Vec<&str> = fmt.split("{}").collect();
+        let mut parts = Vec::new();
+        for (k, seg) in segs.iter().enumerate() {
+            if !seg.is_empty() { parts.push(Expr::String(seg.to_string())); }
+            if k + 1 < segs.len() {
+                parts.push(vals.get(k).cloned().unwrap_or_else(|| Expr::String("{}".into())));
+            }
+        }
+        Expr::InterpolatedString(parts)
+    }
 
     fn is_num(e: &Expr, num: &HashSet<String>) -> bool {
         match e {
@@ -1230,6 +1328,7 @@ impl AotCompiler {
             Stmt::If(_, t, e) => { Self::collect_defs(t, defs); if let Some(e) = e { Self::collect_defs(e, defs); } }
             Stmt::While(_, b) => Self::collect_defs(b, defs),
             Stmt::For(v, _, b) => { defs.push((v.clone(), None)); Self::collect_defs(b, defs); }
+            Stmt::ForRange(v, s, _, b) => { defs.push((v.clone(), Some(s))); Self::collect_defs(b, defs); }
             Stmt::Try(t, n, c) => { Self::collect_defs(t, defs); defs.push((n.clone(), None)); Self::collect_defs(c, defs); }
             Stmt::Match(_, cases, eb) => {
                 for (_, b) in cases { Self::collect_defs(b, defs); }

@@ -1,1 +1,0 @@
-C:\Users\user\Desktop\Donky-Lang\donky-asm\target\debug\donky-asm.exe: C:\Users\user\Desktop\Donky-Lang\donky-asm\src\ast.rs C:\Users\user\Desktop\Donky-Lang\donky-asm\src\codegen.rs C:\Users\user\Desktop\Donky-Lang\donky-asm\src\lexer.rs C:\Users\user\Desktop\Donky-Lang\donky-asm\src\main.rs C:\Users\user\Desktop\Donky-Lang\donky-asm\src\parser.rs

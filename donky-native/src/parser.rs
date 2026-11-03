@@ -51,6 +51,16 @@ impl Parser {
         while !self.is_at_end() { statements.push(self.statement()?); }
         Ok(statements)
     }
+    fn compound_op(t: &TokenType) -> Option<TokenType> {
+        match t {
+            TokenType::PlusEq => Some(TokenType::Plus),
+            TokenType::MinusEq => Some(TokenType::Minus),
+            TokenType::StarEq => Some(TokenType::Star),
+            TokenType::SlashEq => Some(TokenType::Slash),
+            TokenType::PercentEq => Some(TokenType::Percent),
+            _ => None,
+        }
+    }
 
     fn build_compound(&mut self, target: Expr, bin_op: TokenType, value: Expr) -> Result<Stmt, String> {
         match target {
@@ -187,6 +197,14 @@ impl Parser {
             let name = self.consume(TokenType::Ident, "Expected loop variable")?.lexeme.clone();
             self.consume(TokenType::In, "Expected 'in'")?;
             let iter_expr = self.expression(0)?;
+            
+            // NEW: Check for `..` (DotDot)
+            if self.match_token(&[TokenType::DotDot]) {
+                let end_expr = self.expression(0)?;
+                let body = Box::new(self.statement()?);
+                return Ok(Stmt::ForRange(name, iter_expr, end_expr, body));
+            }
+            
             let body = Box::new(self.statement()?);
             return Ok(Stmt::For(name, iter_expr, body));
         }
@@ -235,24 +253,6 @@ impl Parser {
             return Ok(Stmt::Assign(name.clone(), Expr::Binary(Box::new(Expr::Ident(name)), TokenType::Minus, Box::new(Expr::Number(1.0)))));
         }
 
-        if self.check(TokenType::Ident) {
-            let next = self.peek_n(1).ttype.clone();
-            if next == TokenType::PlusEq || next == TokenType::MinusEq || next == TokenType::StarEq || next == TokenType::SlashEq {
-                let name = self.advance().lexeme.clone();
-                let op_token = self.advance().ttype.clone();
-                let value = self.expression(0)?;
-                self.consume(TokenType::Semi, "Expected ';'")?;
-                let bin_op = match op_token {
-                    TokenType::PlusEq => TokenType::Plus,
-                    TokenType::MinusEq => TokenType::Minus,
-                    TokenType::StarEq => TokenType::Star,
-                    TokenType::SlashEq => TokenType::Slash,
-                    _ => unreachable!(),
-                };
-                return Ok(Stmt::Assign(name.clone(), Expr::Binary(Box::new(Expr::Ident(name)), bin_op, Box::new(value))));
-            }
-        }
-
         if self.check(TokenType::Ident) && self.peek_n(1).ttype == TokenType::Eq {
             let name = self.advance().lexeme.clone();
             self.advance();
@@ -263,16 +263,9 @@ impl Parser {
 
         let expr = self.expression(0)?;
 
-        if self.check(TokenType::PlusEq) || self.check(TokenType::MinusEq) || self.check(TokenType::StarEq) || self.check(TokenType::SlashEq) {
-            let op_token = self.advance().ttype.clone();
+        if let Some(bin_op) = Self::compound_op(&self.peek().ttype) {
+            self.advance();
             let value = self.expression(0)?;
-            let bin_op = match op_token {
-                TokenType::PlusEq => TokenType::Plus,
-                TokenType::MinusEq => TokenType::Minus,
-                TokenType::StarEq => TokenType::Star,
-                TokenType::SlashEq => TokenType::Slash,
-                _ => unreachable!(),
-            };
             self.consume(TokenType::Semi, "Expected ';'")?;
             return self.build_compound(expr, bin_op, value);
         }
@@ -337,7 +330,7 @@ impl Parser {
         if min_bp <= 2 && self.match_token(&[TokenType::Question]) {
             let then_branch = self.expression(0)?;
             self.consume(TokenType::Colon, "Expected ':' in ternary")?;
-            let else_branch = self.expression(2)?;
+            let else_branch = self.expression(0)?;
             left = Expr::Ternary(Box::new(left), Box::new(then_branch), Box::new(else_branch));
         }
 

@@ -561,7 +561,8 @@ impl Compiler {
                 let end = self.code.len(); self.code[jo] = PendingOp::Ready(OpCode::Jump(end));
                 match saved { Some(old) => { self.locals.insert(err_name, old); } None => { self.locals.remove(&err_name); } }
             }
-            Stmt::StructDef(_, _) => {}
+            Stmt::StructDef(_, _) => {},
+            Stmt::ForRange(_, _, _, _) => panic!("ForRange not supported in VM"),
         }
     }
 

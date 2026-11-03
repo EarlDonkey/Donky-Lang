@@ -1,9 +1,0 @@
-let arr = [];
-for i in [1,2,3,4,5,6,7,8,9,10] {
-    push(arr, i * i);
-}
-let total = 0;
-for x in arr {
-    total = total + x;
-}
-print(total);

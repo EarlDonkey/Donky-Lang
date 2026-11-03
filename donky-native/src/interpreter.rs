@@ -205,6 +205,7 @@ impl Interpreter {
             Stmt::Return(expr) => { let v = if let Some(e) = expr { self.evaluate(e)? } else { Value::null() }; Ok(ControlFlow::Return(v)) }
             Stmt::Break => Ok(ControlFlow::Break),
             Stmt::Continue => Ok(ControlFlow::Continue),
+            Stmt::ForRange(_, _, _, _) => Err("ForRange not supported in interpreter".to_string()),
         }
     }
 
