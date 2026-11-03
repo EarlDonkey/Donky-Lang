@@ -1,8 +1,8 @@
 import "lib/json.donk";
 
 fn main() {
+    // Read the single file from disk once before the timer starts
     let raw = read_file("big.json");
-    print("File size: " + str(len(raw)) + " bytes");
 
     let start = now_ms();
     let i = 0;

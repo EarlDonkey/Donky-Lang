@@ -8,7 +8,6 @@
 #include <conio.h>
 
 #define WIN32_LEAN_AND_MEAN
-#define _WINSOCKAPI_
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -187,7 +186,8 @@ void* gc_malloc(size_t size) {
 }
 
 typedef struct { uint64_t* data; size_t len; size_t cap; } Array;
-typedef struct { uint64_t* keys; uint64_t* vals; uint32_t* idx; size_t len; size_t cap; size_t idx_cap; } Map;
+// hs: cached 64-bit hash per entry. Only allocated once the hash index exists (len > 8).
+typedef struct { uint64_t* keys; uint64_t* vals; uint32_t* idx; uint64_t* hs; size_t len; size_t cap; size_t idx_cap; } Map;
 
 uint64_t donky_alloc_map(void);
 uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val);
@@ -289,7 +289,7 @@ uint64_t donky_kill_process(uint64_t pid_val) {
     if (!hProc) return make_number(0.0);
     BOOL res = TerminateProcess(hProc, 1);
     CloseHandle(hProc);
-    return make_number(res ? 1.0 : 0.0);
+    return make_number(res ? 1.0 : 0.0); 
 }
 
 uint64_t donky_get_uptime() {
@@ -317,7 +317,8 @@ uint64_t donky_get_disk_info() {
 
 uint64_t donky_alloc_map() {
     Map* map = gc_malloc(sizeof(Map));
-    map->keys = NULL; map->vals = NULL; map->idx = NULL; map->len = 0; map->cap = 0; map->idx_cap = 0;
+    map->keys = NULL; map->vals = NULL; map->idx = NULL; map->hs = NULL;
+    map->len = 0; map->cap = 0; map->idx_cap = 0;
     GCHeader* h = ((GCHeader*)map) - 1;
     h->type_tag = TAG_MAP;
     return TAG_BASE | (TAG_MAP << 48) | (uint64_t)map;
@@ -375,6 +376,7 @@ static void gc_finalize(GCHeader* h) {
         if (map->keys) free(map->keys);
         if (map->vals) free(map->vals);
         if (map->idx) free(map->idx);
+        if (map->hs) free(map->hs);
     }
     h->type_tag = 0;
 }
@@ -441,7 +443,11 @@ void gc_mark_stack() {
     setjmp(env); 
     ULONG_PTR lowLimit = 0, highLimit = 0;
     GetCurrentThreadStackLimits(&lowLimit, &highLimit);
-    uintptr_t* stack_ptr = (uintptr_t*)&lowLimit;
+    // Start at whichever of `env` (saved registers) and `lowLimit` is lower, so
+    // callee-saved registers captured by setjmp are always inside the scanned range.
+    uintptr_t* pa = (uintptr_t*)&env;
+    uintptr_t* pb = (uintptr_t*)&lowLimit;
+    uintptr_t* stack_ptr = pa < pb ? pa : pb;
     uintptr_t* top = (uintptr_t*)highLimit;
 
     while (stack_ptr < top) {
@@ -473,7 +479,7 @@ uint64_t donky_gc() {
 static int map_key_eq(uint64_t a, uint64_t b) {
     if (is_number(a) && is_number(b)) return as_number(a) == as_number(b);
     if (get_tag(a) == TAG_STRING && get_tag(b) == TAG_STRING)
-        return strcmp((char*)as_index(a), (char*)as_index(b)) == 0;
+        return a == b || strcmp((char*)as_index(a), (char*)as_index(b)) == 0;   // pointer-equal fast path (interned keys)
     return a == b;
 }
 
@@ -481,6 +487,19 @@ static inline uint64_t mix64(uint64_t b) {
     b ^= b >> 33; b *= 0xff51afd7ed558ccdULL;
     b ^= b >> 33; b *= 0xc4ceb9fe1a85ec53ULL;
     b ^= b >> 33; return b;
+}
+
+// 8 bytes at a time instead of FNV's one byte at a time.
+static uint64_t hash_bytes(const unsigned char* p, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)n * 0xff51afd7ed558ccdULL), t = 0;
+    while (n >= 8) {
+        uint64_t w; memcpy(&w, p, 8);
+        h = (h ^ w) * 0x9FB21C651E98DF25ULL;
+        h ^= h >> 32;
+        p += 8; n -= 8;
+    }
+    if (n) memcpy(&t, p, n);
+    return mix64((h ^ t) * 0x9FB21C651E98DF25ULL);
 }
 
 static uint64_t map_hash(uint64_t k) {
@@ -491,33 +510,36 @@ static uint64_t map_hash(uint64_t k) {
         return mix64(b);
     }
     if (get_tag(k) == TAG_STRING) {
-        const unsigned char* p = (const unsigned char*)as_index(k);
-        uint64_t h = 1469598103934665603ULL; // FNV-1a
-        while (*p) { h ^= *p++; h *= 1099511628211ULL; }
-        return mix64(h);
+        const char* s = (const char*)as_index(k);
+        return hash_bytes((const unsigned char*)s, str_len(s));
     }
     return mix64(k);
 }
 
-static int64_t map_find(Map* m, uint64_t key) {
+// h is only used when the map has a hash index (m->idx != NULL).
+static int64_t map_find_h(Map* m, uint64_t key, uint64_t h) {
     if (!m->idx) {
         for (size_t i = 0; i < m->len; i++)
             if (map_key_eq(m->keys[i], key)) return (int64_t)i;
         return -1;
     }
     size_t mask = m->idx_cap - 1;
-    size_t p = (size_t)map_hash(key) & mask;
+    size_t p = (size_t)h & mask;
     for (;;) {
         uint32_t e = m->idx[p];
         if (e == 0) return -1;
-        if (map_key_eq(m->keys[e - 1], key)) return (int64_t)(e - 1);
+        if (m->hs[e - 1] == h && map_key_eq(m->keys[e - 1], key)) return (int64_t)(e - 1);
         p = (p + 1) & mask;
     }
 }
 
+static int64_t map_find(Map* m, uint64_t key) {
+    return map_find_h(m, key, m->idx ? map_hash(key) : 0);
+}
+
 static void map_index_insert(Map* m, size_t entry) {
     size_t mask = m->idx_cap - 1;
-    size_t p = (size_t)map_hash(m->keys[entry]) & mask;
+    size_t p = (size_t)m->hs[entry] & mask;
     while (m->idx[p]) p = (p + 1) & mask;
     m->idx[p] = (uint32_t)(entry + 1);
 }
@@ -528,28 +550,36 @@ static void map_rebuild_index(Map* m) {
     if (m->idx) free(m->idx);
     m->idx = (uint32_t*)calloc(need, sizeof(uint32_t));
     m->idx_cap = need;
+    if (!m->hs) {                         // first time: hash every existing key once
+        m->hs = (uint64_t*)malloc(m->cap * sizeof(uint64_t));
+        for (size_t i = 0; i < m->len; i++) m->hs[i] = map_hash(m->keys[i]);
+    }                                     // otherwise hs is already current: no rehashing
     for (size_t i = 0; i < m->len; i++) map_index_insert(m, i);
 }
 
 uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val) {
     if (get_tag(map_val) != TAG_MAP) return 0;
     Map* map = (Map*)as_index(map_val);
-    int64_t f = map_find(map, key);
+    uint64_t h = map->idx ? map_hash(key) : 0;
+    int64_t f = map_find_h(map, key, h);
     if (f >= 0) { map->vals[f] = val; return 0; }
     int grew = 0;
     if (map->len == map->cap) {
         map->cap = map->cap == 0 ? 4 : map->cap * 2;
         map->keys = realloc(map->keys, map->cap * sizeof(uint64_t));
         map->vals = realloc(map->vals, map->cap * sizeof(uint64_t));
+        if (map->hs) map->hs = realloc(map->hs, map->cap * sizeof(uint64_t));
         grew = 1;
     }
     map->keys[map->len] = key;
     map->vals[map->len] = val;
-    map->len++;
     if (map->idx) {
+        map->hs[map->len] = h;
+        map->len++;
         if (grew) map_rebuild_index(map); else map_index_insert(map, map->len - 1);
-    } else if (map->len > 8) {
-        map_rebuild_index(map);
+    } else {
+        map->len++;
+        if (map->len > 8) map_rebuild_index(map);
     }
     return 0;
 }
@@ -877,7 +907,9 @@ uint64_t donky_sleep(uint64_t ms_val) {
 #define DONKY_TLS __thread
 #endif
 
-#define JSON_MAX_DEPTH 512
+// Recursion depth cap. ~2048 levels fits comfortably in the default 1 MB Windows stack.
+// To go deeper, add "-Wl,--stack,16777216" to the gcc link args in main.rs and raise this.
+#define JSON_MAX_DEPTH 2048
 #define JV_IS(v, t) (!is_number(v) && get_tag(v) == (t))
 
 static DONKY_TLS char json_err_buf[192];
@@ -890,10 +922,14 @@ static uint64_t jp_mkstr(const char* s, size_t n) {
     return TAG_BASE | (TAG_STRING << 48) | (uint64_t)d;
 }
 
+#define JP_KEY_CACHE 256      // direct-mapped; power of two
+#define JP_KEY_MAXLEN 32      // only short keys are interned
+
 typedef struct {
     const char* p; const char* end;
     char* scratch; size_t scap;
     const char* err; const char* err_at;
+    uint64_t kc[JP_KEY_CACHE];   // interned object-key strings (zero-initialised = empty)
 } JsonParser;
 
 static int jp_fail(JsonParser* jp, const char* msg) {
@@ -940,7 +976,10 @@ static size_t jp_utf8(char* o, unsigned cp) {
     return 4;
 }
 
-static int jp_string(JsonParser* jp, uint64_t* out) {
+// is_key != 0: short escape-free strings are interned in jp->kc so repeated object
+// keys share one GC string (and hit the pointer-equality fast path in map_key_eq).
+// Interned strings are never mutated, and no GC runs during a decode.
+static int jp_string(JsonParser* jp, uint64_t* out, int is_key) {
     const char* start = jp->p + 1;
     const char* p = start;
     while (p < jp->end) {                       // fast path: scan for quote/backslash
@@ -950,7 +989,21 @@ static int jp_string(JsonParser* jp, uint64_t* out) {
         p++;
     }
     if (p >= jp->end) { jp->p = p; return jp_fail(jp, "unterminated string"); }
-    if (*p == '"') { *out = jp_mkstr(start, (size_t)(p - start)); jp->p = p + 1; return 1; }
+    if (*p == '"') {
+        size_t n = (size_t)(p - start);
+        if (is_key && n <= JP_KEY_MAXLEN) {
+            size_t slot = (size_t)(hash_bytes((const unsigned char*)start, n) & (JP_KEY_CACHE - 1));
+            uint64_t c = jp->kc[slot];
+            if (c) {
+                const char* cs = (const char*)as_index(c);
+                if (str_len(cs) == n && memcmp(cs, start, n) == 0) { *out = c; jp->p = p + 1; return 1; }
+            }
+            uint64_t s = jp_mkstr(start, n);
+            jp->kc[slot] = s;
+            *out = s; jp->p = p + 1; return 1;
+        }
+        *out = jp_mkstr(start, n); jp->p = p + 1; return 1;
+    }
 
     size_t used = (size_t)(p - start);          // slow path: has escapes
     if (!jp_reserve(jp, used + 8)) { jp->p = p; return jp_fail(jp, "out of memory"); }
@@ -994,32 +1047,52 @@ static int jp_string(JsonParser* jp, uint64_t* out) {
     return jp_fail(jp, "unterminated string");
 }
 
+// Exact powers of ten representable as doubles (1e0..1e22).
+static const double JP_P10[23] = {
+    1e0,1e1,1e2,1e3,1e4,1e5,1e6,1e7,1e8,1e9,1e10,1e11,
+    1e12,1e13,1e14,1e15,1e16,1e17,1e18,1e19,1e20,1e21,1e22
+};
+
+// Clinger fast path: when the decimal mantissa is < 2^53 and the power-of-ten exponent
+// is within +-22, (double)m * or / 10^|e| is a single correctly-rounded IEEE operation,
+// so the result is bit-identical to strtod. Anything else falls back to strtod.
 static int jp_number(JsonParser* jp, uint64_t* out) {
     const char* st = jp->p; const char* p = st;
-    int is_int = 1;
-    if (*p == '-') p++;
+    int neg = 0, nd = 0, e10 = 0, fast = 1;
+    uint64_t m = 0;
+    if (*p == '-') { neg = 1; p++; }
     if (*p == '0') p++;
-    else if (*p >= '1' && *p <= '9') { while (*p >= '0' && *p <= '9') p++; }
-    else { jp->p = p; return jp_fail(jp, "invalid value"); }
+    else if (*p >= '1' && *p <= '9') {
+        while (*p >= '0' && *p <= '9') {
+            if (nd < 19) { m = m * 10 + (uint64_t)(*p - '0'); nd++; }
+            else { fast = 0; e10++; }
+            p++;
+        }
+    } else { jp->p = p; return jp_fail(jp, "invalid value"); }
     if (*p == '.') {
-        is_int = 0; p++;
+        p++;
         if (!(*p >= '0' && *p <= '9')) { jp->p = p; return jp_fail(jp, "bad number"); }
-        while (*p >= '0' && *p <= '9') p++;
+        while (*p >= '0' && *p <= '9') {
+            if (nd < 19) { m = m * 10 + (uint64_t)(*p - '0'); nd++; e10--; }
+            else fast = 0;
+            p++;
+        }
     }
     if (*p == 'e' || *p == 'E') {
-        is_int = 0; p++;
-        if (*p == '+' || *p == '-') p++;
+        p++;
+        int es = 1, ev = 0;
+        if (*p == '+') p++;
+        else if (*p == '-') { es = -1; p++; }
         if (!(*p >= '0' && *p <= '9')) { jp->p = p; return jp_fail(jp, "bad number"); }
-        while (*p >= '0' && *p <= '9') p++;
+        while (*p >= '0' && *p <= '9') { if (ev < 10000) ev = ev * 10 + (*p - '0'); p++; }
+        e10 += es * ev;
     }
     double d;
-    if (is_int && (p - st) <= 15) {              // fast integer path (exact in a double)
-        const char* q = st; int neg = 0; int64_t v = 0;
-        if (*q == '-') { neg = 1; q++; }
-        while (q < p) v = v * 10 + (*q++ - '0');
-        d = neg ? -(double)v : (double)v;
+    if (fast && m < (1ULL << 53) && e10 >= -22 && e10 <= 22) {
+        d = e10 < 0 ? (double)m / JP_P10[-e10] : (double)m * JP_P10[e10];
+        if (neg) d = -d;
     } else {
-        d = strtod(st, NULL);
+        d = strtod(st, NULL);        // st includes the '-', so the sign is already applied
     }
     jp->p = p;
     *out = make_number(d);
@@ -1033,7 +1106,7 @@ static int jp_value(JsonParser* jp, uint64_t* out, int depth) {
     char c = *jp->p;
     size_t left = (size_t)(jp->end - jp->p);
     switch (c) {
-    case '"': return jp_string(jp, out);
+    case '"': return jp_string(jp, out, 0);
     case '{': {
         jp->p++;
         uint64_t m = donky_alloc_map();
@@ -1043,7 +1116,7 @@ static int jp_value(JsonParser* jp, uint64_t* out, int depth) {
             jp_ws(jp);
             if (jp->p >= jp->end || *jp->p != '"') return jp_fail(jp, "expected string key");
             uint64_t k, v;
-            if (!jp_string(jp, &k)) return 0;
+            if (!jp_string(jp, &k, 1)) return 0;
             jp_ws(jp);
             if (jp->p >= jp->end || *jp->p != ':') return jp_fail(jp, "expected ':'");
             jp->p++;
@@ -1091,7 +1164,7 @@ uint64_t donky_json_decode(uint64_t s_val) {
     json_err_buf[0] = 0;
     if (!JV_IS(s_val, TAG_STRING)) { snprintf(json_err_buf, sizeof json_err_buf, "json: expected a string"); return 0; }
     const char* s = (const char*)as_index(s_val);
-    JsonParser jp = { s, s + str_len(s), NULL, 0, NULL, NULL };
+    JsonParser jp = { s, s + str_len(s), NULL, 0, NULL, NULL };   // kc[] zero-initialised
     if (jp.end - jp.p >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) jp.p += 3;  // UTF-8 BOM
     uint64_t result = 0;
     int ok = jp_value(&jp, &result, 0);
