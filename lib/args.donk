@@ -1,0 +1,158 @@
+// lib/args.donk — state lives in the runtime's global store, so call args_parse once at startup.
+//   --name=value      -> param
+//   --name            -> flag   (or a param, if "name" is listed in `valued`: --name value)
+//   -abc              -> flags a, b, c
+//   anything else     -> positional
+
+fn args_nl() { return bytes_to_str([10]); }
+
+fn args_find_eq(s) {
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        if byte_at(s, i) == 61 { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn args_is_digit(c) { return c >= 48 && c <= 57; }
+
+fn args_parse_with(argv, valued) {
+    let flags = {};
+    let params = {};
+    let pos = [];
+    let n = len(argv);
+    let i = 0;
+    while i < n {
+        let a = argv[i];
+        let al = len(a);
+        if al > 2 && byte_at(a, 0) == 45 && byte_at(a, 1) == 45 {
+            let body = byte_substr(a, 2, al);
+            let eq = args_find_eq(body);
+            if eq >= 0 {
+                let pk = byte_substr(body, 0, eq);
+                params[pk] = byte_substr(body, eq + 1, len(body));
+            } else {
+                if contains(valued, body) && i + 1 < n {
+                    params[body] = argv[i + 1];
+                    i = i + 1;
+                } else {
+                    flags[body] = true;
+                }
+            }
+        } else {
+            if al > 1 && byte_at(a, 0) == 45 && byte_at(a, 1) != 45 && !args_is_digit(byte_at(a, 1)) {
+                let j = 1;
+                while j < al {
+                    let fk = byte_substr(a, j, j + 1);
+                    flags[fk] = true;
+                    j = j + 1;
+                }
+            } else {
+                push(pos, a);
+            }
+        }
+        i = i + 1;
+    }
+    global_set("args.flags", flags);
+    global_set("args.params", params);
+    global_set("args.pos", pos);
+    return 1;
+}
+
+fn args_parse(argv) { return args_parse_with(argv, []); }
+
+fn args_flag(name) {
+    let m = global_get("args.flags");
+    if type(m) != "map" { return false; }
+    if contains(m, name) { return true; }
+    return false;
+}
+
+fn args_param(name) {
+    let m = global_get("args.params");
+    if type(m) != "map" { return null; }
+    if contains(m, name) { return m[name]; }
+    return null;
+}
+
+fn args_param_or(name, fallback) {
+    let m = global_get("args.params");
+    if type(m) != "map" { return fallback; }
+    if contains(m, name) { return m[name]; }
+    return fallback;
+}
+
+fn args_positional() {
+    let p = global_get("args.pos");
+    if type(p) != "array" { return []; }
+    return p;
+}
+
+// ---- help / version ----
+fn args_set_info(name, version, description) {
+    global_set("args.name", name);
+    global_set("args.version", version);
+    global_set("args.desc", description);
+    return 1;
+}
+
+fn args_add_option(spec, text) {
+    let o = global_get("args.opts");
+    if type(o) != "array" { o = []; }
+    push(o, [spec, text]);
+    global_set("args.opts", o);
+    return 1;
+}
+
+fn args_help_text() {
+    let nl = args_nl();
+    let name = global_get("args.name");
+    let lines = [];
+    if type(name) == "string" {
+        let desc = global_get("args.desc");
+        if type(desc) == "string" { push(lines, name + " - " + desc); } else { push(lines, name); }
+    }
+    push(lines, "");
+    push(lines, "Options:");
+    let o = global_get("args.opts");
+    if type(o) == "array" {
+        for pair in o {
+            let spec = pair[0];
+            let pad = 24 - len(spec);
+            if pad < 2 { pad = 2; }
+            push(lines, "  " + spec + bytes_to_str(args_spaces(pad)) + pair[1]);
+        }
+    }
+    push(lines, "  --help" + bytes_to_str(args_spaces(17)) + "Show this help");
+    push(lines, "  --version" + bytes_to_str(args_spaces(14)) + "Show version");
+    return join(lines, nl);
+}
+
+fn args_spaces(n) {
+    let out = [];
+    let i = 0;
+    while i < n { push(out, 32); i = i + 1; }
+    return out;
+}
+
+// Print and return.
+fn args_help() {
+    let t = args_help_text();
+    sys_puts(t);
+    return t;
+}
+
+fn args_version() {
+    let v = global_get("args.version");
+    if type(v) != "string" { v = "unknown"; }
+    let name = global_get("args.name");
+    let t = v;
+    if type(name) == "string" { t = name + " " + v; }
+    sys_puts(t);
+    return t;
+}
+
+fn args_wants_help() { return args_flag("help") || args_flag("h"); }
+fn args_wants_version() { return args_flag("version"); }

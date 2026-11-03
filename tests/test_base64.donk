@@ -1,0 +1,36 @@
+import "lib/base64.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+check(base64_encode("") == "", "empty");
+check(base64_encode("M") == "TQ==", "1 byte");
+check(base64_encode("Ma") == "TWE=", "2 bytes");
+check(base64_encode("Man") == "TWFu", "3 bytes");
+check(base64_encode("foobar") == "Zm9vYmFy", "foobar");
+check(base64_encode([251, 255]) == "+/8=", "std alphabet from byte array");
+check(base64_encode_url([251, 255]) == "-_8", "url alphabet, no padding");
+
+check(base64_decode("TQ==") == "M", "decode padded 1");
+check(base64_decode("TWE=") == "Ma", "decode padded 2");
+check(base64_decode("TWFu") == "Man", "decode full");
+check(base64_decode("Zm9vYmFy") == "foobar", "decode foobar");
+check(base64_decode("TQ") == "M", "decode unpadded");
+check(base64_decode_url("-_8") == bytes_to_str([251, 255]), "decode_url");
+check(json_encode(base64_decode_bytes("+/8=")) == "[251,255]", "decode_bytes std");
+check(json_encode(base64_decode_bytes("-_8")) == "[251,255]", "decode_bytes url");
+
+let msg = "The quick brown fox jumps over the lazy dog";
+check(base64_decode(base64_encode(msg)) == msg, "roundtrip");
+check(base64_decode_url(base64_encode_url(msg)) == msg, "roundtrip url");
+
+finish("test_base64");

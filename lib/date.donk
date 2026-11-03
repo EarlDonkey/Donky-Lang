@@ -1,0 +1,103 @@
+// lib/date.donk — timestamps are Unix epoch seconds, all calendar maths in UTC.
+// Formats: %Y %y %m %d %e %H %I %M %S %p %j %a %A %b %B %u %w %Z %z %s %F %T %R %D %%
+
+fn date_now() { return now(); }
+// Real epoch milliseconds. (The builtin now_ms() is a boot-relative tick counter, not epoch time.)
+fn date_now_ms() { return sys_epoch_ms(); }
+
+fn date_format(ts, fmt) { return sys_strftime(ts, fmt); }
+fn date_iso(ts) { return sys_strftime(ts, "%Y-%m-%dT%H:%M:%SZ"); }
+
+// [year, month, day, hour, minute, second, weekday(0=Sun), yearday(0-based)]
+fn date_parts(ts) { return sys_gmtime(ts); }
+
+fn date_year(ts)    { let p = sys_gmtime(ts); return p[0]; }
+fn date_month(ts)   { let p = sys_gmtime(ts); return p[1]; }
+fn date_day(ts)     { let p = sys_gmtime(ts); return p[2]; }
+fn date_hour(ts)    { let p = sys_gmtime(ts); return p[3]; }
+fn date_minute(ts)  { let p = sys_gmtime(ts); return p[4]; }
+fn date_second(ts)  { let p = sys_gmtime(ts); return p[5]; }
+fn date_weekday(ts) { let p = sys_gmtime(ts); return p[6]; }
+
+fn date_make(y, m, d, h, mi, s) { return sys_timegm(y, m, d, h, mi, s); }
+
+fn date_add_seconds(ts, n) { return ts + n; }
+fn date_add_minutes(ts, n) { return ts + n * 60; }
+fn date_add_hours(ts, n)   { return ts + n * 3600; }
+fn date_add_days(ts, n)    { return ts + n * 86400; }
+
+fn date_is_leap(y) {
+    return ((y % 4) == 0 && (y % 100) != 0) || (y % 400) == 0;
+}
+
+fn date_days_in_month(y, m) {
+    if m == 2 {
+        if date_is_leap(y) { return 29; }
+        return 28;
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { return 30; }
+    return 31;
+}
+
+// Adds calendar months, clamping the day (Jan 31 + 1 month = Feb 28/29).
+fn date_add_months(ts, n) {
+    let p = sys_gmtime(ts);
+    let total = p[0] * 12 + (p[1] - 1) + n;
+    let y = floor(total / 12);
+    let m = total - y * 12 + 1;
+    let dd = p[2];
+    let dim = date_days_in_month(y, m);
+    if dd > dim { dd = dim; }
+    return sys_timegm(y, m, dd, p[3], p[4], p[5]);
+}
+
+fn date_digits_ok(s) {
+    let n = len(s);
+    if n == 0 { return false; }
+    let i = 0;
+    while i < n {
+        let c = byte_at(s, i);
+        if c < 48 || c > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Accepts "YYYY-MM-DD", "YYYY-MM-DD HH:MM[:SS]" or "YYYY-MM-DDTHH:MM[:SS]" (anything after the seconds,
+// such as "Z" or fractions, is ignored; the value is always interpreted as UTC). Throws on bad input.
+fn date_parse(s) {
+    let n = len(s);
+    if n < 10 { throw "date_parse: expected YYYY-MM-DD[ HH:MM[:SS]]"; }
+    if byte_at(s, 4) != 45 || byte_at(s, 7) != 45 { throw "date_parse: bad date separators"; }
+    let ys = byte_substr(s, 0, 4);
+    let ms = byte_substr(s, 5, 7);
+    let ds = byte_substr(s, 8, 10);
+    if !(date_digits_ok(ys) && date_digits_ok(ms) && date_digits_ok(ds)) { throw "date_parse: non-numeric date"; }
+    let y = num(ys);
+    let mo = num(ms);
+    let d = num(ds);
+    if mo < 1 || mo > 12 { throw "date_parse: month out of range"; }
+    if d < 1 || d > date_days_in_month(y, mo) { throw "date_parse: day out of range"; }
+    let h = 0;
+    let mi = 0;
+    let sec = 0;
+    if n > 10 {
+        if n < 16 { throw "date_parse: bad time part"; }
+        let sep = byte_at(s, 10);
+        if sep != 32 && sep != 84 { throw "date_parse: expected space or T before time"; }
+        if byte_at(s, 13) != 58 { throw "date_parse: bad time separator"; }
+        let hs = byte_substr(s, 11, 13);
+        let mis = byte_substr(s, 14, 16);
+        if !(date_digits_ok(hs) && date_digits_ok(mis)) { throw "date_parse: non-numeric time"; }
+        h = num(hs);
+        mi = num(mis);
+        if n >= 19 {
+            if byte_at(s, 16) != 58 { throw "date_parse: bad time separator"; }
+            let ss = byte_substr(s, 17, 19);
+            if !date_digits_ok(ss) { throw "date_parse: non-numeric seconds"; }
+            sec = num(ss);
+        }
+        if h > 23 || mi > 59 || sec > 59 { throw "date_parse: time out of range"; }
+    }
+    return sys_timegm(y, mo, d, h, mi, sec);
+}

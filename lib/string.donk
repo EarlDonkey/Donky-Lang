@@ -1,4 +1,12 @@
-// lib/string.donk — string helpers
+// lib/string.donk — byte-oriented string helpers
+
+fn chr(n) {
+    return bytes_to_str([n]);
+}
+
+fn is_empty(s) {
+    return len(s) == 0;
+}
 
 fn starts_with(s, prefix) {
     if len(prefix) > len(s) { return false; }
@@ -10,6 +18,8 @@ fn ends_with(s, suffix) {
     return byte_substr(s, len(s) - len(suffix), len(s)) == suffix;
 }
 
+// First index of needle in s, or -1.
+// (Named index_of_str so it does not collide with list.donk's index_of.)
 fn index_of_str(s, needle) {
     let i = 0;
     let sl = len(s);
@@ -21,12 +31,15 @@ fn index_of_str(s, needle) {
     return -1;
 }
 
+// O(log n) concatenations via doubling.
 fn repeat(s, n) {
     let out = "";
-    let i = 0;
-    while i < n {
-        out = out + s;
-        i = i + 1;
+    let chunk = s;
+    let k = floor(n);
+    while k > 0 {
+        if (k % 2) == 1 { out = out + chunk; }
+        k = floor(k / 2);
+        if k > 0 { chunk = chunk + chunk; }
     }
     return out;
 }
@@ -79,4 +92,93 @@ fn int_to_padded(n, width) {
         return "-" + pad_left(byte_substr(s, 1, len(s)), width - 1, "0");
     }
     return pad_left(s, width, "0");
+}
+
+fn str_is_ws(c) {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+fn trim_left(s) {
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        if str_is_ws(byte_at(s, i)) { i = i + 1; } else { break; }
+    }
+    return byte_substr(s, i, n);
+}
+
+fn trim_right(s) {
+    let j = len(s);
+    while j > 0 {
+        if str_is_ws(byte_at(s, j - 1)) { j = j - 1; } else { break; }
+    }
+    return byte_substr(s, 0, j);
+}
+
+fn trim(s) {
+    return trim_right(trim_left(s));
+}
+
+fn replace_all(s, from, to) {
+    let fl = len(from);
+    if fl == 0 { return s; }
+    let sl = len(s);
+    let first = byte_at(from, 0);
+    let parts = [];
+    let start = 0;
+    let i = 0;
+    while i + fl <= sl {
+        if byte_at(s, i) == first && byte_substr(s, i, i + fl) == from {
+            push(parts, byte_substr(s, start, i));
+            push(parts, to);
+            i = i + fl;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    push(parts, byte_substr(s, start, sl));
+    return join(parts, "");
+}
+
+// Splits on \n or \r\n. Keeps empty lines (unlike the builtin split, which drops them).
+fn split_lines(s) {
+    let lines = [];
+    let n = len(s);
+    let start = 0;
+    let i = 0;
+    while i < n {
+        if byte_at(s, i) == 10 {
+            let end = i;
+            if end > start {
+                if byte_at(s, end - 1) == 13 { end = end - 1; }
+            }
+            push(lines, byte_substr(s, start, end));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n { push(lines, byte_substr(s, start, n)); }
+    return lines;
+}
+
+// Split on a multi-byte delimiter, keeping empty fields.
+fn split_str(s, delim) {
+    let out = [];
+    let dl = len(delim);
+    if dl == 0 { push(out, s); return out; }
+    let sl = len(s);
+    let start = 0;
+    let i = 0;
+    while i + dl <= sl {
+        if byte_substr(s, i, i + dl) == delim {
+            push(out, byte_substr(s, start, i));
+            i = i + dl;
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    push(out, byte_substr(s, start, sl));
+    return out;
 }

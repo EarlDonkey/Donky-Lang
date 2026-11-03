@@ -1,10 +1,45 @@
 import "lib/string.donk";
 
-print(starts_with("hello", "he"));
-print(ends_with("hello", "lo"));
-print(index_of_str("hello", "ll"));
-print(repeat("ab", 3));
-print(reverse_str("hello"));
-print(pad_left("7", 3, "0"));
-print(is_numeric("123"));
-print(is_numeric("12a"));
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+check(starts_with("donkey", "don"), "starts_with");
+check(!starts_with("donkey", "key"), "starts_with false");
+check(ends_with("donkey", "key"), "ends_with");
+check(!ends_with("do", "donkey"), "ends_with longer suffix");
+check(index_of_str("hello world", "o w") == 4, "index_of_str");
+check(index_of_str("hello", "z") == -1, "index_of_str missing");
+check(repeat("ab", 3) == "ababab", "repeat");
+check(repeat("x", 0) == "", "repeat zero");
+check(repeat("-", 10) == "----------", "repeat 10");
+check(pad_left("7", 3, "0") == "007", "pad_left");
+check(pad_right("7", 3, ".") == "7..", "pad_right");
+check(is_empty("") && !is_empty("a"), "is_empty");
+check(trim_left("  hi  ") == "hi  ", "trim_left");
+check(trim_right("  hi  ") == "  hi", "trim_right");
+check(trim("  hi  ") == "hi", "trim");
+check(trim("   ") == "", "trim all-space");
+check(replace_all("a-b-c", "-", "+") == "a+b+c", "replace_all");
+check(replace_all("aaa", "aa", "b") == "ba", "replace_all non-overlapping");
+check(replace_all("abc", "", "x") == "abc", "replace_all empty needle");
+check(replace_all("abc", "abc", "") == "", "replace_all whole string");
+
+let nl = chr(10);
+let lines = split_lines("a" + nl + "b" + chr(13) + nl + nl + "c");
+check(len(lines) == 4, "split_lines count");
+check(join(lines, "|") == "a|b||c", "split_lines content");
+check(join(split_str("a,,b", ","), "|") == "a||b", "split_str keeps empties");
+check(chr(65) == "A", "chr");
+check(reverse_str("abc") == "cba", "reverse_str");
+check(int_to_padded(5, 3) == "005", "int_to_padded");
+
+finish("test_string");

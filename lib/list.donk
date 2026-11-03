@@ -1,36 +1,28 @@
-// lib/list.donk — higher-order helpers for arrays.
-// Import with: import "lib/list.donk";
-//
-// Parameters that receive a function are named `f` because `fn` is a
-// reserved keyword in Donky.
+// lib/list.donk — array helpers.
+// `contains` is already a native builtin (works on arrays), so it is not redefined here.
+// Function-typed params are named `f` because `fn` is reserved.
 
-fn map(arr, f) -> array {
+fn map(arr, f) {
+    let out = [];
+    for x in arr { push(out, f(x)); }
+    return out;
+}
+
+fn filter(arr, f) {
     let out = [];
     for x in arr {
-        push(out, f(x));
+        if f(x) { push(out, x); }
     }
     return out;
 }
 
-fn filter(arr, f) -> array {
-    let out = [];
-    for x in arr {
-        if f(x) {
-            push(out, x);
-        }
-    }
-    return out;
-}
-
-fn reduce(arr, f, init) -> any {
+fn reduce(arr, f, init) {
     let acc = init;
-    for x in arr {
-        acc = f(acc, x);
-    }
+    for x in arr { acc = f(acc, x); }
     return acc;
 }
 
-fn reverse(arr) -> array {
+fn reverse(arr) {
     let out = [];
     let i = len(arr) - 1;
     while i >= 0 {
@@ -40,58 +32,97 @@ fn reverse(arr) -> array {
     return out;
 }
 
-fn unique(arr) -> array {
+fn unique(arr) {
     let out = [];
     for x in arr {
-        if !contains(out, x) {
-            push(out, x);
-        }
+        if !contains(out, x) { push(out, x); }
     }
     return out;
 }
 
-fn any(arr, f) -> bool {
+fn any(arr, f) {
     for x in arr {
-        if f(x) {
-            return true;
-        }
+        if f(x) { return true; }
     }
     return false;
 }
 
-fn all(arr, f) -> bool {
+fn all(arr, f) {
     for x in arr {
-        if !f(x) {
-            return false;
-        }
+        if !f(x) { return false; }
     }
     return true;
 }
 
-fn count(arr, f) -> num {
+fn count(arr, f) {
     let n = 0;
     for x in arr {
-        if f(x) {
-            n = n + 1;
-        }
+        if f(x) { n = n + 1; }
     }
     return n;
 }
 
-// Return a new array, sorted ascending by the result of f.
-// f must return a number or a string (both are comparable).
-// Stable: equal keys preserve their original relative order.
-// Non-mutating: arr is unchanged.
-// Call reverse(sort_by(...)) for descending order.
-//
-// Implementation is bubble sort — O(n^2). Fine for hundreds of items.
-// Promotion to a builtin (with faster sorting) is a future compiler
-// change; see ROADMAP.
-fn sort_by(arr, f) -> array {
-    let keyed = [];
-    for x in arr {
-        push(keyed, [f(x), x]);
+fn index_of(arr, x) {
+    let i = 0;
+    let n = len(arr);
+    while i < n {
+        if arr[i] == x { return i; }
+        i = i + 1;
     }
+    return -1;
+}
+
+// Stable merge sort, O(n log n). f(a, b) must return <0, 0 or >0. Non-mutating.
+fn sort(arr, f) {
+    let n = len(arr);
+    let src = [];
+    for x in arr { push(src, x); }
+    if n < 2 { return src; }
+    let width = 1;
+    while width < n {
+        let dst = [];
+        let lo = 0;
+        while lo < n {
+            let mid = lo + width;
+            if mid > n { mid = n; }
+            let hi = lo + width * 2;
+            if hi > n { hi = n; }
+            let i = lo;
+            let j = mid;
+            while i < mid && j < hi {
+                if f(src[j], src[i]) < 0 {
+                    push(dst, src[j]);
+                    j = j + 1;
+                } else {
+                    push(dst, src[i]);
+                    i = i + 1;
+                }
+            }
+            while i < mid { push(dst, src[i]); i = i + 1; }
+            while j < hi { push(dst, src[j]); j = j + 1; }
+            lo = hi;
+        }
+        src = dst;
+        width = width * 2;
+    }
+    return src;
+}
+
+fn cmp_asc(a, b) {
+    if a < b { return -1; }
+    if a > b { return 1; }
+    return 0;
+}
+
+// Ascending sort for arrays of numbers.
+fn sort_asc(arr) {
+    return sort(arr, cmp_asc);
+}
+
+// Sort by key function. Same contract as before (stable, ascending).
+fn sort_by(arr, f) {
+    let keyed = [];
+    for x in arr { push(keyed, [f(x), x]); }
     let n = len(keyed);
     let i = 0;
     while i < n {
@@ -107,8 +138,99 @@ fn sort_by(arr, f) -> array {
         i = i + 1;
     }
     let out = [];
-    for pair in keyed {
-        push(out, pair[1]);
+    for pair in keyed { push(out, pair[1]); }
+    return out;
+}
+
+fn chunk(arr, size) {
+    let out = [];
+    if size < 1 { return out; }
+    let n = len(arr);
+    let i = 0;
+    while i < n {
+        let part = [];
+        let j = i;
+        while j < i + size && j < n {
+            push(part, arr[j]);
+            j = j + 1;
+        }
+        push(out, part);
+        i = i + size;
+    }
+    return out;
+}
+
+// Flattens ONE level.
+fn flatten(arr) {
+    let out = [];
+    for x in arr {
+        if type(x) == "array" {
+            for y in x { push(out, y); }
+        } else {
+            push(out, x);
+        }
+    }
+    return out;
+}
+
+fn zip(a, b) {
+    let out = [];
+    let n = len(a);
+    if len(b) < n { n = len(b); }
+    let i = 0;
+    while i < n {
+        push(out, [a[i], b[i]]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn range(start, end) {
+    let out = [];
+    let i = start;
+    while i < end {
+        push(out, i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn range_step(start, end, step) {
+    let out = [];
+    if step == 0 { return out; }
+    let i = start;
+    if step > 0 {
+        while i < end { push(out, i); i = i + step; }
+    } else {
+        while i > end { push(out, i); i = i + step; }
+    }
+    return out;
+}
+
+fn sum(arr) {
+    let acc = 0;
+    for x in arr { acc = acc + x; }
+    return acc;
+}
+
+fn first(arr) {
+    if len(arr) == 0 { return null; }
+    return arr[0];
+}
+
+fn last(arr) {
+    if len(arr) == 0 { return null; }
+    return arr[len(arr) - 1];
+}
+
+// New array of arr[a..b)
+fn slice(arr, a, b) {
+    let out = [];
+    let i = a;
+    if b > len(arr) { b = len(arr); }
+    while i < b {
+        push(out, arr[i]);
+        i = i + 1;
     }
     return out;
 }

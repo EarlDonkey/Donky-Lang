@@ -1,0 +1,86 @@
+// lib/os.donk — environment, working directory, files, paths.
+// Paths are joined with "/" (accepted by all Win32 file APIs); both "/" and "\" are recognised when parsing.
+
+fn cwd() { return sys_cwd(); }
+fn chdir(p) { return sys_chdir(p); }                 // 1 on success, 0 on failure
+fn getenv(name) { return sys_getenv(name); }         // string, or null if unset
+fn setenv(name, value) { return sys_setenv(name, value); }
+fn remove_file(p) { return sys_remove(p); }          // 1 on success
+fn rename(a, b) { return sys_rename(a, b); }         // 1 on success, overwrites b
+
+fn getenv_or(name, fallback) {
+    let v = sys_getenv(name);
+    if type(v) == "string" { return v; }
+    return fallback;
+}
+
+fn os_is_sep(c) {
+    return c == 47 || c == 92;
+}
+
+fn path_join(a, b) {
+    if len(a) == 0 { return b; }
+    if len(b) == 0 { return a; }
+    let end = len(a);
+    while end > 0 {
+        if os_is_sep(byte_at(a, end - 1)) { end = end - 1; } else { break; }
+    }
+    let start = 0;
+    let bl = len(b);
+    while start < bl {
+        if os_is_sep(byte_at(b, start)) { start = start + 1; } else { break; }
+    }
+    return byte_substr(a, 0, end) + "/" + byte_substr(b, start, bl);
+}
+
+fn path_basename(p) {
+    let end = len(p);
+    while end > 0 {
+        if os_is_sep(byte_at(p, end - 1)) { end = end - 1; } else { break; }
+    }
+    let i = end;
+    while i > 0 {
+        if os_is_sep(byte_at(p, i - 1)) { break; }
+        i = i - 1;
+    }
+    return byte_substr(p, i, end);
+}
+
+fn path_dirname(p) {
+    let end = len(p);
+    while end > 0 {
+        if os_is_sep(byte_at(p, end - 1)) { end = end - 1; } else { break; }
+    }
+    let i = end;
+    while i > 0 {
+        if os_is_sep(byte_at(p, i - 1)) { break; }
+        i = i - 1;
+    }
+    let d = i;
+    while d > 0 {
+        if os_is_sep(byte_at(p, d - 1)) { d = d - 1; } else { break; }
+    }
+    if d == 0 {
+        if i > 0 { return "/"; }
+        return ".";
+    }
+    return byte_substr(p, 0, d);
+}
+
+// ".gz" for "a/b.tar.gz"; "" if none; "" for dotfiles like ".bashrc".
+fn path_ext(p) {
+    let base = path_basename(p);
+    let i = len(base);
+    while i > 0 {
+        if byte_at(base, i - 1) == 46 { break; }
+        i = i - 1;
+    }
+    if i <= 1 { return ""; }
+    return byte_substr(base, i - 1, len(base));
+}
+
+fn path_stem(p) {
+    let base = path_basename(p);
+    let ext = path_ext(p);
+    return byte_substr(base, 0, len(base) - len(ext));
+}

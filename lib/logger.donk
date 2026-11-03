@@ -1,0 +1,50 @@
+// lib/logger.donk — levels: 0 debug, 1 info (default), 2 warn, 3 error, 4 off.
+// info/debug go to stdout, warn/error to stderr; optionally mirrored (appended) to a file.
+
+fn log_level_value(l) {
+    if type(l) == "number" { return l; }
+    let s = lower(str(l));
+    if s == "debug" { return 0; }
+    if s == "info" { return 1; }
+    if s == "warn" { return 2; }
+    if s == "error" { return 3; }
+    if s == "off" { return 4; }
+    return 1;
+}
+
+fn log_set_level(l) {
+    global_set("log.lvl", log_level_value(l) + 1);
+    return 1;
+}
+
+fn log_level() {
+    let raw = global_get("log.lvl");
+    if raw == 0 { return 1; }
+    return raw - 1;
+}
+
+fn log_to_file(path) {
+    global_set("log.file", path);
+    return 1;
+}
+
+fn log_close_file() {
+    global_set("log.file", 0);
+    return 1;
+}
+
+fn log_write(lvl, label, msg) {
+    if lvl < log_level() { return 0; }
+    let line = "[" + sys_strftime(now(), "%Y-%m-%d %H:%M:%S") + "] " + label + " " + str(msg);
+    if lvl >= 2 { sys_eputs(line); } else { sys_puts(line); }
+    let f = global_get("log.file");
+    if type(f) == "string" {
+        sys_append_file(f, line + bytes_to_str([10]));
+    }
+    return 1;
+}
+
+fn log_debug(msg) { return log_write(0, "DEBUG", msg); }
+fn log_info(msg)  { return log_write(1, "INFO ", msg); }
+fn log_warn(msg)  { return log_write(2, "WARN ", msg); }
+fn log_error(msg) { return log_write(3, "ERROR", msg); }

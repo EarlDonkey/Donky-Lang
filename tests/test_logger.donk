@@ -1,0 +1,49 @@
+import "lib/logger.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+let path = "tests/_log_test.tmp";
+write_file(path, "");
+check(log_level() == 1, "default level is info");
+
+log_to_file(path);
+log_info("hello-info");
+log_debug("hidden-debug");
+log_warn("hello-warn");
+log_error("hello-error");
+let c = read_file(path);
+check(contains(c, "INFO") && contains(c, "hello-info"), "info written");
+check(!contains(c, "hidden-debug"), "debug filtered at default level");
+check(contains(c, "WARN") && contains(c, "hello-warn"), "warn written");
+check(contains(c, "ERROR") && contains(c, "hello-error"), "error written");
+
+log_set_level("error");
+check(log_level() == 3, "set_level by name");
+log_warn("hidden-warn");
+log_error("second-error");
+c = read_file(path);
+check(!contains(c, "hidden-warn"), "warn filtered at error level");
+check(contains(c, "second-error"), "error still logged");
+
+log_set_level(0);
+check(log_level() == 0, "set_level by number");
+log_debug("now-visible");
+c = read_file(path);
+check(contains(c, "now-visible") && contains(c, "DEBUG"), "debug visible at level 0");
+
+log_close_file();
+log_info("not-in-file");
+check(!contains(read_file(path), "not-in-file"), "close_file stops file output");
+
+sys_remove(path);
+finish("test_logger");

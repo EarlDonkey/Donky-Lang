@@ -1,0 +1,37 @@
+// lib/hash.donk — inputs may be a string or an array of byte values. Output is lowercase hex.
+
+fn md5(s)               { return sys_md5(s); }
+fn sha1(s)              { return sys_sha1(s); }
+fn sha256(s)            { return sys_sha256(s); }
+fn hmac_sha256(key, msg) { return sys_hmac_sha256(key, msg); }
+
+fn hash_hexval(c) {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return -1;
+}
+
+fn hex_to_bytes(hex) {
+    let out = [];
+    let n = len(hex);
+    let i = 0;
+    while i + 1 < n {
+        let hi = hash_hexval(byte_at(hex, i));
+        let lo = hash_hexval(byte_at(hex, i + 1));
+        if hi < 0 || lo < 0 { throw "hex_to_bytes: invalid hex digit"; }
+        push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn bytes_to_hex(bytes) {
+    let digits = "0123456789abcdef";
+    let out = [];
+    for b in bytes {
+        push(out, byte_at(digits, floor(b / 16)));
+        push(out, byte_at(digits, b % 16));
+    }
+    return bytes_to_str(out);
+}

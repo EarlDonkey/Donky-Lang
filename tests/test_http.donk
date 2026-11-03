@@ -1,3 +1,55 @@
-let res = http_get("https://api.github.com/users/torvalds");
-// The response is a JSON string. Let's just print the first 100 characters to prove it worked.
-print(byte_substr(res, 0, 100));
+import "lib/http.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+check(url_encode("a b&c=d/é") != "", "url_encode runs");
+check(url_encode("a b&c") == "a%20b%26c", "url_encode specials");
+check(url_encode("AZaz09-_.~") == "AZaz09-_.~", "url_encode unreserved untouched");
+check(url_decode("a%20b%26c") == "a b&c", "url_decode");
+check(url_decode("a+b") == "a+b", "url_decode leaves +");
+check(url_decode_plus("a+b%21") == "a b!", "url_decode_plus");
+check(url_decode("100%") == "100%", "url_decode dangling %");
+let s = "héllo wörld/?x=1&y=2";
+check(url_decode(url_encode(s)) == s, "encode/decode roundtrip (UTF-8)");
+
+let u = parse_url("https://user:pw@example.com:8443/a/b?x=1&y=two%20words#frag");
+check(u["scheme"] == "https", "scheme");
+check(u["host"] == "example.com", "host (user-info dropped)");
+check(u["port"] == 8443, "explicit port");
+check(u["path"] == "/a/b", "path");
+check(u["query"] == "x=1&y=two%20words", "query");
+check(u["fragment"] == "frag", "fragment");
+
+let u2 = parse_url("http://localhost");
+check(u2["port"] == 80 && u2["path"] == "/" && u2["host"] == "localhost", "defaults: port 80, path /");
+check(parse_url("https://x.org/")["port"] == 443, "default https port");
+
+let q = url_parse_query("a=1&b=x%20y&c=p+q&flag");
+check(q["a"] == "1" && q["b"] == "x y" && q["c"] == "p q" && q["flag"] == "", "parse_query");
+let built = url_build_query(q);
+check(contains(built, "a=1") && contains(built, "b=x%20y"), "build_query");
+
+check(http_build_headers(null) == "", "no headers");
+let h = {};
+h["X-Test"] = "1";
+check(http_build_headers(h) == "X-Test: 1" + bytes_to_str([13, 10]), "header string");
+
+// Network test (skipped silently when offline): GET status via the generic request builtin.
+let body = http_send("GET", "http://example.com/", "", null);
+if http_status() == 200 {
+    check(len(body) > 0, "http_send GET example.com");
+} else {
+    sys_puts("  skip  network test (status " + str(http_status()) + ")");
+}
+
+finish("test_http");

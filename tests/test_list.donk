@@ -1,0 +1,45 @@
+import "lib/list.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+fn t_cmp_desc(a, b) { return b - a; }
+fn t_neg(x) { return 0 - x; }
+fn t_key(x) { return x; }
+
+check(contains([1, 2, 3], 2) && !contains([1, 2, 3], 9), "contains (builtin)");
+check(index_of([5, 6, 7], 7) == 2, "index_of");
+check(index_of([5, 6, 7], 9) == -1, "index_of missing");
+check(json_encode(sort([3, 1, 2], cmp_asc)) == "[1,2,3]", "sort asc");
+check(json_encode(sort([3, 1, 2, 5, 4, 9, 7], t_cmp_desc)) == "[9,7,5,4,3,2,1]", "sort desc (7 elems)");
+check(json_encode(sort([], cmp_asc)) == "[]", "sort empty");
+check(json_encode(sort_asc([2, 2, 1])) == "[1,2,2]", "sort_asc dupes");
+let orig = [3, 1, 2];
+let sorted = sort(orig, cmp_asc);
+check(json_encode(orig) == "[3,1,2]", "sort is non-mutating");
+check(json_encode(sort_by([3, 1, 2], t_key)) == "[1,2,3]", "sort_by");
+check(json_encode(unique([1, 2, 2, 3, 1])) == "[1,2,3]", "unique");
+check(json_encode(chunk([1, 2, 3, 4, 5], 2)) == "[[1,2],[3,4],[5]]", "chunk");
+check(json_encode(flatten([1, [2, 3], [4], 5])) == "[1,2,3,4,5]", "flatten");
+check(json_encode(zip([1, 2, 3], [10, 20])) == "[[1,10],[2,20]]", "zip");
+check(json_encode(range(0, 5)) == "[0,1,2,3,4]", "range");
+check(json_encode(range_step(10, 0, -4)) == "[10,6,2]", "range_step");
+check(sum([1, 2, 3, 4]) == 10, "sum");
+check(sum([]) == 0, "sum empty");
+check(first([7, 8, 9]) == 7 && last([7, 8, 9]) == 9, "first/last");
+check(json_encode(slice([1, 2, 3, 4], 1, 3)) == "[2,3]", "slice");
+check(json_encode(map([1, 2, 3], t_neg)) == "[-1,-2,-3]", "map");
+check(json_encode(reverse([1, 2, 3])) == "[3,2,1]", "reverse");
+check(sum(range(1, 1001)) == 500500, "sum(range) large");
+check(json_encode(slice(sort(range_step(2000, 0, -1), cmp_asc), 0, 3)) == "[1,2,3]", "sort 2000 elems");
+
+finish("test_list");

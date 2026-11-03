@@ -1,0 +1,42 @@
+import "lib/date.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+check(date_format(0, "%Y-%m-%d") == "1970-01-01", "format epoch");
+check(date_format(0, "%H:%M:%S") == "00:00:00", "format time");
+check(date_format(0, "%A %B") == "Thursday January", "names");
+
+let ts = date_parse("2024-02-29 12:30:45");
+check(ts == 1709209845, "parse datetime");
+check(date_parse("1970-01-02") == 86400, "parse date only");
+check(date_parse("2024-02-29T12:30:45Z") == 1709209845, "parse ISO T");
+check(date_format(ts, "%Y-%m-%d %H:%M:%S") == "2024-02-29 12:30:45", "roundtrip");
+check(date_iso(ts) == "2024-02-29T12:30:45Z", "iso");
+
+check(date_year(ts) == 2024, "year");
+check(date_month(ts) == 2, "month");
+check(date_day(ts) == 29, "day");
+check(date_hour(ts) == 12 && date_minute(ts) == 30 && date_second(ts) == 45, "h/m/s");
+check(date_weekday(ts) == 4, "weekday (Thursday)");
+
+let next = date_add_days(ts, 1);
+check(date_month(next) == 3 && date_day(next) == 1, "add_days crosses leap day");
+check(date_day(date_add_days(ts, -29)) == 31, "add_days negative");
+check(date_format(date_add_months(date_parse("2024-01-31"), 1), "%F") == "2024-02-29", "add_months clamps");
+check(date_format(date_add_months(date_parse("2024-11-15"), 3), "%F") == "2025-02-15", "add_months year wrap");
+check(date_make(2000, 1, 1, 0, 0, 0) == 946684800, "make");
+check(date_is_leap(2000) && !date_is_leap(1900) && date_is_leap(2024), "leap years");
+check(date_now() > 1700000000, "now");
+check(date_now_ms() > 1700000000000, "now_ms is epoch ms");
+
+finish("test_date");

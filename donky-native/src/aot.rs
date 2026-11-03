@@ -9,6 +9,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static STRING_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 22] = [
+    ("sys_cwd", "donky_sys_cwd", 0),
+    ("sys_chdir", "donky_sys_chdir", 1),
+    ("sys_getenv", "donky_sys_getenv", 1),
+    ("sys_setenv", "donky_sys_setenv", 2),
+    ("sys_remove", "donky_sys_remove", 1),
+    ("sys_rename", "donky_sys_rename", 2),
+    ("sys_append_file", "donky_sys_append_file", 2),
+    ("sys_puts", "donky_sys_puts", 1),
+    ("sys_eputs", "donky_sys_eputs", 1),
+    ("sys_exit", "donky_sys_exit", 1),
+    ("sys_epoch_ms", "donky_sys_epoch_ms", 0),
+    ("sys_gmtime", "donky_sys_gmtime", 1),
+    ("sys_timegm", "donky_sys_timegm", 6),
+    ("sys_strftime", "donky_sys_strftime", 2),
+    ("sys_md5", "donky_sys_md5", 1),
+    ("sys_sha1", "donky_sys_sha1", 1),
+    ("sys_sha256", "donky_sys_sha256", 1),
+    ("sys_hmac_sha256", "donky_sys_hmac_sha256", 2),
+    ("http_request", "donky_http_request", 4),
+    ("http_status", "donky_http_status", 0),
+    ("global_get", "donky_global_get", 1),
+    ("global_set", "donky_global_set", 2),
+];
+
 #[derive(Clone, Copy)]
 pub struct RuntimeFuncs {
     pub print_id: FuncId, pub alloc_array_id: FuncId, pub array_push_id: FuncId,
@@ -42,6 +67,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
+    pub stdlib_ids: [FuncId; 22],
 }
 
 pub struct AotCompiler {
@@ -76,6 +102,11 @@ impl AotCompiler {
             if let Some(r) = ret { sig.returns.push(AbiParam::new(r)); }
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
+
+        let stdlib_ids: [FuncId; 22] = std::array::from_fn(|i| {
+            let (_, cname, n) = STDLIB_BUILTINS[i];
+            declare(cname, &vec![types::I64; n], Some(types::I64))
+        });
 
         let runtime = RuntimeFuncs {
             print_id: declare("donky_print", &[types::I64], None),
@@ -163,6 +194,7 @@ impl AotCompiler {
             json_encode_id: declare("donky_json_encode", &[types::I64], Some(types::I64)),
             json_pretty_id: declare("donky_json_pretty", &[types::I64], Some(types::I64)),
             json_error_id:  declare("donky_json_error",  &[], Some(types::I64)),
+            stdlib_ids,
             
         };
         
@@ -886,7 +918,10 @@ impl AotCompiler {
                         "json_pretty" => runtime.json_pretty_id,
                         "json_error" => runtime.json_error_id,
                         "now_ms" => runtime.now_ms_id,
-                        _ => panic!("Unknown builtin function: {}", name),
+                        _ => match STDLIB_BUILTINS.iter().position(|(n, _, _)| *n == name.as_str()) {
+                            Some(i) => runtime.stdlib_ids[i],
+                            None => panic!("Unknown builtin function: {}", name),
+                        },
                     };
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
                     let mut arg_vals = Vec::new();

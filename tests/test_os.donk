@@ -1,0 +1,41 @@
+import "lib/os.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+check(path_join("a", "b") == "a/b", "path_join basic");
+check(path_join("a/", "/b") == "a/b", "path_join strips separators");
+check(path_join("", "b") == "b", "path_join empty left");
+check(path_basename("x/y/z.txt") == "z.txt", "basename");
+check(path_dirname("x/y/z.txt") == "x/y", "dirname");
+check(path_dirname("z.txt") == ".", "dirname no dir");
+check(path_ext("x/y.tar.gz") == ".gz", "ext");
+check(path_ext(".bashrc") == "", "ext dotfile");
+check(path_ext("noext") == "", "ext none");
+check(path_stem("x/y.tar.gz") == "y.tar", "stem");
+
+check(type(cwd()) == "string" && len(cwd()) > 0, "cwd");
+check(chdir("."), "chdir .");
+
+setenv("DONKY_TEST_VAR", "hello");
+check(getenv("DONKY_TEST_VAR") == "hello", "setenv/getenv");
+check(type(getenv("DONKY_SURELY_UNSET_VAR_123")) != "string", "getenv missing is null");
+check(getenv_or("DONKY_SURELY_UNSET_VAR_123", "dflt") == "dflt", "getenv_or");
+
+write_file("tests/_os_a.tmp", "x");
+check(file_exists("tests/_os_a.tmp"), "write_file");
+check(rename("tests/_os_a.tmp", "tests/_os_b.tmp"), "rename");
+check(!file_exists("tests/_os_a.tmp") && file_exists("tests/_os_b.tmp"), "rename moved file");
+check(remove_file("tests/_os_b.tmp"), "remove_file");
+check(!file_exists("tests/_os_b.tmp"), "file gone");
+
+finish("test_os");

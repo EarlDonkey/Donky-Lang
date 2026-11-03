@@ -1,0 +1,101 @@
+// lib/base64.donk — input may be a string or an array of byte values.
+// Decoding to a string stops at the first NUL byte; use base64_decode_bytes for binary data.
+
+fn b64_alpha() { return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; }
+fn b64_alpha_url() { return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"; }
+
+fn b64_to_bytes(data) {
+    if type(data) == "array" { return data; }
+    let out = [];
+    let s = str(data);
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        push(out, byte_at(s, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn b64_encode_with(data, alpha, pad) {
+    let bytes = b64_to_bytes(data);
+    let n = len(bytes);
+    let out = [];
+    let i = 0;
+    while i + 2 < n {
+        let v = bytes[i] * 65536 + bytes[i + 1] * 256 + bytes[i + 2];
+        push(out, byte_at(alpha, floor(v / 262144)));
+        push(out, byte_at(alpha, floor(v / 4096) % 64));
+        push(out, byte_at(alpha, floor(v / 64) % 64));
+        push(out, byte_at(alpha, v % 64));
+        i = i + 3;
+    }
+    let rest = n - i;
+    if rest == 1 {
+        let v1 = bytes[i] * 65536;
+        push(out, byte_at(alpha, floor(v1 / 262144)));
+        push(out, byte_at(alpha, floor(v1 / 4096) % 64));
+        if pad { push(out, 61); push(out, 61); }
+    }
+    if rest == 2 {
+        let v2 = bytes[i] * 65536 + bytes[i + 1] * 256;
+        push(out, byte_at(alpha, floor(v2 / 262144)));
+        push(out, byte_at(alpha, floor(v2 / 4096) % 64));
+        push(out, byte_at(alpha, floor(v2 / 64) % 64));
+        if pad { push(out, 61); }
+    }
+    return bytes_to_str(out);
+}
+
+fn base64_encode(data)     { return b64_encode_with(data, b64_alpha(), true); }
+fn base64_encode_url(data) { return b64_encode_with(data, b64_alpha_url(), false); }
+
+// Accepts both alphabets, with or without padding; skips whitespace. Returns an array of bytes.
+fn base64_decode_bytes(s) {
+    let tbl = [];
+    let k = 0;
+    while k < 256 { push(tbl, -1); k = k + 1; }
+    let alpha = b64_alpha();
+    k = 0;
+    while k < 64 {
+        tbl[byte_at(alpha, k)] = k;
+        k = k + 1;
+    }
+    tbl[45] = 62;
+    tbl[95] = 63;
+
+    let out = [];
+    let n = len(s);
+    let i = 0;
+    let acc = 0;
+    let cnt = 0;
+    while i < n {
+        let c = byte_at(s, i);
+        if c == 61 { break; }
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1;
+        } else {
+            let v = tbl[c];
+            if v < 0 { throw "base64: invalid character"; }
+            acc = acc * 64 + v;
+            cnt = cnt + 1;
+            if cnt == 4 {
+                push(out, floor(acc / 65536));
+                push(out, floor(acc / 256) % 256);
+                push(out, acc % 256);
+                acc = 0;
+                cnt = 0;
+            }
+            i = i + 1;
+        }
+    }
+    if cnt == 2 { push(out, floor(acc / 16)); }
+    if cnt == 3 {
+        push(out, floor(acc / 1024));
+        push(out, floor(acc / 4) % 256);
+    }
+    return out;
+}
+
+fn base64_decode(s)     { return bytes_to_str(base64_decode_bytes(s)); }
+fn base64_decode_url(s) { return bytes_to_str(base64_decode_bytes(s)); }

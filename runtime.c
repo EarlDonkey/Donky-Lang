@@ -20,6 +20,7 @@
 #include <winhttp.h>
 #include <exdisp.h>
 #include <olectl.h>
+#include <wchar.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "psapi.lib")
@@ -193,6 +194,7 @@ uint64_t donky_alloc_map(void);
 uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val);
 
 uint64_t current_exception = 0;
+static uint64_t g_globals = 0;
 
 int is_number(uint64_t v) { return (v & TAG_MASK) != TAG_BASE; }
 double as_number(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
@@ -289,7 +291,7 @@ uint64_t donky_kill_process(uint64_t pid_val) {
     if (!hProc) return make_number(0.0);
     BOOL res = TerminateProcess(hProc, 1);
     CloseHandle(hProc);
-    return make_number(res ? 1.0 : 0.0);
+    return make_number(res ? 1.0 : 0.0); 
 }
 
 uint64_t donky_get_uptime() {
@@ -465,6 +467,7 @@ void gc_collect() {
     extern uint64_t donky_args_array;
     if (donky_args_array != 0) gc_mark(donky_args_array);
     if (current_exception != 0) gc_mark(current_exception);
+    if (g_globals != 0) gc_mark(g_globals);
 
     gc_mark_stack();
     gc_sweep();
@@ -1863,6 +1866,422 @@ uint64_t donky_gui_webview(uint64_t url_val) {
     }
     return make_number(1.0);
 }
+
+// ===================== Standard library builtins =====================
+static inline int dk_is_str(uint64_t v) { return !is_number(v) && get_tag(v) == TAG_STRING; }
+static inline const char* dk_s(uint64_t v) { return (const char*)as_index(v); }
+
+// ---- globals (shared state for libs) ----
+uint64_t donky_global_set(uint64_t k, uint64_t v) {
+    if (!g_globals) g_globals = donky_alloc_map();
+    donky_map_set(g_globals, k, v);
+    return 0;
+}
+uint64_t donky_global_get(uint64_t k) {
+    if (!g_globals) return 0;
+    return donky_index_get(g_globals, k);
+}
+
+// ---- console / process ----
+uint64_t donky_sys_puts(uint64_t s) {
+    uint64_t sv = dk_is_str(s) ? s : donky_str(s);
+    printf("%s\n", dk_s(sv)); fflush(stdout);
+    return 0;
+}
+uint64_t donky_sys_eputs(uint64_t s) {
+    uint64_t sv = dk_is_str(s) ? s : donky_str(s);
+    fprintf(stderr, "%s\n", dk_s(sv)); fflush(stderr);
+    return 0;
+}
+uint64_t donky_sys_exit(uint64_t code) {
+    fflush(stdout); fflush(stderr);
+    exit(is_number(code) ? (int)as_number(code) : 0);
+    return 0;
+}
+
+// ---- os ----
+uint64_t donky_sys_cwd(void) {
+    char buf[MAX_PATH * 4];
+    DWORD n = GetCurrentDirectoryA(sizeof buf, buf);
+    if (n == 0 || n >= sizeof buf) return donky_alloc_string("");
+    return donky_alloc_string(buf);
+}
+uint64_t donky_sys_chdir(uint64_t p) {
+    if (!dk_is_str(p)) return make_number(0.0);
+    return make_number(SetCurrentDirectoryA(dk_s(p)) ? 1.0 : 0.0);
+}
+// returns null (0) if the variable does not exist
+uint64_t donky_sys_getenv(uint64_t name) {
+    if (!dk_is_str(name)) return 0;
+    SetLastError(0);
+    DWORD n = GetEnvironmentVariableA(dk_s(name), NULL, 0);
+    if (n == 0) return GetLastError() == ERROR_ENVVAR_NOT_FOUND ? 0 : donky_alloc_string("");
+    char* buf = (char*)malloc(n + 1);
+    DWORD m = GetEnvironmentVariableA(dk_s(name), buf, n + 1);
+    buf[m < n + 1 ? m : n] = 0;
+    uint64_t r = donky_alloc_string(buf);
+    free(buf);
+    return r;
+}
+uint64_t donky_sys_setenv(uint64_t name, uint64_t val) {
+    if (!dk_is_str(name) || !dk_is_str(val)) return make_number(0.0);
+    return make_number(SetEnvironmentVariableA(dk_s(name), dk_s(val)) ? 1.0 : 0.0);
+}
+uint64_t donky_sys_remove(uint64_t p) {
+    if (!dk_is_str(p)) return make_number(0.0);
+    return make_number(DeleteFileA(dk_s(p)) ? 1.0 : 0.0);
+}
+uint64_t donky_sys_rename(uint64_t a, uint64_t b) {
+    if (!dk_is_str(a) || !dk_is_str(b)) return make_number(0.0);
+    return make_number(MoveFileExA(dk_s(a), dk_s(b), MOVEFILE_REPLACE_EXISTING) ? 1.0 : 0.0);
+}
+uint64_t donky_sys_append_file(uint64_t p, uint64_t c) {
+    if (!dk_is_str(p) || !dk_is_str(c)) return make_number(0.0);
+    FILE* f = fopen(dk_s(p), "ab");
+    if (!f) return make_number(0.0);
+    fwrite(dk_s(c), 1, str_len(dk_s(c)), f);
+    fclose(f);
+    return make_number(1.0);
+}
+
+// ---- time (all UTC, no CRT time functions so no Win32 strftime assertions) ----
+static int64_t dk_floor_div(int64_t a, int64_t b) { int64_t q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
+
+static int64_t dk_days_from_civil(int64_t y, int m, int d) {
+    y -= (m <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static void dk_civil_from_days(int64_t z, int64_t* y, int* m, int* d) {
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t yy = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = yy + (*m <= 2);
+}
+typedef struct { int64_t Y; int M, D, h, m, s, wd, yd; } DkTm;
+static void dk_gmtime(int64_t ts, DkTm* t) {
+    int64_t days = dk_floor_div(ts, 86400);
+    int64_t rem = ts - days * 86400;
+    dk_civil_from_days(days, &t->Y, &t->M, &t->D);
+    t->h = (int)(rem / 3600); t->m = (int)((rem % 3600) / 60); t->s = (int)(rem % 60);
+    t->wd = (int)(((days % 7) + 11) % 7);               // 1970-01-01 was a Thursday (4)
+    t->yd = (int)(days - dk_days_from_civil(t->Y, 1, 1));
+}
+
+uint64_t donky_sys_epoch_ms(void) {
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    return make_number((double)((u.QuadPart - 116444736000000000ULL) / 10000ULL));
+}
+
+// -> [year, month, day, hour, minute, second, weekday(0=Sun), yearday(0-based)]
+uint64_t donky_sys_gmtime(uint64_t ts) {
+    DkTm t; dk_gmtime((int64_t)floor(is_number(ts) ? as_number(ts) : 0.0), &t);
+    uint64_t a = donky_alloc_array();
+    donky_array_push(a, make_number((double)t.Y)); donky_array_push(a, make_number(t.M));
+    donky_array_push(a, make_number(t.D));         donky_array_push(a, make_number(t.h));
+    donky_array_push(a, make_number(t.m));         donky_array_push(a, make_number(t.s));
+    donky_array_push(a, make_number(t.wd));        donky_array_push(a, make_number(t.yd));
+    return a;
+}
+
+uint64_t donky_sys_timegm(uint64_t Y, uint64_t Mo, uint64_t D, uint64_t H, uint64_t Mi, uint64_t S) {
+    int64_t y = (int64_t)as_number(Y), mo = (int64_t)as_number(Mo);
+    y += dk_floor_div(mo - 1, 12);
+    mo = ((mo - 1) % 12 + 12) % 12 + 1;
+    int64_t days = dk_days_from_civil(y, (int)mo, 1) + ((int64_t)as_number(D) - 1);
+    int64_t ts = days * 86400 + (int64_t)as_number(H) * 3600 + (int64_t)as_number(Mi) * 60 + (int64_t)as_number(S);
+    return make_number((double)ts);
+}
+
+// Supported: %Y %y %m %d %e %H %I %M %S %p %j %a %A %b %B %u %w %Z %z %s %F %T %R %D %%
+uint64_t donky_sys_strftime(uint64_t ts_val, uint64_t fmt_val) {
+    if (!dk_is_str(fmt_val)) return donky_alloc_string("");
+    static const char* WD[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+    static const char* MN[] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+    int64_t ts = (int64_t)floor(is_number(ts_val) ? as_number(ts_val) : 0.0);
+    DkTm t; dk_gmtime(ts, &t);
+    const char* f = dk_s(fmt_val);
+    char out[1024]; size_t o = 0; const size_t cap = sizeof out;
+#define APP(...) do { if (o + 64 < cap) o += (size_t)snprintf(out + o, cap - o, __VA_ARGS__); } while (0)
+    for (; *f; f++) {
+        if (*f != '%' || !f[1]) { if (o + 2 < cap) out[o++] = *f; continue; }
+        f++;
+        int h12 = (t.h % 12 == 0) ? 12 : t.h % 12;
+        switch (*f) {
+            case 'Y': APP("%lld", (long long)t.Y); break;
+            case 'y': APP("%02d", (int)(((t.Y % 100) + 100) % 100)); break;
+            case 'm': APP("%02d", t.M); break;
+            case 'd': APP("%02d", t.D); break;
+            case 'e': APP("%2d", t.D); break;
+            case 'H': APP("%02d", t.h); break;
+            case 'I': APP("%02d", h12); break;
+            case 'M': APP("%02d", t.m); break;
+            case 'S': APP("%02d", t.s); break;
+            case 'p': APP("%s", t.h < 12 ? "AM" : "PM"); break;
+            case 'j': APP("%03d", t.yd + 1); break;
+            case 'a': APP("%.3s", WD[t.wd]); break;
+            case 'A': APP("%s", WD[t.wd]); break;
+            case 'b': APP("%.3s", MN[t.M - 1]); break;
+            case 'B': APP("%s", MN[t.M - 1]); break;
+            case 'u': APP("%d", t.wd == 0 ? 7 : t.wd); break;
+            case 'w': APP("%d", t.wd); break;
+            case 'Z': APP("UTC"); break;
+            case 'z': APP("+0000"); break;
+            case 's': APP("%lld", (long long)ts); break;
+            case 'F': APP("%lld-%02d-%02d", (long long)t.Y, t.M, t.D); break;
+            case 'T': APP("%02d:%02d:%02d", t.h, t.m, t.s); break;
+            case 'R': APP("%02d:%02d", t.h, t.m); break;
+            case 'D': APP("%02d/%02d/%02d", t.M, t.D, (int)(((t.Y % 100) + 100) % 100)); break;
+            case '%': APP("%%"); break;
+            default:  APP("%%%c", *f); break;
+        }
+    }
+#undef APP
+    out[o] = 0;
+    return donky_alloc_string(out);
+}
+
+// ---- hashing ----
+#define DK_ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define DK_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static uint8_t* dk_pad(const uint8_t* m, size_t L, int big_endian, size_t* outn) {
+    size_t n = ((L + 8) / 64 + 1) * 64;
+    uint8_t* b = (uint8_t*)calloc(n, 1);
+    if (L) memcpy(b, m, L);
+    b[L] = 0x80;
+    uint64_t bits = (uint64_t)L * 8;
+    for (int i = 0; i < 8; i++) b[n - 8 + i] = (uint8_t)(big_endian ? (bits >> (56 - 8 * i)) : (bits >> (8 * i)));
+    *outn = n;
+    return b;
+}
+
+static void dk_sha256(const uint8_t* m, size_t L, uint8_t out[32]) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    size_t n; uint8_t* b = dk_pad(m, L, 1, &n);
+    for (size_t off = 0; off < n; off += 64) {
+        uint32_t w[64];
+        for (int t = 0; t < 16; t++)
+            w[t] = ((uint32_t)b[off+4*t] << 24) | ((uint32_t)b[off+4*t+1] << 16) | ((uint32_t)b[off+4*t+2] << 8) | (uint32_t)b[off+4*t+3];
+        for (int t = 16; t < 64; t++) {
+            uint32_t s0 = DK_ROTR(w[t-15], 7) ^ DK_ROTR(w[t-15], 18) ^ (w[t-15] >> 3);
+            uint32_t s1 = DK_ROTR(w[t-2], 17) ^ DK_ROTR(w[t-2], 19) ^ (w[t-2] >> 10);
+            w[t] = w[t-16] + s0 + w[t-7] + s1;
+        }
+        uint32_t a=h[0],bb=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int t = 0; t < 64; t++) {
+            uint32_t S1 = DK_ROTR(e,6) ^ DK_ROTR(e,11) ^ DK_ROTR(e,25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + K[t] + w[t];
+            uint32_t S0 = DK_ROTR(a,2) ^ DK_ROTR(a,13) ^ DK_ROTR(a,22);
+            uint32_t mj = (a & bb) ^ (a & c) ^ (bb & c);
+            uint32_t t2 = S0 + mj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = bb; bb = a; a = t1 + t2;
+        }
+        h[0]+=a; h[1]+=bb; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    free(b);
+    for (int i = 0; i < 8; i++) { out[4*i] = (uint8_t)(h[i] >> 24); out[4*i+1] = (uint8_t)(h[i] >> 16); out[4*i+2] = (uint8_t)(h[i] >> 8); out[4*i+3] = (uint8_t)h[i]; }
+}
+
+static void dk_sha1(const uint8_t* m, size_t L, uint8_t out[20]) {
+    uint32_t h[5] = {0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0};
+    size_t n; uint8_t* b = dk_pad(m, L, 1, &n);
+    for (size_t off = 0; off < n; off += 64) {
+        uint32_t w[80];
+        for (int t = 0; t < 16; t++)
+            w[t] = ((uint32_t)b[off+4*t] << 24) | ((uint32_t)b[off+4*t+1] << 16) | ((uint32_t)b[off+4*t+2] << 8) | (uint32_t)b[off+4*t+3];
+        for (int t = 16; t < 80; t++) w[t] = DK_ROTL(w[t-3] ^ w[t-8] ^ w[t-14] ^ w[t-16], 1);
+        uint32_t a=h[0],bb=h[1],c=h[2],d=h[3],e=h[4];
+        for (int t = 0; t < 80; t++) {
+            uint32_t f, k;
+            if (t < 20)      { f = (bb & c) | (~bb & d);           k = 0x5A827999; }
+            else if (t < 40) { f = bb ^ c ^ d;                     k = 0x6ED9EBA1; }
+            else if (t < 60) { f = (bb & c) | (bb & d) | (c & d);  k = 0x8F1BBCDC; }
+            else             { f = bb ^ c ^ d;                     k = 0xCA62C1D6; }
+            uint32_t tmp = DK_ROTL(a,5) + f + e + k + w[t];
+            e = d; d = c; c = DK_ROTL(bb,30); bb = a; a = tmp;
+        }
+        h[0]+=a; h[1]+=bb; h[2]+=c; h[3]+=d; h[4]+=e;
+    }
+    free(b);
+    for (int i = 0; i < 5; i++) { out[4*i] = (uint8_t)(h[i] >> 24); out[4*i+1] = (uint8_t)(h[i] >> 16); out[4*i+2] = (uint8_t)(h[i] >> 8); out[4*i+3] = (uint8_t)h[i]; }
+}
+
+static void dk_md5(const uint8_t* m, size_t L, uint8_t out[16]) {
+    static const int S[64] = {7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22, 5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+                              4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23, 6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+    static uint32_t K[64]; static int kinit = 0;
+    if (!kinit) { for (int i = 0; i < 64; i++) K[i] = (uint32_t)(fabs(sin((double)(i + 1))) * 4294967296.0); kinit = 1; }
+    uint32_t a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    size_t n; uint8_t* b = dk_pad(m, L, 0, &n);
+    for (size_t off = 0; off < n; off += 64) {
+        uint32_t M[16];
+        for (int i = 0; i < 16; i++)
+            M[i] = (uint32_t)b[off+4*i] | ((uint32_t)b[off+4*i+1] << 8) | ((uint32_t)b[off+4*i+2] << 16) | ((uint32_t)b[off+4*i+3] << 24);
+        uint32_t A = a0, B = b0, C = c0, D = d0;
+        for (int i = 0; i < 64; i++) {
+            uint32_t F; int g;
+            if (i < 16)      { F = (B & C) | (~B & D); g = i; }
+            else if (i < 32) { F = (D & B) | (~D & C); g = (5*i + 1) % 16; }
+            else if (i < 48) { F = B ^ C ^ D;          g = (3*i + 5) % 16; }
+            else             { F = C ^ (B | ~D);       g = (7*i) % 16; }
+            F = F + A + K[i] + M[g];
+            A = D; D = C; C = B; B = B + DK_ROTL(F, S[i]);
+        }
+        a0 += A; b0 += B; c0 += C; d0 += D;
+    }
+    free(b);
+    uint32_t r[4] = {a0, b0, c0, d0};
+    for (int i = 0; i < 4; i++) { out[4*i] = (uint8_t)r[i]; out[4*i+1] = (uint8_t)(r[i] >> 8); out[4*i+2] = (uint8_t)(r[i] >> 16); out[4*i+3] = (uint8_t)(r[i] >> 24); }
+}
+
+static void dk_hmac_sha256(const uint8_t* key, size_t kl, const uint8_t* msg, size_t ml, uint8_t out[32]) {
+    uint8_t k[64]; memset(k, 0, 64);
+    if (kl > 64) dk_sha256(key, kl, k); else if (kl) memcpy(k, key, kl);
+    uint8_t* buf = (uint8_t*)malloc(64 + (ml > 32 ? ml : 32));
+    uint8_t inner[32];
+    for (int i = 0; i < 64; i++) buf[i] = k[i] ^ 0x36;
+    if (ml) memcpy(buf + 64, msg, ml);
+    dk_sha256(buf, 64 + ml, inner);
+    for (int i = 0; i < 64; i++) buf[i] = k[i] ^ 0x5c;
+    memcpy(buf + 64, inner, 32);
+    dk_sha256(buf, 96, out);
+    free(buf);
+}
+
+// Accepts a string or an array of byte values.
+static const uint8_t* dk_in_bytes(uint64_t v, size_t* n, uint8_t** owned) {
+    *owned = NULL; *n = 0;
+    if (dk_is_str(v)) { const char* s = dk_s(v); *n = str_len(s); return (const uint8_t*)s; }
+    if (!is_number(v) && get_tag(v) == TAG_ARRAY) {
+        Array* a = (Array*)as_index(v);
+        uint8_t* b = (uint8_t*)malloc(a->len + 1);
+        for (size_t i = 0; i < a->len; i++) b[i] = is_number(a->data[i]) ? (uint8_t)(int)as_number(a->data[i]) : 0;
+        *owned = b; *n = a->len;
+        return b;
+    }
+    return (const uint8_t*)"";
+}
+static uint64_t dk_hex(const uint8_t* d, size_t n) {
+    static const char* H = "0123456789abcdef";
+    char* b = (char*)malloc(n * 2 + 1);
+    for (size_t i = 0; i < n; i++) { b[2*i] = H[d[i] >> 4]; b[2*i+1] = H[d[i] & 15]; }
+    b[n * 2] = 0;
+    uint64_t r = donky_alloc_string(b);
+    free(b);
+    return r;
+}
+uint64_t donky_sys_md5(uint64_t v)    { size_t n; uint8_t* o; const uint8_t* p = dk_in_bytes(v, &n, &o); uint8_t d[16]; dk_md5(p, n, d);    free(o); return dk_hex(d, 16); }
+uint64_t donky_sys_sha1(uint64_t v)   { size_t n; uint8_t* o; const uint8_t* p = dk_in_bytes(v, &n, &o); uint8_t d[20]; dk_sha1(p, n, d);   free(o); return dk_hex(d, 20); }
+uint64_t donky_sys_sha256(uint64_t v) { size_t n; uint8_t* o; const uint8_t* p = dk_in_bytes(v, &n, &o); uint8_t d[32]; dk_sha256(p, n, d); free(o); return dk_hex(d, 32); }
+uint64_t donky_sys_hmac_sha256(uint64_t key, uint64_t msg) {
+    size_t kn, mn; uint8_t *ko, *mo;
+    const uint8_t* kp = dk_in_bytes(key, &kn, &ko);
+    const uint8_t* mp = dk_in_bytes(msg, &mn, &mo);
+    uint8_t d[32]; dk_hmac_sha256(kp, kn, mp, mn, d);
+    free(ko); free(mo);
+    return dk_hex(d, 32);
+}
+
+// ---- generic HTTP: http_request(method, url, body, headers_string) -> response body ----
+// headers_string is "Name: Value\r\nName2: Value2\r\n". Status is available via http_status().
+static DONKY_TLS int dk_http_status = 0;
+uint64_t donky_http_status(void) { return make_number((double)dk_http_status); }
+
+static wchar_t* dk_widen(const char* s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    wchar_t* w = (wchar_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(wchar_t));
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n); else w[0] = 0;
+    return w;
+}
+
+uint64_t donky_http_request(uint64_t method_val, uint64_t url_val, uint64_t body_val, uint64_t hdr_val) {
+    dk_http_status = 0;
+    if (!dk_is_str(method_val) || !dk_is_str(url_val)) return donky_alloc_string("");
+    const char* body = dk_is_str(body_val) ? dk_s(body_val) : "";
+    const char* hdrs = dk_is_str(hdr_val) ? dk_s(hdr_val) : "";
+    size_t blen = strlen(body);
+
+    wchar_t* wurl = dk_widen(dk_s(url_val));
+    wchar_t* wmeth = dk_widen(dk_s(method_val));
+    wchar_t* whdr = hdrs[0] ? dk_widen(hdrs) : NULL;
+    wchar_t *host = NULL, *path = NULL;
+    HINTERNET hS = NULL, hC = NULL, hR = NULL;
+    char* resp = NULL; size_t total = 0;
+
+    URL_COMPONENTS uc; ZeroMemory(&uc, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.dwSchemeLength = (DWORD)-1; uc.dwHostNameLength = (DWORD)-1;
+    uc.dwUrlPathLength = (DWORD)-1; uc.dwExtraInfoLength = (DWORD)-1;
+
+    if (WinHttpCrackUrl(wurl, 0, 0, &uc)) {
+        host = (wchar_t*)malloc((uc.dwHostNameLength + 1) * sizeof(wchar_t));
+        wmemcpy(host, uc.lpszHostName, uc.dwHostNameLength); host[uc.dwHostNameLength] = 0;
+        path = (wchar_t*)malloc((uc.dwUrlPathLength + uc.dwExtraInfoLength + 2) * sizeof(wchar_t));
+        size_t o = 0;
+        if (uc.dwUrlPathLength == 0) path[o++] = L'/';
+        else { wmemcpy(path, uc.lpszUrlPath, uc.dwUrlPathLength); o += uc.dwUrlPathLength; }
+        if (uc.dwExtraInfoLength) { wmemcpy(path + o, uc.lpszExtraInfo, uc.dwExtraInfoLength); o += uc.dwExtraInfoLength; }
+        path[o] = 0;
+
+        hS = WinHttpOpen(L"Donky/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hS) hC = WinHttpConnect(hS, host, uc.nPort, 0);
+        if (hC) {
+            DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+            hR = WinHttpOpenRequest(hC, wmeth, path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        }
+        if (hR) {
+            BOOL ok = WinHttpSendRequest(hR,
+                whdr ? whdr : WINHTTP_NO_ADDITIONAL_HEADERS, whdr ? (DWORD)-1L : 0,
+                blen ? (LPVOID)body : WINHTTP_NO_REQUEST_DATA, (DWORD)blen, (DWORD)blen, 0);
+            if (ok) ok = WinHttpReceiveResponse(hR, NULL);
+            if (ok) {
+                DWORD st = 0, sz = sizeof st;
+                if (WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                        WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX))
+                    dk_http_status = (int)st;
+                for (;;) {
+                    DWORD avail = 0, got = 0;
+                    if (!WinHttpQueryDataAvailable(hR, &avail) || avail == 0) break;
+                    char* nb = (char*)realloc(resp, total + avail + 1);
+                    if (!nb) break;
+                    resp = nb;
+                    if (!WinHttpReadData(hR, resp + total, avail, &got)) break;
+                    total += got;
+                    resp[total] = 0;
+                }
+            }
+        }
+    }
+    if (hR) WinHttpCloseHandle(hR);
+    if (hC) WinHttpCloseHandle(hC);
+    if (hS) WinHttpCloseHandle(hS);
+    free(wurl); free(wmeth); free(whdr); free(host); free(path);
+    uint64_t r = donky_alloc_string(resp ? resp : "");
+    free(resp);
+    return r;
+}
+// ===================== end standard library builtins =====================
 
 int main(int argc, char** argv) {
     gc_init_lock();

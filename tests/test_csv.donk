@@ -1,0 +1,51 @@
+import "lib/csv.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+let nl = bytes_to_str([10]);
+let q = bytes_to_str([34]);
+
+let rows = csv_parse("a,b,c" + nl + "1,2,3" + nl);
+check(len(rows) == 2, "row count");
+check(join(rows[0], "|") == "a|b|c", "header row");
+check(join(rows[1], "|") == "1|2|3", "data row");
+
+let r2 = csv_parse("x,,z" + bytes_to_str([13, 10]) + "last,");
+check(len(r2) == 2, "CRLF + trailing delimiter rows");
+check(join(r2[0], "|") == "x||z", "empty middle field");
+check(join(r2[1], "|") == "last|", "trailing empty field");
+
+let r3 = csv_parse(q + "hello, world" + q + "," + q + "say " + q + q + "hi" + q + q + q + "," + q + "line1" + nl + "line2" + q);
+check(len(r3) == 1 && len(r3[0]) == 3, "quoted fields count");
+check(r3[0][0] == "hello, world", "quoted comma");
+check(r3[0][1] == "say " + q + "hi" + q, "escaped quotes");
+check(r3[0][2] == "line1" + nl + "line2", "embedded newline");
+
+check(len(csv_parse("")) == 0, "empty input");
+check(len(csv_parse("a" + nl + nl + "b")) == 2, "blank lines skipped");
+
+let out = csv_stringify([["a", "b,c"], [1, q + "x" + q]]);
+check(out == "a," + q + "b,c" + q + nl + "1," + q + q + q + "x" + q + q + q + nl, "stringify quoting");
+let back = csv_parse(out);
+check(back[0][1] == "b,c" && back[1][1] == q + "x" + q, "stringify/parse roundtrip");
+
+write_file("tests/_csv_test.tmp", "name,age" + nl + "ann,30" + nl + "bob,25" + nl);
+let fr = csv_parse_file("tests/_csv_test.tmp");
+check(len(fr) == 3 && fr[2][0] == "bob", "parse_file");
+let maps = csv_to_maps(fr);
+check(len(maps) == 2 && maps[0]["name"] == "ann" && maps[1]["age"] == "25", "csv_to_maps");
+check(csv_write_file("tests/_csv_test.tmp", [["k", "v"]]), "csv_write_file");
+check(read_file("tests/_csv_test.tmp") == "k,v" + nl, "csv_write_file content");
+sys_remove("tests/_csv_test.tmp");
+
+finish("test_csv");

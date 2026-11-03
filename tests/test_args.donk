@@ -1,0 +1,40 @@
+import "lib/args.donk";
+
+fn check(ok, name) {
+    if ok { sys_puts("  ok    " + name); }
+    else { sys_puts("  FAIL  " + name); global_set("fails", global_get("fails") + 1); }
+    return 0;
+}
+fn finish(label) {
+    let f = global_get("fails");
+    if f > 0 { sys_puts(label + ": " + str(f) + " FAILED"); sys_exit(1); }
+    sys_puts(label + ": all passed");
+    return 0;
+}
+
+args_parse_with(["--name=donky", "-vq", "--out", "f.txt", "in.txt", "--debug", "-5", "--", "last"], ["out"]);
+
+check(args_param("name") == "donky", "--name=value");
+check(args_param("out") == "f.txt", "--out value (declared valued)");
+check(args_flag("debug"), "--debug flag");
+check(args_flag("v") && args_flag("q"), "short flag cluster -vq");
+check(!args_flag("nope"), "missing flag");
+check(type(args_param("nope")) != "string", "missing param is null");
+check(args_param_or("nope", "dflt") == "dflt", "param_or default");
+let pos = args_positional();
+check(json_encode(pos) == "[\"in.txt\",\"-5\",\"--\",\"last\"]" || len(pos) == 4, "positionals (incl. negative number)");
+check(pos[0] == "in.txt" && pos[1] == "-5" && pos[3] == "last", "positional order");
+
+args_parse(["--help"]);
+check(args_wants_help(), "wants_help");
+check(!args_wants_version(), "wants_version false");
+
+args_set_info("mytool", "1.2.3", "does things");
+args_add_option("--name=NAME", "Your name");
+let h = args_help_text();
+check(contains(h, "mytool - does things"), "help header");
+check(contains(h, "--name=NAME") && contains(h, "Your name"), "help options");
+check(contains(h, "--help"), "help builtin option");
+check(args_version() == "mytool 1.2.3", "version");
+
+finish("test_args");
