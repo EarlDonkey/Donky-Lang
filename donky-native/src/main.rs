@@ -56,19 +56,23 @@ fn main() {
             println!("Compiling to object file...");
             let aot = aot::AotCompiler::new();
             let obj_path = "donky_app.obj";
-            aot.compile_to_object(&ast, obj_path).unwrap();
+            if let Err(e) = aot.compile_to_object(&ast, obj_path) { eprintln!("Error: {}", e); return; }
 
             #[cfg(target_os = "windows")]
             let (gcc_bin, gcc_args): (String, Vec<String>) = {
-                let rt = match find_runtime_obj() { Ok(p) => p, Err(e) => { eprintln!("{}", e); return; } };
+                    println!("Writing C runtime...");
+                fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
+                
                 let mut a: Vec<String> = vec![
-                    obj_path.to_string(),
-                    rt.to_string_lossy().into_owned(),
+                    obj_path.to_string(), 
+                    "runtime.c".to_string(),  // <-- Compile the C source, not the .o
                     "-o".to_string(), "donky_app.exe".to_string(),
-                    "-static".to_string(), "-static-libgcc".to_string(),
+                    "-mstackrealign".to_string(),
                 ];
-                for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-Wl,--stack,67108864"] { a.push(l.to_string()); }
-                (find_gcc(), a)
+                for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"] { 
+                    a.push(l.to_string()); 
+                }
+                ("gcc".to_string(), a)
             };
 
             #[cfg(not(target_os = "windows"))]
@@ -234,8 +238,28 @@ fn run_file(path: &str) -> Result<(), String> {
     let source = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let tokens = lexer::Lexer::new(&source).tokenize()?;
     let ast = parser::Parser::new(tokens).parse()?;
-    let (code, funcs, pool) = vm::Compiler::new().compile(ast);
-    vm::VM::new().run(code, funcs, pool, vec![])
+
+    let aot = aot::AotCompiler::new();
+    let obj_path = "test_app.obj";
+    if let Err(e) = aot.compile_to_object(&ast, obj_path) {
+        return Err(format!("Compile error: {}", e));
+    }
+
+    fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
+
+    let status = std::process::Command::new("gcc")
+        .args(&[obj_path, "runtime.c", "-o", "test_app.exe", "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"])
+        .status()
+        .map_err(|e| e.to_string())?;
+
+    if !status.success() { return Err("Linker failed".to_string()); }
+
+    let run_status = std::process::Command::new("test_app.exe")
+        .status()
+        .map_err(|e| e.to_string())?;
+
+    if !run_status.success() { return Err("Program exited with error".to_string()); }
+    Ok(())
 }
 
 fn cmd_bench(arg: Option<&str>) -> Result<(), String> {

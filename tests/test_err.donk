@@ -1,0 +1,5 @@
+fn main() {
+    let x = 5;
+    foo(x); // This function doesn't exist
+}
+main();

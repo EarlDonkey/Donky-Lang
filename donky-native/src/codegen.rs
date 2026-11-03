@@ -431,7 +431,7 @@ impl NativeCompiler {
                 let var = fctx.variables.get(name).expect(&format!("Undefined variable: {}", name));
                 builder.use_var(*var)
             }
-            Expr::Call(name, args) => {
+            Expr::Call(name, args, _) => {
                 let func_id = user_funcs.get(name).expect(&format!("Undefined function: {}", name));
                 let local_callee = module.declare_func_in_func(*func_id, builder.func);
                 let mut arg_vals = Vec::new();

@@ -289,7 +289,7 @@ static uint64_t g_globals = 0;
 
 int is_number(uint64_t v) { return (v & TAG_MASK) != TAG_BASE; }
 double as_number(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
-uint64_t get_tag(uint64_t v) { return (v >> 48) & 0x7; }
+uint64_t get_tag(uint64_t v) { return is_number(v) ? 0 : ((v >> 48) & 0x7); }
 uint64_t as_index(uint64_t v) { return v & 0x0000FFFFFFFFFFFFULL; }
 uint64_t make_number(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
 
@@ -326,7 +326,8 @@ void print_value(uint64_t val) {
 }
 
 void donky_print(uint64_t val) {
-    print_value(val);
+    if (!is_number(val) && get_tag(val) == TAG_STRING) printf("%s", (char*)as_index(val));
+    else print_value(val);
     printf("\n");
 }
 
@@ -906,18 +907,38 @@ uint64_t donky_num(uint64_t val) {
 }
 
 uint64_t donky_read_file(uint64_t path_val) {
-    if (get_tag(path_val) != TAG_STRING) return 0;
+    if (get_tag(path_val) != TAG_STRING) {
+        donky_throw(donky_alloc_string("read_file: path must be a string"));
+        return 0;
+    }
     char* path = (char*)as_index(path_val);
+    char err_buf[600];
     FILE* f = fopen(path, "rb");
     if (!f) {
-        char err_buf[512];
         snprintf(err_buf, sizeof(err_buf), "File not found: %s", path);
         donky_throw(donky_alloc_string(err_buf));
         return 0;
     }
-    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
-    char* buf = malloc(len + 1); fread(buf, 1, len, f); buf[len] = 0; fclose(f);
-    uint64_t res = donky_alloc_string(buf); free(buf); return res;
+    long len = -1;
+    if (fseek(f, 0, SEEK_END) == 0) len = ftell(f);
+    if (len < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        snprintf(err_buf, sizeof(err_buf), "Cannot read file: %s", path);
+        donky_throw(donky_alloc_string(err_buf));
+        return 0;
+    }
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(f);
+        donky_throw(donky_alloc_string("read_file: out of memory"));
+        return 0;
+    }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    buf[got] = 0;
+    uint64_t res = donky_alloc_string(buf);
+    free(buf);
+    return res;
 }
 
 uint64_t donky_write_file(uint64_t path_val, uint64_t content_val) {
@@ -1089,11 +1110,13 @@ uint64_t donky_input(uint64_t prompt_val) {
         printf("%s", (char*)as_index(prompt_val));
         fflush(stdout);
     }
-    char buf[256];
-    if (fgets(buf, 256, stdin) == NULL) return donky_alloc_string("");
+    char buf[4096];
+    if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        return donky_alloc_string("");
+    }
     buf[strcspn(buf, "\r\n")] = 0;
     return donky_alloc_string(buf);
-}
+}   
 
 uint64_t donky_sleep(uint64_t ms_val) {
     Sleep((DWORD)as_number(ms_val));
@@ -1521,7 +1544,9 @@ static uint64_t ffi_invoke(uint64_t fn_val, uint64_t args_val) {
         Array* arr = (Array*)as_index(args_val);
         for (size_t i = 0; i < arr->len && i < 8; i++) a[i] = ffi_convert_arg(arr->data[i]);
     }
-    return ((DonkyFfiFn)fn)(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
+    typedef uint64_t (*DonkyFfiFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+    DonkyFfiFn f = (DonkyFfiFn)fn;
+    return f(a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
 }
 
 uint64_t donky_dll_load(uint64_t name_val) {
@@ -2394,6 +2419,38 @@ uint64_t donky_sys_eputs(uint64_t s) {
 uint64_t donky_sys_exit(uint64_t code) {
     fflush(stdout); fflush(stderr);
     exit(is_number(code) ? (int)as_number(code) : 0);
+    return 0;
+}
+
+// ---- raw memory for FFI (caller must ffi_free what it ffi_alloc'd) ----
+uint64_t donky_ffi_alloc(uint64_t n) {
+    size_t sz = is_number(n) ? (size_t)as_number(n) : 0;
+    void* p = calloc(1, sz ? sz : 1);
+    return make_number((double)(uint64_t)(uintptr_t)p);
+}
+uint64_t donky_ffi_free(uint64_t p) {
+    if (is_number(p)) free((void*)(uintptr_t)(uint64_t)as_number(p));
+    return 0;
+}
+uint64_t donky_ffi_peek(uint64_t p, uint64_t size) {
+    if (!is_number(p) || !is_number(size)) return make_number(0.0);
+    const void* a = (const void*)(uintptr_t)(uint64_t)as_number(p);
+    if (!a) return make_number(0.0);
+    switch ((int)as_number(size)) {
+        case 1: { uint8_t  v; memcpy(&v, a, 1); return make_number((double)v); }
+        case 2: { uint16_t v; memcpy(&v, a, 2); return make_number((double)v); }
+        case 4: { uint32_t v; memcpy(&v, a, 4); return make_number((double)v); }
+        case 8: { uint64_t v; memcpy(&v, a, 8); return make_number((double)v); }
+    }
+    return make_number(0.0);
+}
+uint64_t donky_ffi_poke(uint64_t p, uint64_t size, uint64_t val) {
+    if (!is_number(p) || !is_number(size) || !is_number(val)) return 0;
+    void* a = (void*)(uintptr_t)(uint64_t)as_number(p);
+    if (!a) return 0;
+    uint64_t v = (uint64_t)(int64_t)as_number(val);
+    int n = (int)as_number(size);
+    if (n == 1 || n == 2 || n == 4 || n == 8) memcpy(a, &v, (size_t)n); // little-endian
     return 0;
 }
 

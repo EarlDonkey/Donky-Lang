@@ -130,12 +130,14 @@ pub fn install_from_manifest() -> Result<(), String> {
                 let _ = fs::remove_dir_all(&staging);
                 // Preserve extension from URL if it's a real one
                 let last_seg = url.rsplit('/').next().unwrap_or("");
-                let ext = if let Some(pos) = last_seg.rfind('.') {
+                let mut ext = if let Some(pos) = last_seg.rfind('.') {
                     let e = &last_seg[pos..];
                     if e == ".gz" || e == ".tgz" { "" } else { e }
                 } else {
                     ""
                 };
+                if ext.is_empty() { ext = ".donk"; }
+                let _ = fs::remove_dir_all(std::path::Path::new("donky_modules").join(name)); // drop stale package dir
                 let raw_path = format!("donky_modules/{}{}", name, ext);
                 fs::write(&raw_path, &bytes).map_err(|e| e.to_string())?;
                 println!("  -> Saved raw file to {}", raw_path);
@@ -210,44 +212,30 @@ fn write_lockfile(manifest: &Manifest) -> Result<(), String> {
 }
 
 pub fn add_dependency(name: &str, url_or_path: &str) -> Result<(), String> {
-    let manifest_str = fs::read_to_string("donky.json")
-        .map_err(|_| "no donky.json in current directory".to_string())?;
+    let manifest_str = fs::read_to_string("donky.json").unwrap_or_else(|_| {
+        r#"{"name":"app","version":"0.1.0","dependencies":{}}"#.to_string()
+    });
     let mut manifest: Manifest = serde_json::from_str(&manifest_str)
         .map_err(|e| format!("bad donky.json: {}", e))?;
 
-    // Local path?
     let local = std::path::Path::new(url_or_path);
-    if local.exists() && local.is_dir() {
+    let dep = if local.is_dir() {
         let abs = fs::canonicalize(local).map_err(|e| e.to_string())?;
-        manifest.dependencies.insert(name.to_string(), Dependency::Detailed(DetailedDep {
-            url: None,
-            sha256: None,
-            path: Some(abs.to_string_lossy().to_string()),
-        }));
-        let s = serde_json::to_string_pretty(&manifest).unwrap();
-        fs::write("donky.json", s).map_err(|e| e.to_string())?;
-        println!("Added {} (path: {})", name, abs.display());
-        return Ok(());
-    }
-
-    // URL: fetch to compute hash
-    println!("Fetching {}...", url_or_path);
-    let resp = ureq::get(url_or_path).call().map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    resp.into_reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let hash = format!("{:x}", hasher.finalize());
-
-    manifest.dependencies.insert(name.to_string(), Dependency::Detailed(DetailedDep {
-        url: Some(url_or_path.to_string()),
-        sha256: Some(hash.clone()),
-        path: None,
-    }));
-
-    let s = serde_json::to_string_pretty(&manifest).unwrap();
-    fs::write("donky.json", s).map_err(|e| e.to_string())?;
-    println!("Added {} with sha256 {}", name, hash);
-    Ok(())
+        println!("Adding {} (path: {})", name, abs.display());
+        Dependency::Detailed(DetailedDep { url: None, sha256: None, path: Some(abs.to_string_lossy().to_string()) })
+    } else {
+        println!("Fetching {}...", url_or_path);
+        let resp = ureq::get(url_or_path).call().map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        resp.into_reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = format!("{:x}", hasher.finalize());
+        println!("Pinned sha256 {}", hash);
+        Dependency::Detailed(DetailedDep { url: Some(url_or_path.to_string()), sha256: Some(hash), path: None })
+    };
+    manifest.dependencies.insert(name.to_string(), dep);
+    fs::write("donky.json", serde_json::to_string_pretty(&manifest).unwrap())
+        .map_err(|e| e.to_string())?;
+    install_from_manifest() // drops it into donky_modules/ right away
 }

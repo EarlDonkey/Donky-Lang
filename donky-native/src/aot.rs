@@ -3,13 +3,20 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use cranelift_module::{Module, Linkage, FuncId, DataDescription};
 use crate::ast::{Expr, Stmt};
 use crate::lexer::TokenType;
+use crate::ast::Pos;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 
+fn fatal(pos: Pos, msg: &str) -> ! {
+    if pos.line > 0 { eprintln!("Error at line {}, col {}: {}", pos.line, pos.col, msg); }
+    else { eprintln!("Error: {}", msg); }
+    std::process::exit(1);
+}
+
 static STRING_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 22] = [
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 26] = [
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -32,6 +39,10 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 22] = [
     ("http_status", "donky_http_status", 0),
     ("global_get", "donky_global_get", 1),
     ("global_set", "donky_global_set", 2),
+    ("ffi_alloc", "donky_ffi_alloc", 1),
+    ("ffi_free",  "donky_ffi_free",  1),
+    ("ffi_peek",  "donky_ffi_peek",  2),
+    ("ffi_poke",  "donky_ffi_poke",  3),
 ];
 
 #[derive(Clone, Copy)]
@@ -67,7 +78,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 22],
+    pub stdlib_ids: [FuncId; 26],
 }
 
 pub struct AotCompiler {
@@ -103,7 +114,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 22] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 26] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });
@@ -202,47 +213,9 @@ impl AotCompiler {
     }
 
     pub fn compile_to_object(mut self, stmts: &[Stmt], output_path: &str) -> Result<(), String> {
-        // --- Recursive Import Resolution ---
-        use std::path::Path;
-        use std::fs;
-        
-        fn resolve_imports(stmts: &[Stmt], base_dir: &str, all_funcs: &mut HashMap<String, (Vec<String>, Box<Stmt>)>) {
-            use std::path::Path;
-            use std::fs;
-            for stmt in stmts {
-                match stmt {
-                    Stmt::Import(path) => {
-                        let full_path = Path::new(base_dir).join(path).to_string_lossy().to_string();
-                        
-                        let source = match fs::read_to_string(&full_path) {
-                            Ok(s) => s,
-                            Err(e) => { println!("DEBUG: Failed to read file: {}", e); continue; }
-                        };
-                        
-                        let toks = match crate::lexer::Lexer::new(&source).tokenize() {
-                            Ok(t) => t,
-                            Err(e) => { println!("DEBUG: Lex error in {}: {}", full_path, e); continue; }
-                        };
-                        
-                        let imported_stmts = match crate::parser::Parser::new(toks).parse() {
-                            Ok(a) => a,
-                            Err(e) => { println!("DEBUG: Parse error in {}: {}", full_path, e); continue; }
-                        };
-
-                        let new_base = Path::new(&full_path).parent().unwrap_or(Path::new("")).to_string_lossy().to_string();
-                        resolve_imports(&imported_stmts, &new_base, all_funcs);
-                    }
-                    Stmt::Function(name, params, body) => {
-                        all_funcs.insert(name.clone(), (params.clone(), body.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         let mut latest_funcs: HashMap<String, (Vec<String>, Box<Stmt>)> = HashMap::new();
-        // Start resolution from the current directory
-        resolve_imports(stmts, ".", &mut latest_funcs);
+        let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+        resolve_imports(stmts, ".", &mut latest_funcs, &mut visited)?;
         // ----------------------------------------
 
         for (name, (params, _)) in &latest_funcs {
@@ -349,8 +322,8 @@ impl AotCompiler {
                 Expr::Ident(n) => { u.insert(n.clone()); }
                 Expr::Binary(l, _, r) => { ex(l, u); ex(r, u); }
                 Expr::Unary(_, x) => ex(x, u),
-                Expr::Call(_, args) => { for a in args { ex(a, u); } }
-                Expr::MethodCall(obj, _, args) => { ex(obj, u); for a in args { ex(a, u); } }
+                Expr::Call(_, args, _) => { for a in args { ex(a, u); } }
+                Expr::MethodCall(obj, _, args, _) => { ex(obj, u); for a in args { ex(a, u); } }
                 Expr::Index(o, i) => { ex(o, u); ex(i, u); }
                 Expr::FieldAccess(o, _) => ex(o, u),
                 Expr::Array(v) => { for a in v { ex(a, u); } }
@@ -422,12 +395,22 @@ impl AotCompiler {
             fctx.num_vars = Self::analyze_numeric(params, body);
             
             let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
+
+            // Implicit program `args` goes in FIRST so a parameter named `args` shadows it.
+            let get_args_func = self.module.declare_func_in_func(self.runtime.get_args_id, builder.func);
+            let args_call = builder.ins().call(get_args_func, &[]);
+            let args_val = builder.inst_results(args_call)[0];
+            let args_var = Variable::new(fctx.next_var); fctx.next_var += 1;
+            builder.declare_var(args_var, types::I64);
+            builder.def_var(args_var, args_val);
+            fctx.variables.insert("args".to_string(), args_var);
+
             for (i, param_name) in params.iter().enumerate() {
-                let (pname, _) = Self::split_param(param_name); // Strip ":int"
+                let (pname, _) = Self::split_param(param_name);
                 let var = Variable::new(fctx.next_var); fctx.next_var += 1;
                 builder.declare_var(var, types::I64);
                 builder.def_var(var, block_params[i]);
-                fctx.variables.insert(pname.to_string(), var); // Use stripped name
+                fctx.variables.insert(pname.to_string(), var);
             }
             let get_args_func = self.module.declare_func_in_func(self.runtime.get_args_id, builder.func);
             let args_call = builder.ins().call(get_args_func, &[]);
@@ -473,7 +456,11 @@ impl AotCompiler {
             }
             Stmt::Assign(name, expr) => {
                 let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
-                let var = fctx.variables.get(name).unwrap(); builder.def_var(*var, val); false
+                let var = match fctx.variables.get(name) {
+                    Some(v) => v,
+                    None => fatal(Pos::default(), &format!("assignment to undeclared variable `{}`", name)),
+                };
+                builder.def_var(*var, val); false
             }
             Stmt::IndexSet(target, index, val) => {
                 let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, target);
@@ -514,17 +501,17 @@ impl AotCompiler {
                 };
                 builder.ins().return_(&[val]); true
             }
-            Stmt::Break => {
+            Stmt::Break(pos) => {
                 match fctx.loop_stack.last() {
                     Some((break_target, _)) => { builder.ins().jump(*break_target, &[]); }
-                    None => panic!("`break` used outside of a loop"),
+                    None => fatal(*pos, "`break` used outside of a loop"),
                 }
                 true
             }
-            Stmt::Continue => {
+            Stmt::Continue(pos) => {
                 match fctx.loop_stack.last() {
                     Some((_, continue_target)) => { builder.ins().jump(*continue_target, &[]); }
-                    None => panic!("`continue` used outside of a loop"),
+                    None => fatal(*pos, "`continue` used outside of a loop"),
                 }
                 true
             }
@@ -872,13 +859,13 @@ impl AotCompiler {
                     _ => val,
                 }
             }
-            Expr::Call(name, args) if name == "format" && !user_funcs.contains_key("format")
+            Expr::Call(name, args, _) if name == "format" && !user_funcs.contains_key("format")
                 && matches!(args.first(), Some(Expr::String(_))) => {
                 let fmt = match &args[0] { Expr::String(s) => s.clone(), _ => unreachable!() };
                 let vals: Vec<Expr> = match &args[1..] { [Expr::Array(e)] => e.clone(), rest => rest.to_vec() };
                 Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Self::desugar_format(&fmt, &vals))
             }
-            Expr::MethodCall(obj, method, args) => {
+            Expr::MethodCall(obj, method, args, pos) => {
                 if method == "format" {
                     if let Expr::String(fmt) = obj.as_ref() {
                         let vals: Vec<Expr> = match args.as_slice() { [Expr::Array(e)] => e.clone(), _ => args.clone() };
@@ -888,7 +875,7 @@ impl AotCompiler {
                 let mut full = Vec::with_capacity(args.len() + 1);
                 full.push((**obj).clone());
                 full.extend(args.iter().cloned());
-                Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Expr::Call(method.clone(), full))
+                Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, &Expr::Call(method.clone(), full, *pos))
             }
             Expr::Ternary(c, t, f) => {
                 let cv = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, c);
@@ -911,7 +898,7 @@ impl AotCompiler {
                 builder.switch_to_block(merge);
                 builder.block_params(merge)[0]
             }
-            Expr::Call(name, args) => {
+            Expr::Call(name, args, pos) => {
                 if let Some(func_id) = user_funcs.get(name) {
                     let local_callee = module.declare_func_in_func(*func_id, builder.func);
                     let mut arg_vals = Vec::new();
@@ -994,7 +981,7 @@ impl AotCompiler {
                         "now_ms" => runtime.now_ms_id,
                         _ => match STDLIB_BUILTINS.iter().position(|(n, _, _)| *n == name.as_str()) {
                             Some(i) => runtime.stdlib_ids[i],
-                            None => panic!("Unknown builtin function: {}", name),
+                            None => fatal(*pos, &format!("unknown function `{}`", name)),
                         },
                     };
                     let local_callee = module.declare_func_in_func(builtin_id, builder.func);
@@ -1370,4 +1357,62 @@ impl AotCompiler {
         let zero = builder.ins().f64const(0.0);
         builder.ins().fcmp(FloatCC::NotEqual, vf, zero)
     }
+}
+
+fn find_module(base_dir: &str, import: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let mut names = vec![import.to_string()];
+    if !import.ends_with(".donk") { names.push(format!("{}.donk", import)); }
+
+    let mut roots: Vec<PathBuf> = vec![
+        Path::new(base_dir).to_path_buf(),
+        PathBuf::from("donky_modules"),
+        PathBuf::from("lib"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent().and_then(|p| p.parent()) { roots.push(root.join("lib")); }
+    }
+    for root in &roots {
+        for n in &names {
+            let p = root.join(n);
+            if p.is_file() { return Some(p); }
+        }
+    }
+    let stem = import.trim_end_matches(".donk");
+    let pkg = Path::new("donky_modules").join(stem);
+    for f in ["main.donk", "mod.donk", &format!("{}.donk", stem)] {
+        let p = pkg.join(f);
+        if p.is_file() { return Some(p); }
+    }
+    None
+}
+
+fn resolve_imports(
+    stmts: &[Stmt], base_dir: &str,
+    all_funcs: &mut HashMap<String, (Vec<String>, Box<Stmt>)>,
+    visited: &mut HashSet<std::path::PathBuf>,
+) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Import(path) => {
+                let full = find_module(base_dir, path).ok_or_else(|| format!(
+                    "Import error: cannot find module \"{}\" (searched {}, donky_modules/, lib/)", path, base_dir))?;
+                let canon = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
+                if !visited.insert(canon) { continue; }
+                let source = std::fs::read_to_string(&full)
+                    .map_err(|e| format!("Import error: {}: {}", full.display(), e))?;
+                let toks = crate::lexer::Lexer::new(&source).tokenize()
+                    .map_err(|e| format!("Lex error in {}: {}", full.display(), e))?;
+                let imported = crate::parser::Parser::new(toks).parse()
+                    .map_err(|e| format!("Parse error in {}: {}", full.display(), e))?;
+                let new_base = full.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                resolve_imports(&imported, &new_base, all_funcs, visited)?;
+            }
+            Stmt::Function(name, params, body) => {
+                all_funcs.insert(name.clone(), (params.clone(), body.clone()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

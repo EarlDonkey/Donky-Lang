@@ -203,8 +203,8 @@ impl Interpreter {
                 Ok(ControlFlow::Normal)
             }
             Stmt::Return(expr) => { let v = if let Some(e) = expr { self.evaluate(e)? } else { Value::null() }; Ok(ControlFlow::Return(v)) }
-            Stmt::Break => Ok(ControlFlow::Break),
-            Stmt::Continue => Ok(ControlFlow::Continue),
+            Stmt::Break(_) => Ok(ControlFlow::Break),
+            Stmt::Continue(_) => Ok(ControlFlow::Continue),
             Stmt::ForRange(_, _, _, _) => Err("ForRange not supported in interpreter".to_string()),
         }
     }
@@ -295,7 +295,7 @@ impl Interpreter {
                     _ => Err(format!("Cannot index '{}'", t.to_string_with_heap(&self.heap))),
                 }
             }
-            Expr::MethodCall(target, method, args) => {
+            Expr::MethodCall(target, method, args, _) => {
                 let obj = self.evaluate(*target)?;
                 if obj.is_struct() {
                     let (name, _) = self.heap.get_struct(obj.payload());
@@ -313,7 +313,7 @@ impl Interpreter {
                     } else { Err(format!("Method '{}' not found", full_name)) }
                 } else { Err("Can only call methods on structs".to_string()) }
             }
-            Expr::Call(name, args) => self.call_builtin_or_user(name, args),
+            Expr::Call(name, args, _) => self.call_builtin_or_user(name, args),
             Expr::Unary(op, right) => {
                 let rv = self.evaluate(*right)?;
                 match op {

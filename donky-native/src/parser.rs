@@ -1,5 +1,8 @@
 use crate::lexer::{Token, TokenType, Lexer};
-use crate::ast::{Expr, Stmt};
+
+use crate::ast::{Expr, Stmt, Pos};
+
+fn pos_of(t: &Token) -> Pos { Pos { line: t.line as u32, col: t.col as u32 } }
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -237,8 +240,14 @@ impl Parser {
             return Ok(Stmt::Return(Some(value)));
         }
 
-        if self.match_token(&[TokenType::Break]) { self.consume(TokenType::Semi, "Expected ';'")?; return Ok(Stmt::Break); }
-        if self.match_token(&[TokenType::Continue]) { self.consume(TokenType::Semi, "Expected ';'")?; return Ok(Stmt::Continue); }
+        if self.check(TokenType::Break) {
+            let p = pos_of(self.peek()); self.advance();
+            self.consume(TokenType::Semi, "Expected ';'")?; return Ok(Stmt::Break(p));
+        }
+        if self.check(TokenType::Continue) {
+            let p = pos_of(self.peek()); self.advance();
+            self.consume(TokenType::Semi, "Expected ';'")?; return Ok(Stmt::Continue(p));
+        }
 
         if self.check(TokenType::Ident) && self.peek_n(1).ttype == TokenType::PlusPlus {
             let name = self.advance().lexeme.clone();
@@ -304,7 +313,8 @@ impl Parser {
         }
 
         while self.match_token(&[TokenType::Dot]) {
-            let field = self.consume(TokenType::Ident, "Expected field name")?.lexeme.clone();
+            let ft = self.consume(TokenType::Ident, "Expected field name")?.clone();
+            let field = ft.lexeme.clone();
             if self.match_token(&[TokenType::LParen]) {
                 let mut args = Vec::new();
                 if !self.check(TokenType::RParen) {
@@ -314,7 +324,7 @@ impl Parser {
                     }
                 }
                 self.consume(TokenType::RParen, "Expected ')'")?;
-                left = Expr::MethodCall(Box::new(left), field, args);
+                left = Expr::MethodCall(Box::new(left), field, args, pos_of(&ft));
             } else {
                 left = Expr::FieldAccess(Box::new(left), field);
             }
@@ -389,6 +399,7 @@ impl Parser {
                 Ok(Expr::Function(params, body))
             }
             TokenType::Ident => {
+                let pos = pos_of(&token);
                 let name = token.lexeme;
                 if self.match_token(&[TokenType::LParen]) {
                     let mut args = Vec::new();
@@ -399,7 +410,7 @@ impl Parser {
                         }
                     }
                     self.consume(TokenType::RParen, "Expected ')'")?;
-                    Ok(Expr::Call(name, args))
+                    Ok(Expr::Call(name, args, pos))
                 } else if self.check(TokenType::LBrace) && self.peek_n(1).ttype == TokenType::Ident && self.peek_n(2).ttype == TokenType::Colon {
                     self.advance();
                     let mut fields = Vec::new();

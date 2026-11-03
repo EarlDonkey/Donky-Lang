@@ -1,0 +1,187 @@
+// lib/sqlite.donk -- SQLite for Donky via native FFI.
+//
+// Needs the ffi_alloc / ffi_free / ffi_peek builtins (see runtime patch).
+// Windows: put a 64-bit sqlite3.dll next to your exe (or on PATH).
+// Linux/macOS: install libsqlite3 (libsqlite3.so.0 / libsqlite3.dylib).
+//
+// API:
+//   let db = sqlite_open("app.db");          // ":memory:" works too
+//   sqlite_script(db, "CREATE TABLE ...; INSERT ...;");   // multi-statement, no params
+//   let n = sqlite_exec(db, "INSERT INTO t(a,b) VALUES (?, ?)", ["x", 5]);  // rows changed
+//   let rows = sqlite_query(db, "SELECT * FROM t WHERE b > ?", [1]);        // array of maps
+//   let id = sqlite_last_id(db);
+//   sqlite_close(db);
+// Errors are thrown as strings: try { ... } catch (e) { ... }
+//
+// Params: numbers (integers bind as INTEGER, others as REAL), strings, bools.
+// Note: null and 0 are the same value in Donky, so a null param binds as 0.
+
+fn sqlite_lib() {
+    let lib = global_get("sqlite.lib");
+    if lib != 0 { return lib; }
+    let names = ["sqlite3.dll", "libsqlite3.so.0", "libsqlite3.so", "libsqlite3.dylib", "sqlite3"];
+    for n in names {
+        if lib == 0 {
+            lib = dll_load(n);
+        }
+    }
+    if lib == 0 { throw "sqlite: could not load the SQLite library (sqlite3.dll / libsqlite3.so)"; }
+    global_set("sqlite.lib", lib);
+    return lib;
+}
+
+fn sqlite_sym(name) {
+    let key = "sqlite.sym." + name;
+    let p = global_get(key);
+    if p == 0 {
+        p = dll_sym(sqlite_lib(), name);
+        if p == 0 { throw "sqlite: missing symbol " + name; }
+        global_set(key, p);
+    }
+    return p;
+}
+
+// int-returning C function (eax, sign-extended)
+fn sqlite_call(name, a)  { return dll_calli(sqlite_sym(name), a); }
+fn sqlite_callp(name, a) { return dll_call(sqlite_sym(name), a); }
+
+fn sqlite_errmsg(db) {
+    return ffi_cstr(sqlite_callp("sqlite3_errmsg", [db]));
+}
+
+fn sqlite_open(path) {
+    // Allocate a raw C buffer, copy the path into it, and pass that.
+    // This bypasses the Donky GC entirely.
+    let len = len(path) + 1;
+    let raw_buf = ffi_alloc(len);
+    let i = 0;
+    while i < len(path) {
+        ffi_poke(raw_buf + i, 1, byte_at(path, i));
+        i = i + 1;
+    }
+    ffi_poke(raw_buf + len - 1, 1, 0); // Null terminate
+
+    let out = ffi_alloc(8);
+    let rc = sqlite_call("sqlite3_open", [raw_buf, out]);
+    let db = ffi_peek(out, 8);
+    
+    ffi_free(out);
+    ffi_free(raw_buf); // Free the raw buffer
+    
+    if rc != 0 { return 0; }
+    return db;
+}
+
+fn sqlite_close(db) {
+    sqlite_call("sqlite3_close", [db]);
+    return 0;
+}
+
+fn sqlite_last_id(db) {
+    return sqlite_callp("sqlite3_last_insert_rowid", [db]);
+}
+
+// Run a script of several statements (no parameters, no results).
+fn sqlite_script(db, sql) {
+    let rc = sqlite_call("sqlite3_exec", [db, sql, 0, 0, 0]);
+    if rc != 0 { throw "sqlite: " + sqlite_errmsg(db); }
+    return 0;
+}
+
+fn sqlite_prepare(db, sql) {
+    let out = ffi_alloc(8);
+    let rc = sqlite_call("sqlite3_prepare_v2", [db, sql, -1, out, 0]);
+    let stmt = ffi_peek(out, 8);
+    ffi_free(out);
+    if rc != 0 { throw "sqlite: " + sqlite_errmsg(db); }
+    return stmt;
+}
+
+fn sqlite_bind(db, stmt, params) {
+    if params == 0 { return 0; }
+    let n = len(params);
+    for i in 0..n {
+        let v = params[i];
+        let idx = i + 1;
+        let t = type(v);
+        let rc = 0;
+        if t == "number" {
+            if v == floor(v) {
+                rc = sqlite_call("sqlite3_bind_int64", [stmt, idx, v]);
+            } else {
+                // json_encode round-trips doubles exactly; str() would lose digits
+                rc = sqlite_call("sqlite3_bind_text", [stmt, idx, json_encode(v), -1, -1]);
+            }
+        } else if t == "string" {
+            rc = sqlite_call("sqlite3_bind_text", [stmt, idx, v, -1, -1]);
+        } else if t == "bool" {
+            let bv = 0;
+            if v { bv = 1; }
+            rc = sqlite_call("sqlite3_bind_int64", [stmt, idx, bv]);
+        } else {
+            rc = sqlite_call("sqlite3_bind_int64", [stmt, idx, 0]);
+        }
+        if rc != 0 {
+            let msg = "sqlite: bind failed: " + sqlite_errmsg(db);
+            sqlite_call("sqlite3_finalize", [stmt]);
+            throw msg;
+        }
+    }
+    return 0;
+}
+
+fn sqlite_column(stmt, i) {
+    let t = sqlite_call("sqlite3_column_type", [stmt, i]);
+    if t == 5 { return null; }
+    let s = ffi_cstr(sqlite_callp("sqlite3_column_text", [stmt, i]));
+    if t == 1 { return num(s); }
+    if t == 2 { return num(s); }
+    return s;
+}
+
+// INSERT / UPDATE / DELETE / DDL with optional params. Returns rows changed.
+fn sqlite_exec(db, sql, params) {
+    let stmt = sqlite_prepare(db, sql);
+    if stmt == 0 { return 0; }
+    sqlite_bind(db, stmt, params);
+    let rc = sqlite_call("sqlite3_step", [stmt]);
+    while rc == 100 {
+        rc = sqlite_call("sqlite3_step", [stmt]);
+    }
+    if rc != 101 {
+        let msg = "sqlite: " + sqlite_errmsg(db);
+        sqlite_call("sqlite3_finalize", [stmt]);
+        throw msg;
+    }
+    sqlite_call("sqlite3_finalize", [stmt]);
+    return sqlite_call("sqlite3_changes", [db]);
+}
+
+// SELECT with optional params. Returns an array of maps {column: value}.
+fn sqlite_query(db, sql, params) {
+    let rows = [];
+    let stmt = sqlite_prepare(db, sql);
+    if stmt == 0 { return rows; }
+    sqlite_bind(db, stmt, params);
+    let ncol = sqlite_call("sqlite3_column_count", [stmt]);
+    let names = [];
+    for c in 0..ncol {
+        push(names, ffi_cstr(sqlite_callp("sqlite3_column_name", [stmt, c])));
+    }
+    let rc = sqlite_call("sqlite3_step", [stmt]);
+    while rc == 100 {
+        let row = {};
+        for c in 0..ncol {
+            row[names[c]] = sqlite_column(stmt, c);
+        }
+        push(rows, row);
+        rc = sqlite_call("sqlite3_step", [stmt]);
+    }
+    if rc != 101 {
+        let msg = "sqlite: " + sqlite_errmsg(db);
+        sqlite_call("sqlite3_finalize", [stmt]);
+        throw msg;
+    }
+    sqlite_call("sqlite3_finalize", [stmt]);
+    return rows;
+}

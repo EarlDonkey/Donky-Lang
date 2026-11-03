@@ -508,8 +508,8 @@ impl Compiler {
                 for j in ctx.break_jumps { self.code[j] = PendingOp::Ready(OpCode::Jump(end)); }
                 self.locals = saved;
             }
-            Stmt::Break => { if let Some(ctx) = self.loop_stack.last_mut() { let j = self.code.len(); self.code.push(PendingOp::Ready(OpCode::Jump(0))); ctx.break_jumps.push(j); } }
-            Stmt::Continue => { if let Some(ctx) = self.loop_stack.last_mut() { let j = self.code.len(); self.code.push(PendingOp::Ready(OpCode::Jump(0))); ctx.continue_jumps.push(j); } }
+            Stmt::Break(_) => { if let Some(ctx) = self.loop_stack.last_mut() { let j = self.code.len(); self.code.push(PendingOp::Ready(OpCode::Jump(0))); ctx.break_jumps.push(j); } }
+            Stmt::Continue(_) => { if let Some(ctx) = self.loop_stack.last_mut() { let j = self.code.len(); self.code.push(PendingOp::Ready(OpCode::Jump(0))); ctx.continue_jumps.push(j); } }
             Stmt::Match(target, cases, else_block) => {
                 self.compile_expr(target);
                 let mut end_jumps = Vec::new();
@@ -628,12 +628,12 @@ impl Compiler {
             }
             Expr::FieldAccess(obj, field) => { self.compile_expr(*obj); self.code.push(PendingOp::Ready(OpCode::FieldAccess(field))); }
             Expr::Index(t, i) => { self.compile_expr(*t); self.compile_expr(*i); self.code.push(PendingOp::Ready(OpCode::Index)); }
-            Expr::MethodCall(t, m, args) => {
+            Expr::MethodCall(t, m, args, _) => {
                 self.compile_expr(*t);
                 for a in args.iter().rev() { self.compile_expr(a.clone()); }
                 self.code.push(PendingOp::Ready(OpCode::MethodCall(m, args.len())));
             }
-            Expr::Call(name, args) => {
+            Expr::Call(name, args, _) => {
                 for a in args.iter().rev() { self.compile_expr(a.clone()); }
                 if is_builtin(&name) {
                     self.code.push(PendingOp::Ready(OpCode::Builtin(name, args.len())));

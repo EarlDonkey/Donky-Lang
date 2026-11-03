@@ -1,0 +1,11 @@
+fn main() {
+    print("Testing FFI alloc...");
+    let p = ffi_alloc(16);
+    print("Pointer: " + str(p));
+    ffi_poke(p, 8, 42);
+    let val = ffi_peek(p, 8);
+    print("Value: " + str(val));
+    ffi_free(p);
+    print("Done!");
+}
+main();

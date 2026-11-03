@@ -1,0 +1,6 @@
+import "json.donk";
+
+fn main() {
+    print("Package manager import works!");
+}
+main();

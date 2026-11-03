@@ -156,3 +156,5 @@ fn args_version() {
 
 fn args_wants_help() { return args_flag("help") || args_flag("h"); }
 fn args_wants_version() { return args_flag("version"); }
+
+fn pred(n) { return n - 1; }
