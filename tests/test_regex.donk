@@ -1,0 +1,12 @@
+import "regex.donk";
+
+fn main() {
+    print(re_test("\\d+", "hello 123 world"));
+    let m = re_search("(\\w+)@(\\w+)\\.com", "contact: henri@example.com");
+    print(m["text"]);
+    print(m["groups"][1]);
+    print(re_replace("\\d+", "I have 5 apples and 10 oranges", "NUM"));
+    let parts = re_split(",\\s*", "a, b, c");
+    print(len(parts));
+}
+main();

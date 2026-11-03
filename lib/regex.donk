@@ -1,0 +1,596 @@
+// lib/regex.donk — small backtracking regex engine, pure Donky (no FFI).
+//
+// Supported:  .  ^  $  \b   [abc] [^a-z] [\d.]   \d \D \w \W \s \S   \n \t \r \f \v
+//             ( )  (?: )   |   * + ?   {n} {n,} {n,m}   and lazy forms *? +? ?? {n,m}?
+// Not supported: backreferences, lookaround, flags, unicode classes, \D/\W/\S inside [...].
+// Matching is byte-based (ASCII). `{,n}` is treated as literal text.
+//
+// Public API:
+//   re_compile(pat)               -> compiled regex (any function below also accepts a plain string)
+//   re_test(pat, s)               -> bool, match anywhere
+//   re_match(pat, s)              -> match map or null, anchored at start of s
+//   re_search(pat, s)             -> first match map or null
+//   re_find_iter(pat, s)          -> array of match maps
+//   re_find_all(pat, s)           -> array of matched strings
+//   re_replace(pat, s, repl)      -> replace all;  repl may use $0..$9 for groups
+//   re_replace_first(pat, s, repl)
+//   re_split(pat, s)              -> array of strings
+//   re_escape(s)                  -> s with regex metacharacters escaped
+// A match map is { "start", "end", "text", "groups" }; groups[0] is the whole match, unset groups are null.
+// Errors are thrown as maps: { "type": "RegexError", "message": "..." }.
+
+fn re_fail(msg) {
+    let e = {};
+    e["type"] = "RegexError";
+    e["message"] = msg;
+    throw e;
+}
+
+fn re_append(dst, src) {
+    let i = 0;
+    while i < len(src) { push(dst, src[i]); i = i + 1; }
+}
+
+fn re_is_word(c) {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || c == 95 || (c >= 97 && c <= 122);
+}
+
+// ---------------------------------------------------------------- parser
+// ps = [pattern_bytes, pos, ngroups]
+// AST nodes (arrays):
+//   [1,c] char  [2] any  [3,neg,ranges] class  [7] bol  [8] eol  [10] wordb
+//   [20,items] concat   [21,alts] alternation
+//   [22,node,min,max,greedy] repeat (max -1 = unbounded)   [23,node,group_index] group (-1 = non-capturing)
+
+fn re_shorthand(ch) {
+    // returns [neg, ranges] or [] when ch is not a class shorthand
+    if ch == 100 { return [0, [48, 57]]; }                                   // d
+    if ch == 68  { return [1, [48, 57]]; }                                   // D
+    if ch == 119 { return [0, [48, 57, 65, 90, 95, 95, 97, 122]]; }          // w
+    if ch == 87  { return [1, [48, 57, 65, 90, 95, 95, 97, 122]]; }          // W
+    if ch == 115 { return [0, [32, 32, 9, 13]]; }                            // s
+    if ch == 83  { return [1, [32, 32, 9, 13]]; }                            // S
+    return [];
+}
+
+fn re_esc_char(ch) {
+    if ch == 110 { return 10; }   // n
+    if ch == 116 { return 9; }    // t
+    if ch == 114 { return 13; }   // r
+    if ch == 102 { return 12; }   // f
+    if ch == 118 { return 11; }   // v
+    return ch;
+}
+
+fn re_parse_int(ps) {
+    let p = ps[0];
+    let n = len(p);
+    let start = ps[1];
+    let v = 0;
+    while ps[1] < n {
+        let d = p[ps[1]];
+        if d < 48 || d > 57 { break; }
+        v = v * 10 + (d - 48);
+        ps[1] = ps[1] + 1;
+    }
+    if ps[1] == start { return -1; }
+    return v;
+}
+
+fn re_parse_class(ps) {
+    let p = ps[0];
+    let n = len(p);
+    let neg = 0;
+    if ps[1] < n {
+        if p[ps[1]] == 94 { neg = 1; ps[1] = ps[1] + 1; }
+    }
+    let ranges = [];
+    let first = true;
+    while true {
+        if ps[1] >= n { re_fail("unterminated character class"); }
+        let c = p[ps[1]];
+        if c == 93 && !first { ps[1] = ps[1] + 1; break; }
+        first = false;
+        let lo = 0;
+        if c == 92 {
+            ps[1] = ps[1] + 1;
+            if ps[1] >= n { re_fail("trailing backslash"); }
+            let e = p[ps[1]];
+            ps[1] = ps[1] + 1;
+            let sh = re_shorthand(e);
+            if len(sh) > 0 {
+                if sh[0] == 1 { re_fail("negated shorthand inside [...] is not supported"); }
+                re_append(ranges, sh[1]);
+                continue;
+            }
+            lo = re_esc_char(e);
+        } else {
+            lo = c;
+            ps[1] = ps[1] + 1;
+        }
+        let hi = lo;
+        if ps[1] + 1 < n {
+            if p[ps[1]] == 45 && p[ps[1] + 1] != 93 {
+                ps[1] = ps[1] + 1;
+                let c2 = p[ps[1]];
+                if c2 == 92 {
+                    ps[1] = ps[1] + 1;
+                    if ps[1] >= n { re_fail("trailing backslash"); }
+                    hi = re_esc_char(p[ps[1]]);
+                    ps[1] = ps[1] + 1;
+                } else {
+                    hi = c2;
+                    ps[1] = ps[1] + 1;
+                }
+                if hi < lo { re_fail("bad range in character class"); }
+            }
+        }
+        push(ranges, lo);
+        push(ranges, hi);
+    }
+    return [3, neg, ranges];
+}
+
+fn re_parse_atom(ps) {
+    let p = ps[0];
+    let n = len(p);
+    let c = p[ps[1]];
+    ps[1] = ps[1] + 1;
+    if c == 46 { return [2]; }        // .
+    if c == 94 { return [7]; }        // ^
+    if c == 36 { return [8]; }        // $
+    if c == 91 { return re_parse_class(ps); }   // [
+    if c == 40 {                      // (
+        let idx = -1;
+        let noncap = false;
+        if ps[1] + 1 < n {
+            if p[ps[1]] == 63 && p[ps[1] + 1] == 58 { noncap = true; }
+        }
+        if noncap {
+            ps[1] = ps[1] + 2;
+        } else {
+            ps[2] = ps[2] + 1;
+            idx = ps[2];
+        }
+        let inner = re_parse_alt(ps);
+        if ps[1] >= n { re_fail("missing )"); }
+        if p[ps[1]] != 41 { re_fail("missing )"); }
+        ps[1] = ps[1] + 1;
+        return [23, inner, idx];
+    }
+    if c == 92 {                      // backslash
+        if ps[1] >= n { re_fail("trailing backslash"); }
+        let e = p[ps[1]];
+        ps[1] = ps[1] + 1;
+        if e == 98 { return [10]; }   // \b
+        let sh = re_shorthand(e);
+        if len(sh) > 0 { return [3, sh[0], sh[1]]; }
+        return [1, re_esc_char(e)];
+    }
+    if c == 42 || c == 43 || c == 63 { re_fail("nothing to repeat"); }
+    return [1, c];
+}
+
+fn re_parse_quant(ps, atom) {
+    let p = ps[0];
+    let n = len(p);
+    if ps[1] >= n { return atom; }
+    let c = p[ps[1]];
+    let mn = -1;
+    let mx = -1;
+    if c == 42 { mn = 0; mx = -1; ps[1] = ps[1] + 1; }          // *
+    else if c == 43 { mn = 1; mx = -1; ps[1] = ps[1] + 1; }     // +
+    else if c == 63 { mn = 0; mx = 1; ps[1] = ps[1] + 1; }      // ?
+    else if c == 123 {                                          // {
+        let save = ps[1];
+        ps[1] = ps[1] + 1;
+        let a = re_parse_int(ps);
+        let ok = false;
+        if a >= 0 && ps[1] < n {
+            if p[ps[1]] == 125 {
+                mn = a; mx = a; ps[1] = ps[1] + 1; ok = true;
+            } else if p[ps[1]] == 44 {
+                ps[1] = ps[1] + 1;
+                let b = re_parse_int(ps);
+                if ps[1] < n {
+                    if p[ps[1]] == 125 {
+                        mn = a; mx = b; ps[1] = ps[1] + 1; ok = true;
+                    }
+                }
+            }
+        }
+        if !ok { ps[1] = save; return atom; }
+        if mx >= 0 && mx < mn { re_fail("bad repeat range"); }
+        if mn > 1000 || mx > 1000 { re_fail("repeat count too large"); }
+    } else {
+        return atom;
+    }
+    let greedy = 1;
+    if ps[1] < n {
+        if p[ps[1]] == 63 { greedy = 0; ps[1] = ps[1] + 1; }
+    }
+    return [22, atom, mn, mx, greedy];
+}
+
+fn re_parse_seq(ps) {
+    let p = ps[0];
+    let n = len(p);
+    let items = [];
+    while ps[1] < n {
+        let c = p[ps[1]];
+        if c == 124 || c == 41 { break; }      // | )
+        let atom = re_parse_atom(ps);
+        push(items, re_parse_quant(ps, atom));
+    }
+    return [20, items];
+}
+
+fn re_parse_alt(ps) {
+    let p = ps[0];
+    let n = len(p);
+    let alts = [];
+    push(alts, re_parse_seq(ps));
+    while ps[1] < n {
+        if p[ps[1]] != 124 { break; }
+        ps[1] = ps[1] + 1;
+        push(alts, re_parse_seq(ps));
+    }
+    if len(alts) == 1 { return alts[0]; }
+    return [21, alts];
+}
+
+// ---------------------------------------------------------------- emitter
+// Program = three parallel arrays ops/xs/ys.  em = [ops, xs, ys, next_register_slot]
+//   1 CHAR x    2 ANY    3 CLASS x=neg y=ranges    4 SPLIT x=preferred y=other
+//   5 JMP x     6 SAVE x(slot)   7 BOL   8 EOL   9 MATCH   10 WORDB   13 PROGRESS x(slot)
+
+fn re_emit(em, op, x, y) {
+    push(em[0], op);
+    push(em[1], x);
+    push(em[2], y);
+    return len(em[0]) - 1;
+}
+
+fn re_emit_node(em, node) {
+    let k = node[0];
+    if k == 1  { re_emit(em, 1, node[1], 0); return 0; }
+    if k == 2  { re_emit(em, 2, 0, 0); return 0; }
+    if k == 3  { re_emit(em, 3, node[1], node[2]); return 0; }
+    if k == 7  { re_emit(em, 7, 0, 0); return 0; }
+    if k == 8  { re_emit(em, 8, 0, 0); return 0; }
+    if k == 10 { re_emit(em, 10, 0, 0); return 0; }
+    if k == 20 {
+        let items = node[1];
+        let i = 0;
+        while i < len(items) { re_emit_node(em, items[i]); i = i + 1; }
+        return 0;
+    }
+    if k == 21 {
+        let alts = node[1];
+        let jumps = [];
+        let ai = 0;
+        while ai < len(alts) - 1 {
+            let sp = re_emit(em, 4, 0, 0);
+            em[1][sp] = len(em[0]);
+            re_emit_node(em, alts[ai]);
+            push(jumps, re_emit(em, 5, 0, 0));
+            em[2][sp] = len(em[0]);
+            ai = ai + 1;
+        }
+        re_emit_node(em, alts[len(alts) - 1]);
+        let ji = 0;
+        while ji < len(jumps) { em[1][jumps[ji]] = len(em[0]); ji = ji + 1; }
+        return 0;
+    }
+    if k == 23 {
+        let gidx = node[2];
+        if gidx >= 0 { re_emit(em, 6, 2 * gidx, 0); }
+        re_emit_node(em, node[1]);
+        if gidx >= 0 { re_emit(em, 6, 2 * gidx + 1, 0); }
+        return 0;
+    }
+    if k == 22 {
+        let sub = node[1];
+        let mn = node[2];
+        let mx = node[3];
+        let greedy = node[4];
+        let ci = 0;
+        while ci < mn { re_emit_node(em, sub); ci = ci + 1; }
+        if mx == -1 {
+            let l1 = re_emit(em, 4, 0, 0);
+            let reg = em[3];
+            em[3] = em[3] + 1;
+            let body = len(em[0]);
+            re_emit(em, 6, reg, 0);
+            re_emit_node(em, sub);
+            re_emit(em, 13, reg, 0);
+            re_emit(em, 5, l1, 0);
+            let endpc = len(em[0]);
+            if greedy == 1 { em[1][l1] = body; em[2][l1] = endpc; }
+            else { em[1][l1] = endpc; em[2][l1] = body; }
+        } else {
+            let splits = [];
+            let oi = 0;
+            while oi < mx - mn {
+                let s2 = re_emit(em, 4, 0, 0);
+                push(splits, s2);
+                if greedy == 1 { em[1][s2] = len(em[0]); } else { em[2][s2] = len(em[0]); }
+                re_emit_node(em, sub);
+                oi = oi + 1;
+            }
+            let endpc2 = len(em[0]);
+            let si = 0;
+            while si < len(splits) {
+                if greedy == 1 { em[2][splits[si]] = endpc2; } else { em[1][splits[si]] = endpc2; }
+                si = si + 1;
+            }
+        }
+        return 0;
+    }
+    re_fail("internal error: unknown node");
+}
+
+fn re_compile(pat) {
+    if type(pat) == "map" { return pat; }
+    let pb = [];
+    let n = len(pat);
+    let i = 0;
+    while i < n { push(pb, byte_at(pat, i)); i = i + 1; }
+    let ps = [pb, 0, 0];
+    let tree = re_parse_alt(ps);
+    if ps[1] < len(pb) { re_fail("unmatched )"); }
+    let ng = ps[2];
+    let em = [[], [], [], 2 * (ng + 1)];
+    re_emit(em, 6, 0, 0);
+    re_emit_node(em, tree);
+    re_emit(em, 6, 1, 0);
+    re_emit(em, 9, 0, 0);
+    let re = {};
+    re["ops"] = em[0];
+    re["xs"] = em[1];
+    re["ys"] = em[2];
+    re["ng"] = ng;
+    re["nslots"] = em[3];
+    return re;
+}
+
+// ---------------------------------------------------------------- matcher
+fn re_in_ranges(r, c) {
+    let i = 0;
+    let n = len(r);
+    while i < n {
+        if c >= r[i] && c <= r[i + 1] { return true; }
+        i = i + 2;
+    }
+    return false;
+}
+
+// m = [ops, xs, ys, text, n, caps]
+fn re_run(m, pc, sp) {
+    let ops = m[0];
+    let xs = m[1];
+    let ys = m[2];
+    let s = m[3];
+    let n = m[4];
+    let caps = m[5];
+    while true {
+        let op = ops[pc];
+        if op == 1 {
+            if sp < n {
+                if byte_at(s, sp) == xs[pc] { pc = pc + 1; sp = sp + 1; continue; }
+            }
+            return false;
+        }
+        if op == 2 {
+            if sp < n {
+                if byte_at(s, sp) != 10 { pc = pc + 1; sp = sp + 1; continue; }
+            }
+            return false;
+        }
+        if op == 3 {
+            if sp < n {
+                let hit = re_in_ranges(ys[pc], byte_at(s, sp));
+                if xs[pc] == 1 { hit = !hit; }
+                if hit { pc = pc + 1; sp = sp + 1; continue; }
+            }
+            return false;
+        }
+        if op == 4 {
+            if re_run(m, xs[pc], sp) { return true; }
+            pc = ys[pc];
+            continue;
+        }
+        if op == 5 { pc = xs[pc]; continue; }
+        if op == 6 {
+            let slot = xs[pc];
+            let old = caps[slot];
+            caps[slot] = sp;
+            if re_run(m, pc + 1, sp) { return true; }
+            caps[slot] = old;
+            return false;
+        }
+        if op == 7 {
+            if sp == 0 { pc = pc + 1; continue; }
+            return false;
+        }
+        if op == 8 {
+            if sp == n { pc = pc + 1; continue; }
+            return false;
+        }
+        if op == 9 { return true; }
+        if op == 10 {
+            let wa = false;
+            let wb = false;
+            if sp > 0 { wa = re_is_word(byte_at(s, sp - 1)); }
+            if sp < n { wb = re_is_word(byte_at(s, sp)); }
+            if wa != wb { pc = pc + 1; continue; }
+            return false;
+        }
+        if op == 13 {
+            if caps[xs[pc]] == sp { return false; }
+            pc = pc + 1;
+            continue;
+        }
+        re_fail("internal error: bad opcode");
+    }
+}
+
+// Returns the capture-slot array on success, [] on failure.
+fn re_exec(re, s, from, anchored) {
+    let n = len(s);
+    let start = from;
+    while start <= n {
+        let caps = [];
+        let k = 0;
+        while k < re["nslots"] { push(caps, -1); k = k + 1; }
+        let m = [re["ops"], re["xs"], re["ys"], s, n, caps];
+        if re_run(m, 0, start) { return caps; }
+        if anchored { return []; }
+        start = start + 1;
+    }
+    return [];
+}
+
+// ---------------------------------------------------------------- public API
+fn re_make_match(re, s, caps) {
+    let groups = [];
+    let g = 0;
+    while g <= re["ng"] {
+        let ga = caps[2 * g];
+        let gb = caps[2 * g + 1];
+        if ga >= 0 && gb >= 0 { push(groups, byte_substr(s, ga, gb)); }
+        else { push(groups, null); }
+        g = g + 1;
+    }
+    let mt = {};
+    mt["start"] = caps[0];
+    mt["end"] = caps[1];
+    mt["text"] = groups[0];
+    mt["groups"] = groups;
+    return mt;
+}
+
+fn re_search(pat, s) {
+    let re = re_compile(pat);
+    let caps = re_exec(re, s, 0, false);
+    if len(caps) == 0 { return null; }
+    return re_make_match(re, s, caps);
+}
+
+fn re_match(pat, s) {
+    let re = re_compile(pat);
+    let caps = re_exec(re, s, 0, true);
+    if len(caps) == 0 { return null; }
+    return re_make_match(re, s, caps);
+}
+
+fn re_test(pat, s) {
+    let re = re_compile(pat);
+    let caps = re_exec(re, s, 0, false);
+    return len(caps) > 0;
+}
+
+fn re_find_iter(pat, s) {
+    let re = re_compile(pat);
+    let n = len(s);
+    let out = [];
+    let pos = 0;
+    while pos <= n {
+        let caps = re_exec(re, s, pos, false);
+        if len(caps) == 0 { break; }
+        push(out, re_make_match(re, s, caps));
+        if caps[1] == caps[0] { pos = caps[1] + 1; } else { pos = caps[1]; }
+    }
+    return out;
+}
+
+fn re_find_all(pat, s) {
+    let ms = re_find_iter(pat, s);
+    let out = [];
+    let i = 0;
+    while i < len(ms) { push(out, ms[i]["text"]); i = i + 1; }
+    return out;
+}
+
+// Expands $0..$9 in repl using the groups of match mt.
+fn re_expand(repl, mt) {
+    let n = len(repl);
+    let parts = [];
+    let run_start = 0;
+    let i = 0;
+    while i < n {
+        if byte_at(repl, i) == 36 && i + 1 < n {
+            let d = byte_at(repl, i + 1);
+            if d >= 48 && d <= 57 {
+                if i > run_start { push(parts, byte_substr(repl, run_start, i)); }
+                let gi = d - 48;
+                if gi < len(mt["groups"]) {
+                    let gt = mt["groups"][gi];
+                    if type(gt) == "string" { push(parts, gt); }
+                }
+                i = i + 2;
+                run_start = i;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    if n > run_start { push(parts, byte_substr(repl, run_start, n)); }
+    return join(parts, "");
+}
+
+fn re_replace_impl(pat, s, repl, limit) {
+    let ms = re_find_iter(pat, s);
+    let parts = [];
+    let last = 0;
+    let i = 0;
+    while i < len(ms) {
+        if limit > 0 && i >= limit { break; }
+        let mt = ms[i];
+        if mt["start"] > last { push(parts, byte_substr(s, last, mt["start"])); }
+        push(parts, re_expand(repl, mt));
+        last = mt["end"];
+        i = i + 1;
+    }
+    if len(s) > last { push(parts, byte_substr(s, last, len(s))); }
+    return join(parts, "");
+}
+
+fn re_replace(pat, s, repl)       { return re_replace_impl(pat, s, repl, 0); }
+fn re_replace_first(pat, s, repl) { return re_replace_impl(pat, s, repl, 1); }
+
+fn re_split(pat, s) {
+    let ms = re_find_iter(pat, s);
+    let out = [];
+    let last = 0;
+    let i = 0;
+    while i < len(ms) {
+        let mt = ms[i];
+        if mt["end"] > mt["start"] {              // ignore empty matches, like most split() implementations
+            push(out, byte_substr(s, last, mt["start"]));
+            last = mt["end"];
+        }
+        i = i + 1;
+    }
+    push(out, byte_substr(s, last, len(s)));
+    return out;
+}
+
+fn re_escape(s) {
+    let specials = [46, 94, 36, 42, 43, 63, 40, 41, 91, 93, 123, 125, 124, 92, 45];   // . ^ $ * + ? ( ) [ ] { } | \ -
+    let out = [];
+    let i = 0;
+    while i < len(s) {
+        let c = byte_at(s, i);
+        let j = 0;
+        let hit = false;
+        while j < len(specials) {
+            if specials[j] == c { hit = true; break; }
+            j = j + 1;
+        }
+        if hit { push(out, 92); }
+        push(out, c);
+        i = i + 1;
+    }
+    return bytes_to_str(out);
+}
