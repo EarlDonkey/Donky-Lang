@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -5,6 +11,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#ifdef _WIN32
 #include <conio.h>
 
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +36,81 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "uuid.lib")
+#else
+#include <inttypes.h>
+#include <setjmp.h>
+#include <wchar.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <termios.h>
+#include <dirent.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <curl/curl.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <libproc.h>
+#endif
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+// ---- Win32 -> POSIX shims: lets the shared code below compile unchanged ----
+typedef int       SOCKET;
+#define INVALID_SOCKET  (-1)
+#define SOCKET_ERROR    (-1)
+#define closesocket(s)  close(s)
+
+typedef uint32_t  DWORD;
+typedef uint64_t  ULONGLONG;
+
+typedef void*     HMODULE;
+typedef void*     FARPROC;
+#define LoadLibraryA(n)       dlopen((n), RTLD_NOW)
+#define GetProcAddress(h, n)  dlsym((h), (n))
+
+// gc_lock must be recursive (CRITICAL_SECTION is)
+typedef pthread_mutex_t CRITICAL_SECTION;
+static inline void InitializeCriticalSection(CRITICAL_SECTION* m) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(m, &a);
+    pthread_mutexattr_destroy(&a);
+}
+#define EnterCriticalSection(m) pthread_mutex_lock(m)
+#define LeaveCriticalSection(m) pthread_mutex_unlock(m)
+
+static inline void Sleep(DWORD ms) {
+    struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+// ms since boot, like the Win32 call of the same name
+static inline ULONGLONG GetTickCount64(void) {
+    struct timespec ts;
+#ifdef CLOCK_BOOTTIME
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)(ts.tv_nsec / 1000000L);
+}
+#endif
 
 // --- NaN Boxing Tag Definitions ---
 #define TAG_MASK 0xFFF8000000000000ULL
@@ -42,7 +124,11 @@ static int rand_seeded = 0;
 
 #define MAX_THREADS 64
 static volatile int active_threads = 0;
+#ifdef _WIN32
 static HANDLE active_threads_handles[MAX_THREADS];
+#else
+static int active_thread_used[MAX_THREADS];   // pthread_t is opaque: track slot occupancy separately
+#endif
 
 // --- Garbage Collector & Thread Synchronization ---
 CRITICAL_SECTION gc_lock;
@@ -108,7 +194,12 @@ static GCChunk* gc_find_chunk(void* p) {
 static GCChunk* gc_chunk_new(size_t span, int dedicated) {
     size_t cap = dedicated ? ((span + 4095) & ~(size_t)4095) : GC_CHUNK_SIZE;
     GCChunk*  c    = (GCChunk*)malloc(sizeof(GCChunk));
+#ifdef _WIN32
     char*     mem  = (char*)VirtualAlloc(NULL, cap, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    char*     mem  = (char*)mmap(NULL, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == (char*)MAP_FAILED) mem = NULL;
+#endif
     uint64_t* bits = (uint64_t*)calloc((cap >> 9) + 1, sizeof(uint64_t));
     if (!c || !mem || !bits) gc_oom();
     c->base = mem; c->cap = cap; c->used = 0; c->starts = bits;
@@ -284,6 +375,7 @@ uint64_t donky_array_push(uint64_t arr_val, uint64_t val) {
 
 // --- Extended System Metrics ---
 
+#ifdef _WIN32
 uint64_t donky_kill_process(uint64_t pid_val) {
     if (!is_number(pid_val)) return make_number(0.0);
     DWORD pid = (DWORD)as_number(pid_val);
@@ -293,18 +385,34 @@ uint64_t donky_kill_process(uint64_t pid_val) {
     CloseHandle(hProc);
     return make_number(res ? 1.0 : 0.0); 
 }
+#else
+uint64_t donky_kill_process(uint64_t pid_val) {
+    if (!is_number(pid_val)) return make_number(0.0);
+    pid_t pid = (pid_t)as_number(pid_val);
+    if (pid <= 1) return make_number(0.0);   // never signal init, our process group (0) or every process (-1)
+    return make_number(kill(pid, SIGKILL) == 0 ? 1.0 : 0.0);
+}
+#endif
 
 uint64_t donky_get_uptime() {
     ULONGLONG ms = GetTickCount64();
     return make_number((double)(ms / 1000));
 }
 
+#ifdef _WIN32
 uint64_t donky_get_cpu_cores() {
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     return make_number((double)sysInfo.dwNumberOfProcessors);
 }
+#else
+uint64_t donky_get_cpu_cores() {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return make_number((double)(n > 0 ? n : 1));
+}
+#endif
 
+#ifdef _WIN32
 uint64_t donky_get_disk_info() {
     ULARGE_INTEGER freeBytes, totalBytes, totalFreeBytes;
     if (GetDiskFreeSpaceExA("C:\\", &freeBytes, &totalBytes, &totalFreeBytes)) {
@@ -316,6 +424,22 @@ uint64_t donky_get_disk_info() {
     }
     return donky_alloc_map();
 }
+#else
+uint64_t donky_get_disk_info() {
+    struct statvfs sv;
+    if (statvfs("/", &sv) == 0) {
+        double gb    = 1024.0 * 1024.0 * 1024.0;
+        double total = (double)sv.f_blocks * (double)sv.f_frsize / gb;
+        double free_ = (double)sv.f_bfree  * (double)sv.f_frsize / gb;
+        uint64_t m = donky_alloc_map();
+        donky_map_set(m, donky_alloc_string("total_gb"), make_number(total));
+        donky_map_set(m, donky_alloc_string("free_gb"),  make_number(free_));
+        donky_map_set(m, donky_alloc_string("used_gb"),  make_number(total - free_));
+        return m;
+    }
+    return donky_alloc_map();
+}
+#endif
 
 uint64_t donky_alloc_map() {
     Map* map = gc_malloc(sizeof(Map));
@@ -424,7 +548,11 @@ void gc_sweep() {
             *link = c->next;
             if (gc_cur == c) gc_cur = NULL;
             gc_bytes_reserved -= c->cap;
+#ifdef _WIN32
             VirtualFree(c->base, 0, MEM_RELEASE);
+#else
+            munmap(c->base, c->cap);
+#endif
             free(c->starts);
             free(c);
             continue;
@@ -440,6 +568,7 @@ void gc_sweep() {
     gc_bytes_allocated = live;
 }
 
+#ifdef _WIN32
 void gc_mark_stack() {
     jmp_buf env;
     setjmp(env); 
@@ -458,6 +587,48 @@ void gc_mark_stack() {
         stack_ptr++;
     }
 }
+#else
+// Highest address of the calling thread's stack (cached per thread).
+static uintptr_t dk_stack_high(void) {
+    static __thread uintptr_t cached = 0;
+    if (cached) return cached;
+#if defined(__APPLE__)
+    cached = (uintptr_t)pthread_get_stackaddr_np(pthread_self());   // returns the TOP of the stack
+#else
+    pthread_attr_t attr; void* addr = NULL; size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        pthread_attr_getstack(&attr, &addr, &size);
+        pthread_attr_destroy(&attr);
+        cached = (uintptr_t)addr + size;
+    }
+#endif
+    return cached;
+}
+
+// Scans from its own frame (below every caller local / spilled register) up to the stack top.
+static __attribute__((noinline)) void dk_gc_scan(uintptr_t high) {
+    volatile uintptr_t here = 0;
+    uintptr_t* stack_ptr = (uintptr_t*)&here;
+    uintptr_t* top = (uintptr_t*)high;
+    while (stack_ptr < top) {
+        uint64_t val = *stack_ptr;
+        if ((val & TAG_MASK) == TAG_BASE && gc_valid_object(val)) gc_mark(val);
+        stack_ptr++;
+    }
+}
+
+void gc_mark_stack() {
+    jmp_buf env;
+    setjmp(env);                       // dumps callee-saved registers into this frame
+#if defined(__GNUC__) && !defined(__clang__)
+    __builtin_unwind_init();           // glibc mangles some jmp_buf slots; this spills ALL callee-saved regs
+#endif
+    uintptr_t high = dk_stack_high();
+    if (!high) return;
+    dk_gc_scan(high);
+    __asm__ volatile("" : : "r"(&env) : "memory");   // keep `env` alive in the frame
+}
+#endif
 
 void gc_collect() {
     // Only the calling thread's stack is scanned. With other threads alive their
@@ -883,9 +1054,35 @@ uint64_t donky_char_code(uint64_t s_val) {
 }
 
 // --- Console Native Functions ---
+#ifdef _WIN32
 uint64_t donky_cls() { system("cls"); return 0; }
 uint64_t donky_getch() { return make_number((double)_getch()); }
 uint64_t donky_kbhit() { return make_number(_kbhit() ? 1.0 : 0.0); }
+#else
+uint64_t donky_cls() { fputs("\033[2J\033[H", stdout); fflush(stdout); return 0; }
+
+// Blocking single-key read, no echo, no Enter needed (like _getch).
+uint64_t donky_getch() {
+    struct termios o, n; unsigned char ch = 0;
+    int tty = (tcgetattr(STDIN_FILENO, &o) == 0);
+    if (tty) { n = o; n.c_lflag &= ~(tcflag_t)(ICANON | ECHO); n.c_cc[VMIN] = 1; n.c_cc[VTIME] = 0; tcsetattr(STDIN_FILENO, TCSANOW, &n); }
+    ssize_t r = read(STDIN_FILENO, &ch, 1);
+    if (tty) tcsetattr(STDIN_FILENO, TCSANOW, &o);
+    return make_number(r == 1 ? (double)ch : -1.0);
+}
+
+// Non-blocking "is a key waiting?" (like _kbhit).
+uint64_t donky_kbhit() {
+    struct termios o, n;
+    int tty = (tcgetattr(STDIN_FILENO, &o) == 0);
+    if (tty) { n = o; n.c_lflag &= ~(tcflag_t)(ICANON | ECHO); n.c_cc[VMIN] = 0; n.c_cc[VTIME] = 0; tcsetattr(STDIN_FILENO, TCSANOW, &n); }
+    fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = {0, 0};
+    int ready = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    if (tty) tcsetattr(STDIN_FILENO, TCSANOW, &o);
+    return make_number(ready > 0 ? 1.0 : 0.0);
+}
+#endif
 
 uint64_t donky_input(uint64_t prompt_val) {
     if (get_tag(prompt_val) == TAG_STRING) {
@@ -1359,6 +1556,7 @@ uint64_t donky_ffi_cstr(uint64_t ptr_val) {
 }
 
 // --- System Telemetry Metrics ---
+#ifdef _WIN32
 uint64_t donky_get_total_mem() {
     MEMORYSTATUSEX memInfo;
     memInfo.dwLength = sizeof(MEMORYSTATUSEX);
@@ -1434,6 +1632,137 @@ uint64_t donky_get_cpu_usage() {
     double usage = 100.0 - ((double)idle_diff / (double)total_diff * 100.0);
     return make_number(usage < 0.0 ? 0.0 : (usage > 100.0 ? 100.0 : usage));
 }
+#else
+#if defined(__APPLE__)
+// ---------------- macOS ----------------
+static uint64_t dk_mac_memsize(void) {
+    uint64_t v = 0; size_t len = sizeof v;
+    if (sysctlbyname("hw.memsize", &v, &len, NULL, 0) != 0) return 0;
+    return v;
+}
+uint64_t donky_get_total_mem() { return make_number((double)(dk_mac_memsize() / 1024 / 1024)); }
+uint64_t donky_get_used_mem() {
+    uint64_t total = dk_mac_memsize();
+    vm_statistics64_data_t vm; mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (!total || host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS)
+        return make_number(0.0);
+    vm_size_t pg = 0; host_page_size(mach_host_self(), &pg);
+    uint64_t avail = ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) * (uint64_t)pg;
+    return make_number((double)((total > avail ? total - avail : 0) / 1024 / 1024));
+}
+uint64_t donky_get_processes() {
+    uint64_t arr = donky_alloc_array();
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (bytes <= 0) return arr;
+    int cap = bytes + 64 * (int)sizeof(pid_t);
+    pid_t* pids = (pid_t*)malloc((size_t)cap);
+    if (!pids) return arr;
+    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, cap);
+    int n = got > 0 ? got / (int)sizeof(pid_t) : 0;
+    for (int i = 0; i < n; i++) {
+        if (pids[i] <= 0) continue;
+        char name[256];
+        if (proc_name(pids[i], name, sizeof name) <= 0) continue;
+        struct proc_taskinfo ti;
+        double mem = 0.0, thr = 0.0;
+        if (proc_pidinfo(pids[i], PROC_PIDTASKINFO, 0, &ti, sizeof ti) == (int)sizeof ti) {
+            mem = (double)(ti.pti_resident_size / 1024 / 1024); thr = (double)ti.pti_threadnum;
+        }
+        uint64_t m = donky_alloc_map();
+        donky_map_set(m, donky_alloc_string("pid"),     make_number((double)pids[i]));
+        donky_map_set(m, donky_alloc_string("name"),    donky_alloc_string(name));
+        donky_map_set(m, donky_alloc_string("threads"), make_number(thr));
+        donky_map_set(m, donky_alloc_string("mem"),     make_number(mem));
+        donky_array_push(arr, m);
+    }
+    free(pids);
+    return arr;
+}
+static int dk_cpu_ticks(uint64_t* idle, uint64_t* total) {
+    host_cpu_load_info_data_t ci; mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&ci, &cnt) != KERN_SUCCESS) return 0;
+    *idle  = ci.cpu_ticks[CPU_STATE_IDLE];
+    *total = (uint64_t)ci.cpu_ticks[CPU_STATE_USER] + ci.cpu_ticks[CPU_STATE_SYSTEM]
+           + ci.cpu_ticks[CPU_STATE_IDLE] + ci.cpu_ticks[CPU_STATE_NICE];
+    return 1;
+}
+#else
+// ---------------- Linux (/proc) ----------------
+static uint64_t dk_meminfo_kb(const char* key) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256]; size_t kl = strlen(key); uint64_t v = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, kl) == 0 && line[kl] == ':') { v = strtoull(line + kl + 1, NULL, 10); break; }
+    }
+    fclose(f);
+    return v;
+}
+uint64_t donky_get_total_mem() { return make_number((double)(dk_meminfo_kb("MemTotal") / 1024)); }
+uint64_t donky_get_used_mem() {
+    uint64_t total = dk_meminfo_kb("MemTotal"), avail = dk_meminfo_kb("MemAvailable");
+    return make_number((double)((total > avail ? total - avail : 0) / 1024));
+}
+uint64_t donky_get_processes() {
+    uint64_t arr = donky_alloc_array();
+    DIR* d = opendir("/proc");
+    if (!d) return arr;
+    long pagesz = sysconf(_SC_PAGESIZE);
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        char path[300], buf[1024];
+        snprintf(path, sizeof path, "/proc/%s/stat", de->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f);
+        buf[n] = 0;
+        char* lp = strchr(buf, '(');          // comm may contain spaces/parens: first '(' .. last ')'
+        char* rp = strrchr(buf, ')');
+        if (!lp || !rp || rp < lp) continue;
+        *rp = 0;
+        char name[64]; snprintf(name, sizeof name, "%s", lp + 1);
+        char state = 0; long nthreads = 0;
+        sscanf(rp + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %ld", &state, &nthreads);
+        double mem = 0.0;
+        snprintf(path, sizeof path, "/proc/%s/statm", de->d_name);
+        f = fopen(path, "r");
+        if (f) { unsigned long sz = 0, rss = 0; if (fscanf(f, "%lu %lu", &sz, &rss) == 2) mem = (double)((uint64_t)rss * (uint64_t)pagesz / 1024 / 1024); fclose(f); }
+        uint64_t m = donky_alloc_map();
+        donky_map_set(m, donky_alloc_string("pid"),     make_number((double)atoi(de->d_name)));
+        donky_map_set(m, donky_alloc_string("name"),    donky_alloc_string(name));
+        donky_map_set(m, donky_alloc_string("threads"), make_number((double)nthreads));
+        donky_map_set(m, donky_alloc_string("mem"),     make_number(mem));
+        donky_array_push(arr, m);
+    }
+    closedir(d);
+    return arr;
+}
+static int dk_cpu_ticks(uint64_t* idle, uint64_t* total) {
+    FILE* f = fopen("/proc/stat", "r");
+    if (!f) return 0;
+    unsigned long long u = 0, n = 0, s = 0, i = 0, w = 0, irq = 0, sirq = 0, st = 0;
+    int ok = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &s, &i, &w, &irq, &sirq, &st) >= 4;
+    fclose(f);
+    if (!ok) return 0;
+    *idle  = i + w;
+    *total = u + n + s + i + w + irq + sirq + st;
+    return 1;
+}
+#endif
+
+uint64_t donky_get_cpu_usage() {
+    static uint64_t prev_idle = 0, prev_total = 0;
+    uint64_t idle, total;
+    if (!dk_cpu_ticks(&idle, &total)) return make_number(0.0);
+    if (prev_total == 0) { prev_idle = idle; prev_total = total; return make_number(0.0); }
+    uint64_t idle_diff = idle - prev_idle, total_diff = total - prev_total;
+    prev_idle = idle; prev_total = total;
+    if (total_diff == 0) return make_number(0.0);
+    double usage = 100.0 - ((double)idle_diff / (double)total_diff * 100.0);
+    return make_number(usage < 0.0 ? 0.0 : (usage > 100.0 ? 100.0 : usage));
+}
+#endif
 
 // --- Dynamic Socket API ---
 #define DK_MAX_SOCK 128
@@ -1460,12 +1789,21 @@ static SOCKET dk_socket_from_id(uint64_t v) {
     return g_socks[id - 1];
 }
 
+#ifdef _WIN32
 static void dk_ws_init(void) {
     if (g_socks_init) return;
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
     for (int i = 0; i < DK_MAX_SOCK; i++) g_socks[i] = 0;
     g_socks_init = 1;
 }
+#else
+static void dk_ws_init(void) {
+    if (g_socks_init) return;
+    signal(SIGPIPE, SIG_IGN);   // send() to a closed peer must return -1, not kill the process
+    for (int i = 0; i < DK_MAX_SOCK; i++) g_socks[i] = 0;
+    g_socks_init = 1;
+}
+#endif
 
 uint64_t donky_tcp_listen(uint64_t port_val) {
     dk_ws_init();
@@ -1537,6 +1875,7 @@ uint64_t donky_tcp_close(uint64_t client_val) {
     return 0;
 }
 
+#ifdef _WIN32
 uint64_t donky_http_get(uint64_t url_val) {
     if (get_tag(url_val) != TAG_STRING) return donky_alloc_string("");
     char* url = (char*)as_index(url_val);
@@ -1591,6 +1930,50 @@ uint64_t donky_http_get(uint64_t url_val) {
     if (response_body) free(response_body);
     return result;
 }
+#else
+// ---- libcurl helpers (shared by http_get and http_request) ----
+typedef struct { char* b; size_t n; } DkCurlBuf;
+
+static size_t dk_curl_write_cb(char* p, size_t sz, size_t nm, void* ud) {
+    DkCurlBuf* cb = (DkCurlBuf*)ud;
+    size_t add = sz * nm;
+    char* nb = (char*)realloc(cb->b, cb->n + add + 1);
+    if (!nb) return 0;                       // abort transfer
+    memcpy(nb + cb->n, p, add);
+    cb->n += add; nb[cb->n] = 0; cb->b = nb;
+    return add;
+}
+
+static pthread_once_t dk_curl_once = PTHREAD_ONCE_INIT;
+static void dk_curl_global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
+
+static CURL* dk_curl_new(const char* url, DkCurlBuf* cb) {
+    pthread_once(&dk_curl_once, dk_curl_global_init);
+    CURL* h = curl_easy_init();
+    if (!h) return NULL;
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "Donky/1.0");
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);      // WinHTTP follows redirects by default
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 60L);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);            // required when used from multiple threads
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, dk_curl_write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, cb);
+    return h;
+}
+
+uint64_t donky_http_get(uint64_t url_val) {
+    if (get_tag(url_val) != TAG_STRING) return donky_alloc_string("");
+    DkCurlBuf cb = { NULL, 0 };
+    CURL* h = dk_curl_new((char*)as_index(url_val), &cb);
+    if (!h) return donky_alloc_string("");
+    curl_easy_perform(h);                                 // body (if any) is returned regardless of HTTP status
+    curl_easy_cleanup(h);
+    uint64_t result = donky_alloc_string(cb.b ? cb.b : "");
+    free(cb.b);
+    return result;
+}
+#endif
 
 // --- Argument & Thread Runtime ---
 uint64_t donky_args_array = 0;
@@ -1607,6 +1990,7 @@ typedef struct {
     int slot;
 } ThreadArgs;
 
+#ifdef _WIN32
 unsigned __stdcall donky_thread_runner(void* raw_args) {
     ThreadArgs* targs = (ThreadArgs*)raw_args;
     uintptr_t fp = (uintptr_t)targs->func_ptr;
@@ -1658,7 +2042,71 @@ uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
     LeaveCriticalSection(&gc_lock);
     return make_number(0.0);
 }
+#else
+void* donky_thread_runner(void* raw_args) {
+    ThreadArgs* targs = (ThreadArgs*)raw_args;
+    uintptr_t fp = (uintptr_t)targs->func_ptr;
+    uint64_t a1 = targs->arg1;
+    int slot = targs->slot;
 
+    typedef uint64_t (*DonkyFn)(uint64_t);
+    DonkyFn fn = (DonkyFn)fp;
+    fn(a1);
+
+    gc_init_lock();
+    EnterCriticalSection(&gc_lock);
+    active_thread_used[slot] = 0;
+    active_threads--;
+    LeaveCriticalSection(&gc_lock);
+
+    free(targs);
+    return NULL;
+}
+
+uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
+    gc_init_lock();
+    EnterCriticalSection(&gc_lock);
+    if (active_threads >= MAX_THREADS) {
+        LeaveCriticalSection(&gc_lock);
+        return make_number(-1.0);
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (!active_thread_used[i]) { slot = i; break; }
+    }
+    if (slot == -1) {
+        LeaveCriticalSection(&gc_lock);
+        return make_number(-1.0);
+    }
+
+    ThreadArgs* targs = (ThreadArgs*)malloc(sizeof(ThreadArgs));
+    if (!targs) { LeaveCriticalSection(&gc_lock); return make_number(-1.0); }
+    targs->func_ptr = func_val;
+    targs->arg1 = arg1;
+    targs->slot = slot;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);   // nobody joins; the runner cleans up after itself
+    active_thread_used[slot] = 1;
+    active_threads++;
+    pthread_t tid;
+    int rc = pthread_create(&tid, &attr, donky_thread_runner, targs);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {                      // roll back
+        active_thread_used[slot] = 0;
+        active_threads--;
+        free(targs);
+        LeaveCriticalSection(&gc_lock);
+        return make_number(-1.0);
+    }
+    LeaveCriticalSection(&gc_lock);
+    return make_number(0.0);
+}
+#endif
+
+#ifdef _WIN32
 // --- Modern GUI Subsystem (GDI Double-Buffered & Control UI) ---
 HWND g_hwnd = NULL;
 HDC g_mem_dc = NULL;
@@ -1866,6 +2314,56 @@ uint64_t donky_gui_webview(uint64_t url_val) {
     }
     return make_number(1.0);
 }
+#else
+// --- GUI subsystem: the GDI window API is Windows-only. Stubs keep every symbol linkable. ---
+static int dk_gui_warned = 0;
+static void dk_gui_unsupported(void) {
+    if (!dk_gui_warned) { dk_gui_warned = 1; fprintf(stderr, "[Donky] gui_* is only available on Windows; use gui_webview(url) for a cross-platform UI.\n"); }
+}
+uint64_t donky_gui_init(uint64_t title_val, uint64_t width_val, uint64_t height_val) { (void)title_val; (void)width_val; (void)height_val; dk_gui_unsupported(); return make_number(0.0); }
+uint64_t donky_gui_add_button(uint64_t text_val, uint64_t x, uint64_t y, uint64_t w, uint64_t h) { (void)text_val; (void)x; (void)y; (void)w; (void)h; return make_number(-1.0); }
+uint64_t donky_gui_add_label(uint64_t text_val, uint64_t x, uint64_t y, uint64_t w, uint64_t h) { (void)text_val; (void)x; (void)y; (void)w; (void)h; return make_number(-1.0); }
+uint64_t donky_gui_update_text(uint64_t handle_val, uint64_t text_val) { (void)handle_val; (void)text_val; return 0; }
+uint64_t donky_gui_get_clicked() { return make_number(-1.0); }
+uint64_t donky_gui_clear() { return 0; }
+uint64_t donky_gui_draw_rect(uint64_t x, uint64_t y, uint64_t w, uint64_t h, uint64_t color) { (void)x; (void)y; (void)w; (void)h; (void)color; return 0; }
+uint64_t donky_gui_draw_text(uint64_t text_val, uint64_t x, uint64_t y) { (void)text_val; (void)x; (void)y; return 0; }
+uint64_t donky_gui_repaint() { return 0; }
+uint64_t donky_gui_update() { return make_number(0.0); }
+
+// --- Native WebView Window: open the default browser, then keep the process alive ---
+uint64_t donky_gui_webview(uint64_t url_val) {
+    if (get_tag(url_val) != TAG_STRING) return make_number(0.0);
+    char* url = (char*)as_index(url_val);
+
+    printf("[Donky] Server active. Opening UI at %s\n", url);
+    fflush(stdout);
+
+#ifdef __APPLE__
+    const char* opener = "open";
+#else
+    const char* opener = "xdg-open";
+#endif
+    pid_t pid = fork();
+    if (pid == 0) {                                   // child: double-fork so nothing is left as a zombie
+        if (fork() == 0) {
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn, 1); dup2(dn, 2); }
+            execlp(opener, opener, url, (char*)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    } else if (pid > 0) {
+        int st; waitpid(pid, &st, 0);
+    }
+
+    // Keep the main process thread alive so spawned server threads stay active
+    while (1) {
+        Sleep(100);
+    }
+    return make_number(1.0);
+}
+#endif
 
 // ===================== Standard library builtins =====================
 static inline int dk_is_str(uint64_t v) { return !is_number(v) && get_tag(v) == TAG_STRING; }
@@ -1900,6 +2398,7 @@ uint64_t donky_sys_exit(uint64_t code) {
 }
 
 // ---- os ----
+#ifdef _WIN32
 uint64_t donky_sys_cwd(void) {
     char buf[MAX_PATH * 4];
     DWORD n = GetCurrentDirectoryA(sizeof buf, buf);
@@ -1935,6 +2434,36 @@ uint64_t donky_sys_rename(uint64_t a, uint64_t b) {
     if (!dk_is_str(a) || !dk_is_str(b)) return make_number(0.0);
     return make_number(MoveFileExA(dk_s(a), dk_s(b), MOVEFILE_REPLACE_EXISTING) ? 1.0 : 0.0);
 }
+#else
+uint64_t donky_sys_cwd(void) {
+    char buf[4096];
+    if (!getcwd(buf, sizeof buf)) return donky_alloc_string("");
+    return donky_alloc_string(buf);
+}
+uint64_t donky_sys_chdir(uint64_t p) {
+    if (!dk_is_str(p)) return make_number(0.0);
+    return make_number(chdir(dk_s(p)) == 0 ? 1.0 : 0.0);
+}
+// returns null (0) if the variable does not exist
+uint64_t donky_sys_getenv(uint64_t name) {
+    if (!dk_is_str(name)) return 0;
+    const char* v = getenv(dk_s(name));
+    if (!v) return 0;
+    return donky_alloc_string(v);
+}
+uint64_t donky_sys_setenv(uint64_t name, uint64_t val) {
+    if (!dk_is_str(name) || !dk_is_str(val)) return make_number(0.0);
+    return make_number(setenv(dk_s(name), dk_s(val), 1) == 0 ? 1.0 : 0.0);
+}
+uint64_t donky_sys_remove(uint64_t p) {
+    if (!dk_is_str(p)) return make_number(0.0);
+    return make_number(unlink(dk_s(p)) == 0 ? 1.0 : 0.0);
+}
+uint64_t donky_sys_rename(uint64_t a, uint64_t b) {
+    if (!dk_is_str(a) || !dk_is_str(b)) return make_number(0.0);
+    return make_number(rename(dk_s(a), dk_s(b)) == 0 ? 1.0 : 0.0);   // POSIX rename() replaces the target
+}
+#endif
 uint64_t donky_sys_append_file(uint64_t p, uint64_t c) {
     if (!dk_is_str(p) || !dk_is_str(c)) return make_number(0.0);
     FILE* f = fopen(dk_s(p), "ab");
@@ -1977,11 +2506,18 @@ static void dk_gmtime(int64_t ts, DkTm* t) {
     t->yd = (int)(days - dk_days_from_civil(t->Y, 1, 1));
 }
 
+#ifdef _WIN32
 uint64_t donky_sys_epoch_ms(void) {
     FILETIME ft; GetSystemTimeAsFileTime(&ft);
     ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
     return make_number((double)((u.QuadPart - 116444736000000000ULL) / 10000ULL));
 }
+#else
+uint64_t donky_sys_epoch_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return make_number((double)((uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L)));
+}
+#endif
 
 // -> [year, month, day, hour, minute, second, weekday(0=Sun), yearday(0-based)]
 uint64_t donky_sys_gmtime(uint64_t ts) {
@@ -2208,6 +2744,7 @@ uint64_t donky_sys_hmac_sha256(uint64_t key, uint64_t msg) {
 static DONKY_TLS int dk_http_status = 0;
 uint64_t donky_http_status(void) { return make_number((double)dk_http_status); }
 
+#ifdef _WIN32
 static wchar_t* dk_widen(const char* s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
     wchar_t* w = (wchar_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(wchar_t));
@@ -2281,6 +2818,56 @@ uint64_t donky_http_request(uint64_t method_val, uint64_t url_val, uint64_t body
     free(resp);
     return r;
 }
+#else
+uint64_t donky_http_request(uint64_t method_val, uint64_t url_val, uint64_t body_val, uint64_t hdr_val) {
+    dk_http_status = 0;
+    if (!dk_is_str(method_val) || !dk_is_str(url_val)) return donky_alloc_string("");
+    const char* method = dk_s(method_val);
+    const char* body = dk_is_str(body_val) ? dk_s(body_val) : "";
+    const char* hdrs = dk_is_str(hdr_val) ? dk_s(hdr_val) : "";
+    size_t blen = strlen(body);
+
+    DkCurlBuf cb = { NULL, 0 };
+    CURL* h = dk_curl_new(dk_s(url_val), &cb);
+    if (!h) return donky_alloc_string("");
+
+    if (strcasecmp(method, "HEAD") == 0) curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    else                                 curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+
+    // "Name: Value\r\nName2: Value2\r\n" -> curl_slist
+    struct curl_slist* hl = NULL;
+    if (hdrs[0]) {
+        char* copy = strdup(hdrs);
+        if (copy) {
+            char* sp = NULL;
+            for (char* ln = strtok_r(copy, "\r\n", &sp); ln; ln = strtok_r(NULL, "\r\n", &sp))
+                if (*ln) hl = curl_slist_append(hl, ln);
+            free(copy);
+        }
+    }
+    if (blen) {
+        // WinHTTP adds no Content-Type of its own; stop curl from inventing x-www-form-urlencoded
+        if (!hdrs[0] || !strcasestr(hdrs, "content-type:")) hl = curl_slist_append(hl, "Content-Type:");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)blen);
+    }
+    hl = curl_slist_append(hl, "Expect:");               // never send 100-continue
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hl);
+
+    CURLcode rc = curl_easy_perform(h);
+    if (rc == CURLE_OK) {
+        long st = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &st);
+        dk_http_status = (int)st;
+    }
+    curl_slist_free_all(hl);
+    curl_easy_cleanup(h);
+
+    uint64_t r = donky_alloc_string(cb.b ? cb.b : "");
+    free(cb.b);
+    return r;
+}
+#endif
 // ===================== end standard library builtins =====================
 
 int main(int argc, char** argv) {

@@ -62,9 +62,37 @@ fn main() {
             let c_rt = include_str!("runtime_template.c");
             fs::write("runtime.c", c_rt).unwrap();
             
-            println!("Linking with GCC...");
+println!("Linking with GCC...");
+            
+            let mut gcc_args = vec![obj_path, "runtime.c"];
+            
+            #[cfg(target_os = "windows")]
+            {
+                gcc_args.extend_from_slice(&[
+                    "-o", "donky_app.exe", 
+                    "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", 
+                    "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"
+                ]);
+            }
+            
+            #[cfg(target_os = "linux")]
+            {
+                gcc_args.extend_from_slice(&[
+                    "-o", "donky_app", 
+                    "-lpthread", "-lcurl", "-lm", "-ldl"
+                ]);
+            }
+            
+            #[cfg(target_os = "macos")]
+            {
+                gcc_args.extend_from_slice(&[
+                    "-o", "donky_app", 
+                    "-lcurl"
+                ]);
+            }
+
             let status = std::process::Command::new("gcc")
-                .args(&[obj_path, "runtime.c", "-o", "donky_app.exe", "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"])
+                .args(&gcc_args)
                 .status()
                 .expect("Failed to run gcc. Make sure GCC/MinGW is in your PATH.");
                 
