@@ -1,0 +1,13 @@
+fn rand_weight(state) {
+    state[0] = (state[0] * 1103515245 + 12345) % 2147483648;
+    let normalized = state[0] / 2147483648.0;
+    return (normalized * 2.0) - 1.0;
+}
+
+fn main() {
+    let state = [42];
+    print("Weight 1: " + str(rand_weight(state)));
+    print("Weight 2: " + str(rand_weight(state)));
+    print("Weight 3: " + str(rand_weight(state)));
+}
+main();

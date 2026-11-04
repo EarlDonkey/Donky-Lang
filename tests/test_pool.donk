@@ -1,0 +1,15 @@
+fn task(n) {
+    print("Task " + str(n));
+    sleep(100);
+}
+
+fn main() {
+    let i = 0;
+    while i < 100 {
+        spawn(task, i);
+        i = i + 1;
+    }
+    sleep(3000); // Wait for all tasks to finish
+    print("Done!");
+}
+main();

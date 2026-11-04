@@ -96,6 +96,18 @@ static inline void InitializeCriticalSection(CRITICAL_SECTION* m) {
 #define EnterCriticalSection(m) pthread_mutex_lock(m)
 #define LeaveCriticalSection(m) pthread_mutex_unlock(m)
 
+typedef pthread_cond_t CONDITION_VARIABLE;
+#ifndef INFINITE
+#define INFINITE 0xFFFFFFFFu
+#endif
+static inline void InitializeConditionVariable(CONDITION_VARIABLE* cv) { pthread_cond_init(cv, NULL); }
+#define WakeConditionVariable(cv)     pthread_cond_signal(cv)
+#define WakeAllConditionVariable(cv)  pthread_cond_broadcast(cv)
+static inline int SleepConditionVariableCS(CONDITION_VARIABLE* cv, CRITICAL_SECTION* cs, DWORD ms) {
+    (void)ms;
+    return pthread_cond_wait(cv, cs) == 0;
+}
+
 static inline void Sleep(DWORD ms) {
     struct timespec ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
@@ -124,11 +136,6 @@ static int rand_seeded = 0;
 
 #define MAX_THREADS 64
 static volatile int active_threads = 0;
-#ifdef _WIN32
-static HANDLE active_threads_handles[MAX_THREADS];
-#else
-static int active_thread_used[MAX_THREADS];   // pthread_t is opaque: track slot occupancy separately
-#endif
 
 // --- Garbage Collector & Thread Synchronization ---
 CRITICAL_SECTION gc_lock;
@@ -284,7 +291,14 @@ typedef struct { uint64_t* keys; uint64_t* vals; uint32_t* idx; uint64_t* hs; si
 uint64_t donky_alloc_map(void);
 uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val);
 
-uint64_t current_exception = 0;
+// Exceptions are per-thread: with the worker pool, a shared global made one task's
+// throw visible to (and clearable by) every other thread.
+#ifdef _MSC_VER
+#define DK_TLS __declspec(thread)
+#else
+#define DK_TLS __thread
+#endif
+DK_TLS uint64_t current_exception = 0;
 static uint64_t g_globals = 0;
 
 int is_number(uint64_t v) { return (v & TAG_MASK) != TAG_BASE; }
@@ -293,11 +307,21 @@ uint64_t get_tag(uint64_t v) { return is_number(v) ? 0 : ((v >> 48) & 0x7); }
 uint64_t as_index(uint64_t v) { return v & 0x0000FFFFFFFFFFFFULL; }
 uint64_t make_number(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
 
+// Shortest %.Ng (N = 15..17) that parses back to the same double; integers print exactly.
+static void dk_fmt_num(double d, char* buf, size_t cap) {
+    if (d != d) { snprintf(buf, cap, "nan"); return; }
+    if (isinf(d)) { snprintf(buf, cap, d < 0 ? "-inf" : "inf"); return; }
+    if (fabs(d) < 9.2e18 && d == (double)(long long)d) { snprintf(buf, cap, "%lld", (long long)d); return; }
+    for (int p = 15; p <= 17; p++) {
+        snprintf(buf, cap, "%.*g", p, d);
+        if (strtod(buf, NULL) == d) break;
+    }
+}
+
 void print_value(uint64_t val) {
     if (is_number(val)) {
-        double d = as_number(val);
-        if (d == (long long)d) printf("%lld", (long long)d);
-        else printf("%g", d);
+        char nb[64]; dk_fmt_num(as_number(val), nb, sizeof nb);
+        fputs(nb, stdout);
     } else if (get_tag(val) == TAG_BOOL) {
         printf("%s", (val & 1) ? "true" : "false");
     } else if (get_tag(val) == TAG_STRING) {
@@ -762,12 +786,19 @@ uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val) {
 uint64_t donky_index_get(uint64_t target, uint64_t index) {
     if (get_tag(target) == TAG_ARRAY) {
         Array* arr = (Array*)as_index(target);
-        size_t i = (size_t)as_number(index);
-        if (i < arr->len) return arr->data[i];
+        double di = is_number(index) ? as_number(index) : -1.0;
+        if (di >= 0 && di < (double)arr->len) return arr->data[(size_t)di];
     } else if (get_tag(target) == TAG_MAP) {
         Map* map = (Map*)as_index(target);
         int64_t f = map_find(map, index);
         if (f >= 0) return map->vals[f];
+    } else if (get_tag(target) == TAG_STRING && is_number(index)) {
+        const char* s = (const char*)as_index(target);
+        double di = as_number(index);
+        if (di >= 0 && di < (double)str_len(s)) {
+            char one[2] = { s[(size_t)di], 0 };
+            return donky_alloc_string(one);
+        }
     }
     return 0;
 }
@@ -881,8 +912,7 @@ uint64_t donky_pop(uint64_t arr_val) {
 uint64_t donky_str(uint64_t val) {
     char buf[256];
     if (is_number(val)) {
-        double d = as_number(val);
-        if (d == (long long)d) sprintf(buf, "%lld", (long long)d); else sprintf(buf, "%g", d);
+        dk_fmt_num(as_number(val), buf, sizeof buf);
     } else if (get_tag(val) == TAG_STRING) return val;
     else if (get_tag(val) == TAG_BOOL) strcpy(buf, (val & 1) ? "true" : "false");
     else if (get_tag(val) == TAG_ARRAY) strcpy(buf, "[array]");
@@ -2009,127 +2039,110 @@ void donky_set_args(int argc, char** argv) {
 }
 uint64_t donky_get_args() { return donky_args_array; }
 
-typedef struct {
+typedef struct ThreadArgs {
     uint64_t func_ptr;
     uint64_t arg1;
-    int slot;
+    struct ThreadArgs* next;
 } ThreadArgs;
 
+#define DK_POOL_SIZE   16
+#define DK_QUEUE_MAX   100000
+
+static CRITICAL_SECTION   dk_pool_lock;
+static CONDITION_VARIABLE dk_pool_cv;
+static ThreadArgs* dk_q_head = NULL;
+static ThreadArgs* dk_q_tail = NULL;
+static int dk_q_len = 0;
+static int dk_pool_state = 0;
+
 #ifdef _WIN32
-unsigned __stdcall donky_thread_runner(void* raw_args) {
-    ThreadArgs* targs = (ThreadArgs*)raw_args;
-    uintptr_t fp = (uintptr_t)targs->func_ptr;
-    uint64_t a1 = targs->arg1;
-    int slot = targs->slot;
-    
-    typedef uint64_t (*DonkyFn)(uint64_t);
-    DonkyFn fn = (DonkyFn)fp;
-    fn(a1); 
-    
-    gc_init_lock();
-    EnterCriticalSection(&gc_lock);
-    if (active_threads_handles[slot]) {
-        CloseHandle(active_threads_handles[slot]);
-        active_threads_handles[slot] = NULL;
-    }
-    active_threads--;
-    LeaveCriticalSection(&gc_lock);
-    
-    free(targs);
-    return 0;
-}
-
-uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
-    gc_init_lock();
-    EnterCriticalSection(&gc_lock);
-    if (active_threads >= MAX_THREADS) {
-        LeaveCriticalSection(&gc_lock);
-        return make_number(-1.0);
-    }
-    
-    int slot = -1;
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (active_threads_handles[i] == NULL) { slot = i; break; }
-    }
-    if (slot == -1) {
-        LeaveCriticalSection(&gc_lock);
-        return make_number(-1.0);
-    }
-    
-    ThreadArgs* targs = malloc(sizeof(ThreadArgs));
-    targs->func_ptr = func_val;
-    targs->arg1 = arg1;
-    targs->slot = slot;
-    
-    active_threads_handles[slot] = (HANDLE)_beginthreadex(NULL, 0, donky_thread_runner, targs, CREATE_SUSPENDED, NULL);
-    active_threads++;
-    ResumeThread(active_threads_handles[slot]);
-    LeaveCriticalSection(&gc_lock);
-    return make_number(0.0);
-}
+static unsigned __stdcall dk_pool_worker(void* unused) {
 #else
-void* donky_thread_runner(void* raw_args) {
-    ThreadArgs* targs = (ThreadArgs*)raw_args;
-    uintptr_t fp = (uintptr_t)targs->func_ptr;
-    uint64_t a1 = targs->arg1;
-    int slot = targs->slot;
-
+static void* dk_pool_worker(void* unused) {
+#endif
+    (void)unused;
     typedef uint64_t (*DonkyFn)(uint64_t);
-    DonkyFn fn = (DonkyFn)fp;
-    fn(a1);
+    for (;;) {
+        EnterCriticalSection(&dk_pool_lock);
+        while (dk_q_head == NULL)
+            SleepConditionVariableCS(&dk_pool_cv, &dk_pool_lock, INFINITE);
+        ThreadArgs* t = dk_q_head;
+        dk_q_head = t->next;
+        if (dk_q_head == NULL) dk_q_tail = NULL;
+        dk_q_len--;
+        LeaveCriticalSection(&dk_pool_lock);
 
-    gc_init_lock();
-    EnterCriticalSection(&gc_lock);
-    active_thread_used[slot] = 0;
-    active_threads--;
-    LeaveCriticalSection(&gc_lock);
+        DonkyFn fn = (DonkyFn)(uintptr_t)t->func_ptr;
+        fn(t->arg1);
+        free(t);
 
-    free(targs);
+        // Uncaught exception in a task: report it and reset this worker's slot, otherwise
+        // every later call on this thread would see a stale exception and bail out.
+        if (current_exception != 0) {
+            fputs("Uncaught exception in spawned task: ", stderr);
+            fflush(stdout); print_value(current_exception); fflush(stdout);
+            fputc('\n', stderr);
+            current_exception = 0;
+        }
+
+        EnterCriticalSection(&dk_pool_lock);
+        active_threads--;
+        LeaveCriticalSection(&dk_pool_lock);
+    }
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
+}
+
+static int dk_pool_init(void) {
+    InitializeCriticalSection(&dk_pool_lock);
+    InitializeConditionVariable(&dk_pool_cv);
+
+    int made = 0;
+    for (int i = 0; i < DK_POOL_SIZE; i++) {
+#ifdef _WIN32
+        HANDLE h = (HANDLE)_beginthreadex(NULL, 0, dk_pool_worker, NULL, 0, NULL);
+        if (h) { CloseHandle(h); made++; }
+#else
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_t tid;
+        if (pthread_create(&tid, &attr, dk_pool_worker, NULL) == 0) made++;
+        pthread_attr_destroy(&attr);
+#endif
+    }
+    dk_pool_state = made > 0 ? 1 : -1;
+    return made > 0;
 }
 
 uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
-    gc_init_lock();
-    EnterCriticalSection(&gc_lock);
-    if (active_threads >= MAX_THREADS) {
-        LeaveCriticalSection(&gc_lock);
+    if (dk_pool_state == 0) dk_pool_init();
+    if (dk_pool_state < 0) return make_number(-1.0);
+
+    ThreadArgs* t = (ThreadArgs*)malloc(sizeof(ThreadArgs));
+    if (!t) return make_number(-1.0);
+    t->func_ptr = func_val;
+    t->arg1 = arg1;
+    t->next = NULL;
+
+    EnterCriticalSection(&dk_pool_lock);
+    if (dk_q_len >= DK_QUEUE_MAX) {
+        LeaveCriticalSection(&dk_pool_lock);
+        free(t);
         return make_number(-1.0);
     }
-
-    int slot = -1;
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (!active_thread_used[i]) { slot = i; break; }
-    }
-    if (slot == -1) {
-        LeaveCriticalSection(&gc_lock);
-        return make_number(-1.0);
-    }
-
-    ThreadArgs* targs = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-    if (!targs) { LeaveCriticalSection(&gc_lock); return make_number(-1.0); }
-    targs->func_ptr = func_val;
-    targs->arg1 = arg1;
-    targs->slot = slot;
-
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);   // nobody joins; the runner cleans up after itself
-    active_thread_used[slot] = 1;
+    if (dk_q_tail) dk_q_tail->next = t; else dk_q_head = t;
+    dk_q_tail = t;
+    dk_q_len++;
     active_threads++;
-    pthread_t tid;
-    int rc = pthread_create(&tid, &attr, donky_thread_runner, targs);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) {                      // roll back
-        active_thread_used[slot] = 0;
-        active_threads--;
-        free(targs);
-        LeaveCriticalSection(&gc_lock);
-        return make_number(-1.0);
-    }
-    LeaveCriticalSection(&gc_lock);
+    LeaveCriticalSection(&dk_pool_lock);
+
+    WakeConditionVariable(&dk_pool_cv);
     return make_number(0.0);
 }
-#endif
 
 #ifdef _WIN32
 // --- Modern GUI Subsystem (GDI Double-Buffered & Control UI) ---

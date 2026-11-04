@@ -58,47 +58,12 @@ fn main() {
             let obj_path = "donky_app.obj";
             if let Err(e) = aot.compile_to_object(&ast, obj_path) { eprintln!("Error: {}", e); return; }
 
-            #[cfg(target_os = "windows")]
-            let (gcc_bin, gcc_args): (String, Vec<String>) = {
-                    println!("Writing C runtime...");
-                fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
-                
-                let mut a: Vec<String> = vec![
-                    obj_path.to_string(), 
-                    "runtime.c".to_string(),  // <-- Compile the C source, not the .o
-                    "-o".to_string(), "donky_app.exe".to_string(),
-                    "-mstackrealign".to_string(),
-                ];
-                for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"] { 
-                    a.push(l.to_string()); 
-                }
-                ("gcc".to_string(), a)
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            let (gcc_bin, gcc_args): (String, Vec<String>) = {
-                println!("Writing C runtime...");
-                fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
-                #[allow(unused_mut)]
-                let mut a: Vec<String> = vec![
-                    obj_path.to_string(), "runtime.c".to_string(),
-                    "-o".to_string(), "donky_app".to_string(),
-                ];
-                #[cfg(target_os = "linux")]
-                { for l in ["-lpthread", "-lcurl", "-lm", "-ldl"] { a.push(l.to_string()); } }
-                #[cfg(target_os = "macos")]
-                { a.push("-lcurl".to_string()); }
-                ("gcc".to_string(), a)
-            };
-
-            println!("Linking with GCC...");
-            let status = std::process::Command::new(&gcc_bin)
-                .args(&gcc_args)
-                .status()
-                .expect("Failed to run gcc. Make sure GCC/MinGW is in your PATH.");
-
-            if status.success() { println!("Successfully built donky_app!"); }
-            else { eprintln!("Linker failed."); }
+            println!("Writing C runtime and linking with GCC...");
+            let exe = if cfg!(target_os = "windows") { "donky_app.exe" } else { "donky_app" };
+            match link_executable(obj_path, exe) {
+                Ok(()) => println!("Successfully built {}!", exe),
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            }
         }
         "build" => {
             if args.len() < 3 { eprintln!("Usage: donky-native build <file.donk>"); return; }
@@ -139,6 +104,7 @@ fn install_root() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn find_runtime_obj() -> Result<std::path::PathBuf, String> {
     let mut c: Vec<std::path::PathBuf> = Vec::new();
     if let Some(root) = install_root() { c.push(root.join("lib").join("runtime.o")); }
@@ -158,6 +124,45 @@ fn find_gcc() -> String {
         if g.exists() { return g.to_string_lossy().into_owned(); }
     }
     "gcc".to_string()
+}
+
+/// Writes the embedded C runtime next to the object file and links the final executable.
+/// Shared by `build-exe` and `test` (the test runner used to hard-code Windows-only link flags
+/// and `test_app.exe`, so `donky-native test` could not work on Linux/macOS).
+fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
+    fs::write("runtime.c", include_str!("runtime_template.c"))
+        .map_err(|e| format!("Could not write runtime.c: {}", e))?;
+
+    #[cfg(target_os = "windows")]
+    let gcc_bin = find_gcc();
+    #[cfg(not(target_os = "windows"))]
+    let gcc_bin = "gcc".to_string();
+
+    let mut args: Vec<String> = vec![
+        obj_path.to_string(), "runtime.c".to_string(),
+        "-o".to_string(), exe_path.to_string(),
+    ];
+    #[cfg(target_os = "windows")]
+    {
+        args.push("-mstackrealign".to_string());
+        for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"] {
+            args.push(l.to_string());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for l in ["-lpthread", "-lcurl", "-lm", "-ldl"] { args.push(l.to_string()); }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        args.push("-lcurl".to_string());
+    }
+
+    let status = std::process::Command::new(&gcc_bin)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("Failed to run {}: {}. Make sure GCC/MinGW is in your PATH.", gcc_bin, e))?;
+    if status.success() { Ok(()) } else { Err("Linker failed.".to_string()) }
 }
 
 fn cmd_tree(path: &str, script_args: Vec<String>) -> Result<(), String> {
@@ -245,16 +250,12 @@ fn run_file(path: &str) -> Result<(), String> {
         return Err(format!("Compile error: {}", e));
     }
 
-    fs::write("runtime.c", include_str!("runtime_template.c")).unwrap();
+    let exe = if cfg!(target_os = "windows") { "test_app.exe" } else { "test_app" };
+    link_executable(obj_path, exe)?;
 
-    let status = std::process::Command::new("gcc")
-        .args(&[obj_path, "runtime.c", "-o", "test_app.exe", "-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"])
-        .status()
-        .map_err(|e| e.to_string())?;
-
-    if !status.success() { return Err("Linker failed".to_string()); }
-
-    let run_status = std::process::Command::new("test_app.exe")
+    // A bare name is not searched in the current directory on Unix.
+    let run_path = if cfg!(target_os = "windows") { exe.to_string() } else { format!("./{}", exe) };
+    let run_status = std::process::Command::new(&run_path)
         .status()
         .map_err(|e| e.to_string())?;
 
@@ -268,8 +269,8 @@ fn cmd_bench(arg: Option<&str>) -> Result<(), String> {
     let files = collect_donk_files(dir)?;
     if files.is_empty() { return Err(format!("no .donk files in {}", dir)); }
     const ITERS: usize = 10;
-    println!("{:<20} {:>9} {:>11} {:>13} {:>10} {:>12}", "file", "compile", "run(src)", "load+run(.bc)", "ns/op", "ns/call");
-    println!("{}", "-".repeat(82));
+    println!("{:<20} {:>9} {:>11}", "file", "compile", "run(src)");
+    println!("{}", "-".repeat(42));
     for path in &files {
         let p = path.to_str().unwrap_or("");
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();

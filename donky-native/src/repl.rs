@@ -63,11 +63,16 @@ fn balanced(src: &str) -> bool {
     let mut parens = 0i32;
     let mut brackets = 0i32;
     let mut in_string = false;
+    let mut in_raw = false; // `backtick` raw strings
     let mut in_comment = false;
     let mut chars = src.chars().peekable();
     while let Some(c) = chars.next() {
         if in_comment {
             if c == '\n' { in_comment = false; }
+            continue;
+        }
+        if in_raw {
+            if c == '`' { in_raw = false; }
             continue;
         }
         if in_string {
@@ -78,6 +83,7 @@ fn balanced(src: &str) -> bool {
         if c == '/' && chars.peek() == Some(&'/') { in_comment = true; chars.next(); continue; }
         match c {
             '"' => in_string = true,
+            '`' => in_raw = true,
             '{' => braces += 1,
             '}' => braces -= 1,
             '(' => parens += 1,
@@ -94,22 +100,28 @@ fn eval_input(interp: &mut Interpreter, src: &str) {
     let trimmed = src.trim();
     if trimmed.is_empty() { return; }
 
-    match try_eval(interp, trimmed) {
+    // Parse first. Only a *parse* failure may be retried with a trailing `;` (that is what makes
+    // `1 + 2` work). Retrying after a *runtime* error, as before, ran the input twice and
+    // duplicated its side effects (prints, file writes, pushes...).
+    let stmts = match parse_src(trimmed) {
+        Ok(s) => s,
+        Err(first_err) => {
+            if !trimmed.ends_with(';') && !trimmed.ends_with('}') {
+                match parse_src(&format!("{};", trimmed)) {
+                    Ok(s) => s,
+                    Err(_) => { eprintln!("Error: {}", first_err); return; }
+                }
+            } else {
+                eprintln!("Error: {}", first_err);
+                return;
+            }
+        }
+    };
+
+    match run_stmts(interp, stmts) {
         Ok(Some(v)) => print_value(interp, v),
         Ok(None) => {}
-        Err(first_err) => {
-            // If the source doesn't end with a terminator, retry with `;`.
-            // This is what makes `1 + 2` work without a trailing semicolon.
-            if !trimmed.ends_with(';') && !trimmed.ends_with('}') {
-                let with_semi = format!("{};", trimmed);
-                match try_eval(interp, &with_semi) {
-                    Ok(Some(v)) => { print_value(interp, v); return; }
-                    Ok(None) => return,
-                    Err(_) => {}
-                }
-            }
-            eprintln!("Error: {}", first_err);
-        }
+        Err(e) => eprintln!("Error: {}", e),
     }
 }
 
@@ -119,20 +131,18 @@ fn print_value(interp: &Interpreter, v: Value) {
     }
 }
 
-fn try_eval(interp: &mut Interpreter, src: &str) -> Result<Option<Value>, String> {
-    let mut lex = Lexer::new(src);
-    let tokens = lex.tokenize()?;
-    let mut parser = Parser::new(tokens);
-    let stmts = parser.parse()?;
+fn parse_src(src: &str) -> Result<Vec<Stmt>, String> {
+    let tokens = Lexer::new(src).tokenize()?;
+    Parser::new(tokens).parse()
+}
 
-    // If the whole input is a single expression statement, evaluate and
-    // return the value so the REPL can print it.
+fn run_stmts(interp: &mut Interpreter, stmts: Vec<Stmt>) -> Result<Option<Value>, String> {
+    // A single expression statement is evaluated and its value returned so the REPL can print it.
     if stmts.len() == 1 {
         if let Stmt::ExprStmt(expr) = &stmts[0] {
             return Ok(Some(interp.evaluate(expr.clone())?));
         }
     }
-
     interp.interpret(stmts)?;
     Ok(None)
 }

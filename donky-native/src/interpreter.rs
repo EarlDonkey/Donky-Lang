@@ -69,6 +69,13 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Strings compare by content, numbers by value, everything else by identity.
+    /// (`match` used to compare the *printed* forms, so `1` matched `"1"` and `true` matched `"true"`.)
+    fn values_equal(&self, a: Value, b: Value) -> bool {
+        if a.is_string() && b.is_string() { return self.heap.get_string(a.payload()) == self.heap.get_string(b.payload()); }
+        a == b
+    }
+
     fn execute(&mut self, stmt: Stmt) -> Result<ControlFlow, String> {
         match stmt {
             Stmt::Asm(_) => Ok(ControlFlow::Normal),
@@ -85,7 +92,7 @@ impl Interpreter {
                 let target = self.evaluate(target_expr)?;
                 for (case_expr, block) in cases {
                     let case_val = self.evaluate(case_expr)?;
-                    if target.to_string_with_heap(&self.heap) == case_val.to_string_with_heap(&self.heap) { return self.execute(*block); }
+                    if self.values_equal(target, case_val) { return self.execute(*block); }
                 }
                 if let Some(eb) = else_block { self.execute(*eb) } else { Ok(ControlFlow::Normal) }
             }
@@ -119,15 +126,15 @@ impl Interpreter {
                 match target.kind() {
                     ValueKind::Array(idx) => {
                         if let Some(n) = index.as_number() {
+                            if n.is_nan() || n < 0.0 { return Err(format!("Index {} out of range", n)); }
                             let i = n as usize;
                             let arr = self.heap.get_array_mut(idx);
                             if i < arr.len() { arr[i] = value; } else { return Err(format!("Index {} out of range", i)); }
                         } else { return Err("Array index must be a number".to_string()); }
                     }
                     ValueKind::Map(idx) => {
-                        if let Ok(key) = MapKey::from_value(index, &self.heap) {
-                            self.heap.get_map_mut(idx).insert(key, value);
-                        }
+                        let key = MapKey::from_value(index, &self.heap)?; // bad key types are an error, not a silent no-op
+                        self.heap.get_map_mut(idx).insert(key, value);
                     }
                     ValueKind::Struct(idx) => {
                         if index.is_string() {
@@ -155,10 +162,15 @@ impl Interpreter {
             Stmt::ExprStmt(expr) => { self.evaluate(expr)?; Ok(ControlFlow::Normal) }
             Stmt::Block(stmts) => {
                 self.env.push_scope();
-                let mut res = ControlFlow::Normal;
-                for s in stmts { res = self.execute(s)?; if !matches!(res, ControlFlow::Normal) { break; } }
-                self.env.pop_scope();
-                Ok(res)
+                let mut res: Result<ControlFlow, String> = Ok(ControlFlow::Normal);
+                for s in stmts {
+                    match self.execute(s) {
+                        Ok(ControlFlow::Normal) => {}
+                        other => { res = other; break; }
+                    }
+                }
+                self.env.pop_scope(); // also on error, or a failed REPL line leaves its scope pushed forever
+                res
             }
             Stmt::If(cond, then_b, else_b) => {
                 if self.evaluate(cond)?.is_truthy() { self.execute(*then_b) }
@@ -265,6 +277,7 @@ impl Interpreter {
                 match t.kind() {
                     ValueKind::Array(idx) => {
                         if let Some(n) = iv.as_number() {
+                            if n.is_nan() || n < 0.0 { return Err(format!("Index {} out of range", n)); }
                             let i = n as usize;
                             let arr = self.heap.get_array(idx);
                             if i < arr.len() { Ok(arr[i]) } else { Err(format!("Index {} out of range", i)) }
@@ -283,13 +296,15 @@ impl Interpreter {
                     }
                     ValueKind::String(idx) => {
                         if let Some(n) = iv.as_number() {
-                            let s = self.heap.get_string(idx);
+                            if n.is_nan() || n < 0.0 { return Err(format!("String index {} out of range", n)); }
                             let i = n as usize;
-                            if i < s.len() {
-                                let ch = s.chars().nth(i).unwrap().to_string();
-                                let sidx = self.heap.alloc(HeapObject::String(ch));
-                                Ok(Value::string(sidx))
-                            } else { Err(format!("String index {} out of range", i)) }
+                            // chars().nth(): the old `i < s.len()` guard counted bytes, so a multi-byte
+                            // string could pass the guard and then panic on unwrap().
+                            let ch = self.heap.get_string(idx).chars().nth(i).map(|c| c.to_string());
+                            match ch {
+                                Some(ch) => { let sidx = self.heap.alloc(HeapObject::String(ch)); Ok(Value::string(sidx)) }
+                                None => Err(format!("String index {} out of range", i)),
+                            }
                         } else { Err("String index must be number".to_string()) }
                     }
                     _ => Err(format!("Cannot index '{}'", t.to_string_with_heap(&self.heap))),
@@ -499,7 +514,7 @@ impl Interpreter {
                 return Ok(Value::string(sidx));
             }
             "random" => {
-                let max = arg_vals.get(0).and_then(|v| v.as_number()).map(|n| n as u64).unwrap_or(100);
+                let max = arg_vals.get(0).and_then(|v| v.as_number()).map(|n| n as u64).unwrap_or(100).max(1); // % 0 would panic
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64;
                 return Ok(Value::number(((nanos * 1103515245 + 12345) % max) as f64));

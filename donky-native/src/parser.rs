@@ -4,6 +4,37 @@ use crate::ast::{Expr, Stmt, Pos};
 
 fn pos_of(t: &Token) -> Pos { Pos { line: t.line as u32, col: t.col as u32 } }
 
+/// Advances `i` past the matching `}` of a `${ ... }` expression (the `${` is already consumed).
+/// Quoted strings inside the expression are skipped whole, so braces/quotes in them don't confuse the scan.
+fn skip_interp_expr(chars: &[char], i: &mut usize) -> Result<(), String> {
+    let mut depth = 1usize;
+    while *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        match c {
+            '{' => depth += 1,
+            '}' => { depth -= 1; if depth == 0 { return Ok(()); } }
+            '"' => skip_nested_string(chars, i)?,
+            _ => {}
+        }
+    }
+    Err("Parse error: unterminated ${...} in string".to_string())
+}
+
+fn skip_nested_string(chars: &[char], i: &mut usize) -> Result<(), String> {
+    while *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        match c {
+            '\\' => { *i += 1; }
+            '"' => return Ok(()),
+            '$' if *i < chars.len() && chars[*i] == '{' => { *i += 1; skip_interp_expr(chars, i)?; }
+            _ => {}
+        }
+    }
+    Err("Parse error: unterminated string inside ${...}".to_string())
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
@@ -105,7 +136,8 @@ impl Parser {
             let mut else_block = None;
 
             while !self.check(TokenType::RBrace) && !self.is_at_end() {
-                if self.match_token(&[TokenType::Ident]) && self.previous().lexeme == "_" {
+                if self.check(TokenType::Ident) && self.peek().lexeme == "_" {
+                    self.advance();
                     else_block = Some(Box::new(self.statement()?));
                 } else {
                     let case_val = self.expression(0)?;
@@ -273,21 +305,26 @@ impl Parser {
         let expr = self.expression(0)?;
 
         if let Some(bin_op) = Self::compound_op(&self.peek().ttype) {
+            let (el, ec) = (self.peek().line, self.peek().col);
             self.advance();
             let value = self.expression(0)?;
             self.consume(TokenType::Semi, "Expected ';'")?;
-            return self.build_compound(expr, bin_op, value);
+            return self.build_compound(expr, bin_op, value)
+                .map_err(|e| format!("Parse error at {}:{}: {}", el, ec, e));
         }
 
         if self.check(TokenType::PlusPlus) || self.check(TokenType::MinusMinus) {
             let is_plus = self.check(TokenType::PlusPlus);
+            let (el, ec) = (self.peek().line, self.peek().col);
             self.advance();
             let bin_op = if is_plus { TokenType::Plus } else { TokenType::Minus };
             self.consume(TokenType::Semi, "Expected ';'")?;
-            return self.build_compound(expr, bin_op, Expr::Number(1.0));
+            return self.build_compound(expr, bin_op, Expr::Number(1.0))
+                .map_err(|e| format!("Parse error at {}:{}: {}", el, ec, e));
         }
 
         if self.match_token(&[TokenType::Eq]) {
+            let (el, ec) = (self.previous().line, self.previous().col);
             let value = self.expression(0)?;
             self.consume(TokenType::Semi, "Expected ';'")?;
             match expr {
@@ -295,7 +332,7 @@ impl Parser {
                     return Ok(Stmt::IndexSet(target, index, Box::new(value)));
                 }
                 Expr::FieldAccess(obj, field) => { return Ok(Stmt::FieldSet(*obj, field, value)); }
-                _ => return Err("Invalid assignment target".to_string()),
+                _ => return Err(format!("Parse error at {}:{}: Invalid assignment target", el, ec)),
             }
         }
 
@@ -306,27 +343,30 @@ impl Parser {
     fn expression(&mut self, min_bp: u8) -> Result<Expr, String> {
         let mut left = self.prefix()?;
 
-        while self.match_token(&[TokenType::LBracket]) {
-            let index = self.expression(0)?;
-            self.consume(TokenType::RBracket, "Expected ']'")?;
-            left = Expr::Index(Box::new(left), Box::new(index));
-        }
-
-        while self.match_token(&[TokenType::Dot]) {
-            let ft = self.consume(TokenType::Ident, "Expected field name")?.clone();
-            let field = ft.lexeme.clone();
-            if self.match_token(&[TokenType::LParen]) {
-                let mut args = Vec::new();
-                if !self.check(TokenType::RParen) {
-                    loop {
-                        args.push(self.expression(0)?);
-                        if !self.match_token(&[TokenType::Comma]) { break; }
+        // Postfix operators in one loop so indexing and field/method access can interleave.
+        loop {
+            if self.match_token(&[TokenType::LBracket]) {
+                let index = self.expression(0)?;
+                self.consume(TokenType::RBracket, "Expected ']'")?;
+                left = Expr::Index(Box::new(left), Box::new(index));
+            } else if self.match_token(&[TokenType::Dot]) {
+                let ft = self.consume(TokenType::Ident, "Expected field name")?.clone();
+                let field = ft.lexeme.clone();
+                if self.match_token(&[TokenType::LParen]) {
+                    let mut args = Vec::new();
+                    if !self.check(TokenType::RParen) {
+                        loop {
+                            args.push(self.expression(0)?);
+                            if !self.match_token(&[TokenType::Comma]) { break; }
+                        }
                     }
+                    self.consume(TokenType::RParen, "Expected ')'")?;
+                    left = Expr::MethodCall(Box::new(left), field, args, pos_of(&ft));
+                } else {
+                    left = Expr::FieldAccess(Box::new(left), field);
                 }
-                self.consume(TokenType::RParen, "Expected ')'")?;
-                left = Expr::MethodCall(Box::new(left), field, args, pos_of(&ft));
             } else {
-                left = Expr::FieldAccess(Box::new(left), field);
+                break;
             }
         }
 
@@ -337,7 +377,7 @@ impl Parser {
             left = Expr::Binary(Box::new(left), op_token, Box::new(right));
         }
 
-        if min_bp <= 2 && self.match_token(&[TokenType::Question]) {
+        if min_bp == 0 && self.match_token(&[TokenType::Question]) {
             let then_branch = self.expression(0)?;
             self.consume(TokenType::Colon, "Expected ':' in ternary")?;
             let else_branch = self.expression(0)?;
@@ -351,30 +391,35 @@ impl Parser {
     if self.is_at_end() { return Err("Parse error: unexpected end of input".to_string()); }
     let token = self.advance().clone();
         match token.ttype {
-            TokenType::Number => Ok(Expr::Number(token.literal.unwrap().parse().unwrap())),
+            TokenType::Number => {
+                let lit = token.literal.clone().unwrap_or_default();
+                lit.parse::<f64>()
+                    .map(Expr::Number)
+                    .map_err(|_| format!("Parse error at {}:{}: invalid number '{}'", token.line, token.col, lit))
+            }
             TokenType::String => Ok(Expr::String(token.literal.unwrap())),
             TokenType::StringInterp => {
-                let raw = token.literal.unwrap();
+                let raw: Vec<char> = token.literal.unwrap().chars().collect();
                 let mut parts = Vec::new();
                 let mut current_text = String::new();
-                let mut chars = raw.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '$' && chars.peek() == Some(&'{') {
-                        chars.next();
+                let mut i = 0usize;
+                while i < raw.len() {
+                    let c = raw[i];
+                    i += 1;
+                    if c == '$' && i < raw.len() && raw[i] == '{' {
+                        i += 1;
                         if !current_text.is_empty() { parts.push(Expr::String(current_text.clone())); current_text.clear(); }
-                        let mut expr_text = String::new();
-                        let mut depth = 1;
-                        while let Some(&nc) = chars.peek() {
-                            if nc == '{' { depth += 1; }
-                            if nc == '}' { depth -= 1; }
-                            if depth == 0 { break; }
-                            expr_text.push(chars.next().unwrap());
-                        }
-                        chars.next();
+                        let start = i;
+                        skip_interp_expr(&raw, &mut i)?;
+                        let expr_text: String = raw[start..i - 1].iter().collect();
                         let mut sub_lex = Lexer::new(&expr_text);
                         let sub_tokens = sub_lex.tokenize()?;
                         let mut sub_parser = Parser::new(sub_tokens);
-                        parts.push(sub_parser.expression(0)?);
+                        let e = sub_parser.expression(0)?;
+                        if !sub_parser.is_at_end() {
+                            return Err(format!("Parse error at {}:{}: unexpected text in ${{{}}}", token.line, token.col, expr_text));
+                        }
+                        parts.push(e);
                     } else { current_text.push(c); }
                 }
                 if !current_text.is_empty() { parts.push(Expr::String(current_text)); }
@@ -461,7 +506,7 @@ impl Parser {
                 self.consume(TokenType::RBrace, "Expected '}'")?;
                 Ok(Expr::Map(pairs))
             }
-            _ => Err(format!("Unexpected token: {:?}", token.ttype)),
+            _ => Err(format!("Parse error at {}:{}: Unexpected token {:?}", token.line, token.col, token.ttype)),
         }
     }
 }

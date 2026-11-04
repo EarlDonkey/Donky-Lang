@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Manifest {
     pub name: String,
     pub version: String,
-    pub dependencies: std::collections::HashMap<String, Dependency>,
+    pub dependencies: std::collections::BTreeMap<String, Dependency>, // sorted => stable donky.json / donky.lock
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -50,6 +50,20 @@ impl Dependency {
     }
 }
 
+/// Package names become directory names under donky_modules/, so they must not be able to
+/// escape it ("..", "a/b", absolute paths) — a hostile donky.json could otherwise make
+/// `install` delete or overwrite arbitrary directories.
+fn valid_pkg_name(n: &str) -> bool {
+    !n.is_empty()
+        && n != "." && n != ".."
+        && !n.contains("..")
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(60)).build()
+}
+
 pub fn install_from_manifest() -> Result<(), String> {
     let manifest_str = fs::read_to_string("donky.json")
         .map_err(|_| "Could not find donky.json in the current directory.".to_string())?;
@@ -63,6 +77,9 @@ pub fn install_from_manifest() -> Result<(), String> {
     let mut upgrades: Vec<(String, Dependency)> = Vec::new();
 
     for (name, dep) in &manifest.dependencies {
+        if !valid_pkg_name(name) {
+            return Err(format!("Invalid package name '{}': use letters, digits, '_', '-', '.' only", name));
+        }
         println!("Installing {}...", name);
 
         // Path dependency: copy directory
@@ -82,7 +99,7 @@ pub fn install_from_manifest() -> Result<(), String> {
             .ok_or_else(|| format!("Dependency {} has no url or path", name))?;
 
         println!("  -> Fetching {}", url);
-        let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+        let resp = http_agent().get(url).call().map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         resp.into_reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
 
@@ -91,7 +108,7 @@ pub fn install_from_manifest() -> Result<(), String> {
         let hash = format!("{:x}", hasher.finalize());
 
         match dep.sha256() {
-            Some(expected) if expected != hash => {
+            Some(expected) if !expected.trim().eq_ignore_ascii_case(&hash) => {
                 return Err(format!(
                     "Security Alert for {}: SHA-256 mismatch!\nExpected: {}\nGot:      {}",
                     name, expected, hash
@@ -105,7 +122,7 @@ pub fn install_from_manifest() -> Result<(), String> {
         }
 
         // Try tarball extraction
-        let tar_gz = GzDecoder::new(Cursor::new(bytes.clone()));
+        let tar_gz = GzDecoder::new(Cursor::new(&bytes[..]));
         let mut archive = Archive::new(tar_gz);
         let staging = std::path::Path::new("donky_modules").join(format!(".{}_staging", name));
         let _ = fs::remove_dir_all(&staging);
@@ -212,6 +229,9 @@ fn write_lockfile(manifest: &Manifest) -> Result<(), String> {
 }
 
 pub fn add_dependency(name: &str, url_or_path: &str) -> Result<(), String> {
+    if !valid_pkg_name(name) {
+        return Err(format!("Invalid package name '{}': use letters, digits, '_', '-', '.' only", name));
+    }
     let manifest_str = fs::read_to_string("donky.json").unwrap_or_else(|_| {
         r#"{"name":"app","version":"0.1.0","dependencies":{}}"#.to_string()
     });
@@ -225,7 +245,7 @@ pub fn add_dependency(name: &str, url_or_path: &str) -> Result<(), String> {
         Dependency::Detailed(DetailedDep { url: None, sha256: None, path: Some(abs.to_string_lossy().to_string()) })
     } else {
         println!("Fetching {}...", url_or_path);
-        let resp = ureq::get(url_or_path).call().map_err(|e| e.to_string())?;
+        let resp = http_agent().get(url_or_path).call().map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         resp.into_reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         let mut hasher = Sha256::new();

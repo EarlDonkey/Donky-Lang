@@ -8,7 +8,11 @@ pub enum MapKey { String(String), Number(usize), Bool(bool) }
 
 impl MapKey {
     pub fn from_value(v: Value, heap: &Heap) -> Result<MapKey, String> {
-        if v.is_number() { Ok(MapKey::Number(v.as_f64().to_bits() as usize)) }
+        if v.is_number() {
+            let mut n = v.as_f64();
+            if n == 0.0 { n = 0.0; } // -0.0 == 0.0, so both must hash to the same key
+            Ok(MapKey::Number(n.to_bits() as usize))
+        }
         else if v.is_bool() { Ok(MapKey::Bool(v.as_bool())) }
         else if v.is_string() { Ok(MapKey::String(heap.get_string(v.payload()).clone())) }
         else { Err("Map keys must be strings, numbers, or bools".to_string()) }
@@ -109,7 +113,11 @@ impl Value {
     fn render(self, heap: &Heap, depth: usize) -> String {
         const MAX_DEPTH: usize = 8;
         match self.kind() {
-            ValueKind::Number(n) => if n.fract() == 0.0 { format!("{:.0}", n) } else { n.to_string() },
+            ValueKind::Number(n) => {
+                if n == 0.0 { "0".to_string() }                       // never print "-0"
+                else if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 { format!("{:.0}", n) }
+                else { n.to_string() }                               // huge / fractional / inf / NaN
+            }
             ValueKind::Bool(b) => b.to_string(),
             ValueKind::Null => "null".to_string(),
             ValueKind::String(idx) => heap.get_string(idx).clone(),
@@ -207,13 +215,23 @@ pub struct Heap {
     pub objects: Vec<Option<HeapObject>>,
     marks: Vec<bool>,
     next_gc: usize,
+    free_list: Vec<u32>, // swept slots, reused by alloc() so the object table stops growing forever
+    live: usize,         // number of occupied slots (what GC pacing should look at)
 }
 
 impl Heap {
-    pub fn new() -> Self { Heap { objects: Vec::new(), marks: Vec::new(), next_gc: 1024 } }
-    pub fn needs_gc(&self) -> bool { self.objects.len() >= self.next_gc }
+    pub fn new() -> Self {
+        Heap { objects: Vec::new(), marks: Vec::new(), next_gc: 1024, free_list: Vec::new(), live: 0 }
+    }
+    pub fn needs_gc(&self) -> bool { self.live >= self.next_gc }
 
     pub fn alloc(&mut self, obj: HeapObject) -> u32 {
+        self.live += 1;
+        if let Some(idx) = self.free_list.pop() {
+            self.objects[idx as usize] = Some(obj);
+            self.marks[idx as usize] = false;
+            return idx;
+        }
         let idx = self.objects.len() as u32;
         self.objects.push(Some(obj));
         self.marks.push(false);
@@ -247,43 +265,55 @@ impl Heap {
 
     pub fn collect_garbage(&mut self, roots: &[Value]) {
         for m in self.marks.iter_mut() { *m = false; }
-        for r in roots { self.mark_value(*r); }
-        let mut freed = 0;
+        let mut work: Vec<u32> = Vec::new();
+        for r in roots { Self::push_ref(*r, &mut work); }
+        self.mark_from(&mut work);
+
+        let mut freed = 0usize;
+        self.free_list.clear();
         for i in 0..self.objects.len() {
-            if !self.marks[i] && self.objects[i].is_some() {
-                self.objects[i] = None; freed += 1;
+            if self.objects[i].is_some() && !self.marks[i] {
+                self.objects[i] = None;
+                freed += 1;
             }
+            if self.objects[i].is_none() { self.free_list.push(i as u32); }
         }
-        self.next_gc = std::cmp::max(1024, self.objects.len() * 2);
+        self.live = self.objects.len() - self.free_list.len();
+        self.next_gc = std::cmp::max(1024, self.live * 2);
         if std::env::var("DONKY_GC_LOG").is_ok() {
-            println!("[GC] Swept {} objects. Heap size: {}", freed, self.objects.len());
+            println!("[GC] Swept {} objects. Live: {} (table {})", freed, self.live, self.objects.len());
         }
     }
 
-    fn mark_value(&mut self, v: Value) {
+    #[inline]
+    fn push_ref(v: Value, work: &mut Vec<u32>) {
         if v.is_number() || v.is_null() || v.is_bool() { return; }
-        self.mark_object(v.payload());
+        work.push(v.payload());
     }
 
-    fn mark_object(&mut self, idx: u32) {
-        let i = idx as usize;
-        if i >= self.objects.len() || self.marks[i] || self.objects[i].is_none() { return; }
-        self.marks[i] = true;
-        let obj = self.objects[i].as_ref().unwrap().clone();
-        match obj {
-            HeapObject::String(_) | HeapObject::CodeFunction(_) => {}
-            HeapObject::Array(arr) => { for v in arr { self.mark_value(v); } }
-            HeapObject::Map(map) => { for v in map.values() { self.mark_value(*v); } }
-            HeapObject::Struct(_, fields) => { for v in fields.values() { self.mark_value(*v); } }
-            HeapObject::Function { captured, .. } => {
-                if let Some(env) = captured {
-                    let vals: Vec<Value> = env.borrow().iter().flat_map(|s| s.values().copied()).collect();
-                    for v in vals { self.mark_value(v); }
+    /// Worklist marking: no recursion (deeply nested data can't overflow the Rust stack)
+    /// and no per-object clone (the old version deep-copied every array/map it visited).
+    fn mark_from(&mut self, work: &mut Vec<u32>) {
+        while let Some(idx) = work.pop() {
+            let i = idx as usize;
+            if i >= self.objects.len() || self.marks[i] { continue; }
+            let obj = match self.objects[i].as_ref() { Some(o) => o, None => continue };
+            self.marks[i] = true;
+            match obj {
+                HeapObject::String(_) | HeapObject::CodeFunction(_) => {}
+                HeapObject::Array(arr) => { for v in arr { Self::push_ref(*v, work); } }
+                HeapObject::Map(map) => { for v in map.values() { Self::push_ref(*v, work); } }
+                HeapObject::Struct(_, fields) => { for v in fields.values() { Self::push_ref(*v, work); } }
+                HeapObject::Function { captured, .. } => {
+                    if let Some(env) = captured {
+                        for scope in env.borrow().iter() {
+                            for v in scope.values() { Self::push_ref(*v, work); }
+                        }
+                    }
                 }
-            }
-            HeapObject::Closure { captured, .. } => {
-                let vals: Vec<Value> = captured.borrow().clone();
-                for v in vals { self.mark_value(v); }
+                HeapObject::Closure { captured, .. } => {
+                    for v in captured.borrow().iter() { Self::push_ref(*v, work); }
+                }
             }
         }
     }
