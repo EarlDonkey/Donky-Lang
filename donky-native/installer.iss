@@ -9,7 +9,7 @@
 ;
 ;      dist\bin\donky.exe        <- target\release\donky-native.exe (renamed)
 ;      dist\lib\runtime.o        <- gcc -O2 -c runtime_template.c
-;      dist\lib\*.donk           <- lib\*.donk (recursive)
+;      dist\lib\libffi.a         <- static libffi from the build machine's MinGW (no DLL needed);      dist\lib\*.donk           <- lib\*.donk (recursive)
 ;      dist\examples\...         <- examples\* (build.ps1 skips it if > 50 MB)
 ;
 ;  If you move this file into a subfolder (e.g. installer\), add
@@ -94,6 +94,8 @@ Name: "addtopath"; Description: "Add Donky to the &PATH environment variable (re
 Source: "{#MySourceDir}\bin\donky.exe";      DestDir: "{app}\bin";      Flags: ignoreversion
 ; Pre-compiled C runtime. donky.exe finds it at {exe_dir}\..\lib\runtime.o.
 Source: "{#MySourceDir}\lib\runtime.o";      DestDir: "{app}\lib";      Flags: ignoreversion
+; Static libffi, picked up by donky.exe via -L{app}\lib when the user's MinGW has none. No libffi-8.dll is shipped.
+Source: "{#MySourceDir}\lib\libffi.a";       DestDir: "{app}\lib";      Flags: ignoreversion
 ; Standard library (os.donk, math.donk, micrograd.donk, ...). recursesubdirs keeps any lib\ subfolders.
 Source: "{#MySourceDir}\lib\*.donk";         DestDir: "{app}\lib";      Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; Examples are optional: build.ps1 only stages them when the folder is under 50 MB.

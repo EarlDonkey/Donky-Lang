@@ -1,0 +1,33 @@
+// Load the C standard library
+let libc = dll_load("msvcrt.dll");
+let qsort = dll_sym(libc, "qsort");
+
+// Define our comparator: int cmp(const void* a, const void* b)
+fn my_cmp(a, b) {
+    let ia = ffi_peek(a, 4); // Read int32 from pointer
+    let ib = ffi_peek(b, 4);
+    if ia < ib { return -1; }
+    if ia > ib { return 1; }
+    return 0;
+}
+
+// Create the C function pointer
+let cmp_ptr = dll_callback("i", "pp", my_cmp);
+
+// Allocate memory for 5 ints (5 * 4 bytes = 20 bytes)
+let arr = ffi_alloc(20);
+ffi_poke(arr, 4, 5);
+ffi_poke(arr + 4, 4, 2);
+ffi_poke(arr + 8, 4, 9);
+ffi_poke(arr + 12, 4, 1);
+ffi_poke(arr + 16, 4, 7);
+
+// void qsort(void *base, size_t nitems, size_t size, int (*compar)(const void *, const void *))
+dll_call_sig(qsort, "v", "pLLp", [arr, 5, 4, cmp_ptr]);
+
+// Read back the sorted array
+print(ffi_peek(arr, 4));       // 1
+print(ffi_peek(arr + 4, 4));   // 2
+print(ffi_peek(arr + 8, 4));   // 5
+print(ffi_peek(arr + 12, 4));  // 7
+print(ffi_peek(arr + 16, 4));  // 9

@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <ffi.h>
 #ifdef _WIN32
 #include <conio.h>
 
@@ -54,7 +55,10 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
+#include #include <sys/mman.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/syscall.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -1777,6 +1781,263 @@ uint64_t donky_dll_calli(uint64_t fn_val, uint64_t args_val) {
     return make_number((double)(int32_t)ffi_invoke(fn_val, args_val));
 }
 
+// --- libffi-backed typed FFI (donky_dll_call_sig / donky_dll_callback) ---
+// Type chars:  v void   i int32   u uint32   l int64   L uint64   f float   d double
+//              s char* (Donky string or null)   p pointer-as-number
+// Numbers cross the boundary as doubles, so 'l'/'L' values above 2^53 lose precision and
+// pointers must fit in 48 bits (true for user-space pointers on x64/arm64).
+#define DK_FFI_MAX_ARGS 32     // dll_call_sig
+#define DK_CB_MAX_ARGS   8     // dll_callback
+
+typedef union {
+    int32_t i; uint32_t u; int64_t l; uint64_t L;
+    float f; double d; void* p;
+    ffi_arg a; ffi_sarg sa;     // widened integer returns (libffi writes a full ffi_arg)
+} DkFfiSlot;
+
+static uint64_t dk_ffi_err(const char* msg) {
+    donky_throw(donky_alloc_string(msg));
+    return TAG_BASE;
+}
+
+static ffi_type* dk_ffi_type_of(char c) {
+    switch (c) {
+        case 'v': return &ffi_type_void;
+        case 'i': return &ffi_type_sint32;
+        case 'u': return &ffi_type_uint32;
+        case 'l': return &ffi_type_sint64;
+        case 'L': return &ffi_type_uint64;
+        case 'f': return &ffi_type_float;
+        case 'd': return &ffi_type_double;
+        case 's': case 'p': return &ffi_type_pointer;
+        default:  return NULL;
+    }
+}
+
+// number/bool -> int64, saturating (no UB on NaN / out-of-range doubles). Anything else -> 0.
+static int64_t dk_ffi_to_i64(uint64_t v) {
+    if (is_number(v)) {
+        double d = as_number(v);
+        if (d != d) return 0;
+        if (d >= 9223372036854775807.0)  return INT64_MAX;
+        if (d <= -9223372036854775808.0) return INT64_MIN;
+        return (int64_t)d;
+    }
+    if (get_tag(v) == TAG_BOOL) return (int64_t)(v & 1);
+    return 0;
+}
+
+// number/bool -> uint64. Negative numbers wrap (two's complement), so -1 -> 0xFFFF...FFFF.
+static uint64_t dk_ffi_to_u64(uint64_t v) {
+    if (is_number(v)) {
+        double d = as_number(v);
+        if (d >= 18446744073709551615.0) return UINT64_MAX;
+        if (d >= 9223372036854775808.0)  return (uint64_t)d;
+    }
+    return (uint64_t)dk_ffi_to_i64(v);
+}
+
+static int dk_ffi_is_numeric(uint64_t v) { return is_number(v) || get_tag(v) == TAG_BOOL; }
+
+// 'p' accepts a number (address), a string (its char*), a bool (0/1) or null (NULL).
+static void* dk_ffi_to_ptr(uint64_t v) {
+    if (is_number(v))               return (void*)(uintptr_t)dk_ffi_to_u64(v);
+    if (get_tag(v) == TAG_STRING)   return (void*)(uintptr_t)as_index(v);
+    if (get_tag(v) == TAG_BOOL)     return (void*)(uintptr_t)(v & 1);
+    return NULL;
+}
+
+uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg_types_val, uint64_t args_val) {
+    // Keep the args array (and the strings it owns) visible to the conservative GC stack scan
+    // for the whole call: a callback may allocate, and the compiler could otherwise drop args_val.
+    volatile uint64_t gc_keep = args_val;
+    char msg[96];
+
+    if (!is_number(fn_val)) return dk_ffi_err("dll_call_sig: function must be a pointer from dll_sym or dll_callback");
+    uintptr_t fnaddr = (uintptr_t)dk_ffi_to_u64(fn_val);
+    if (!fnaddr) return dk_ffi_err("dll_call_sig: null function pointer");
+
+    if (get_tag(ret_type_val) != TAG_STRING || strlen((const char*)as_index(ret_type_val)) != 1)
+        return dk_ffi_err("dll_call_sig: return type must be a 1-char string (v i u l L f d s p)");
+    char rt = ((const char*)as_index(ret_type_val))[0];
+    ffi_type* rtype = dk_ffi_type_of(rt);
+    if (!rtype) { snprintf(msg, sizeof msg, "dll_call_sig: bad return type '%c'", rt); return dk_ffi_err(msg); }
+
+    const char* at = "";                                   // null arg-type string = no arguments
+    if (get_tag(arg_types_val) == TAG_STRING) at = (const char*)as_index(arg_types_val);
+    else if (arg_types_val != TAG_BASE) return dk_ffi_err("dll_call_sig: arg types must be a string (or null for none)");
+    size_t n = strlen(at);
+    if (n > DK_FFI_MAX_ARGS) return dk_ffi_err("dll_call_sig: too many arguments (max 32)");
+
+    Array* arr = NULL;
+    size_t have = 0;
+    if (get_tag(args_val) == TAG_ARRAY) { arr = (Array*)as_index(args_val); have = arr->len; }
+    else if (n != 0) return dk_ffi_err("dll_call_sig: args must be an array");
+    if (have != n) {
+        snprintf(msg, sizeof msg, "dll_call_sig: signature has %zu args but %zu were given", n, have);
+        return dk_ffi_err(msg);
+    }
+
+    ffi_type* atypes[DK_FFI_MAX_ARGS + 1];
+    void*     aptrs[DK_FFI_MAX_ARGS + 1];
+    DkFfiSlot slots[DK_FFI_MAX_ARGS + 1];
+    for (size_t i = 0; i < n; i++) {
+        char t = at[i];
+        uint64_t v = arr->data[i];
+        memset(&slots[i], 0, sizeof slots[i]);
+        atypes[i] = (t == 'v') ? NULL : dk_ffi_type_of(t);
+        if (!atypes[i]) { snprintf(msg, sizeof msg, "dll_call_sig: bad arg type '%c' at position %zu", t, i); return dk_ffi_err(msg); }
+        switch (t) {
+            case 'i': case 'u': case 'l': case 'L': case 'f': case 'd':
+                if (!dk_ffi_is_numeric(v)) {
+                    snprintf(msg, sizeof msg, "dll_call_sig: arg %zu ('%c') must be a number", i, t);
+                    return dk_ffi_err(msg);
+                }
+                if      (t == 'i') slots[i].i = (int32_t)dk_ffi_to_i64(v);
+                else if (t == 'u') slots[i].u = (uint32_t)dk_ffi_to_u64(v);
+                else if (t == 'l') slots[i].l = dk_ffi_to_i64(v);
+                else if (t == 'L') slots[i].L = dk_ffi_to_u64(v);
+                else if (t == 'f') slots[i].f = is_number(v) ? (float)as_number(v) : (float)(v & 1);
+                else               slots[i].d = is_number(v) ? as_number(v) : (double)(v & 1);
+                break;
+            case 's':
+                if (get_tag(v) == TAG_STRING) slots[i].p = (void*)(uintptr_t)as_index(v);
+                else if (v == TAG_BASE)       slots[i].p = NULL;
+                else {
+                    snprintf(msg, sizeof msg, "dll_call_sig: arg %zu ('s') must be a string or null", i);
+                    return dk_ffi_err(msg);
+                }
+                break;
+            case 'p':
+                slots[i].p = dk_ffi_to_ptr(v);
+                break;
+        }
+        aptrs[i] = &slots[i];
+    }
+
+    ffi_cif cif;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, rtype, atypes) != FFI_OK)
+        return dk_ffi_err("dll_call_sig: ffi_prep_cif failed");
+
+    DkFfiSlot rv;
+    memset(&rv, 0, sizeof rv);
+    ffi_call(&cif, (void (*)(void))fnaddr, &rv, aptrs);
+    (void)gc_keep;
+
+    switch (rt) {
+        case 'v': return TAG_BASE;
+        case 'i': return make_number((double)(int32_t)rv.sa);
+        case 'u': return make_number((double)(uint32_t)rv.a);
+        case 'l': return make_number((double)rv.l);
+        case 'L': return make_number((double)rv.L);
+        case 'f': return make_number((double)rv.f);
+        case 'd': return make_number(rv.d);
+        case 's': return rv.p ? donky_alloc_string((const char*)rv.p) : TAG_BASE;
+        case 'p': return make_number((double)(uint64_t)(uintptr_t)rv.p);
+    }
+    return TAG_BASE;
+}
+
+// ---- callbacks: Donky function -> C function pointer ----
+typedef struct DkCallback {
+    ffi_cif   cif;
+    ffi_type* atypes[DK_CB_MAX_ARGS];
+    void*     code;                       // the C-callable entry point handed to the library
+    uint64_t  fn;                         // raw Donky code address (AOT convention, as in donky_spawn)
+    int       nargs;
+    char      rt;
+    char      at[DK_CB_MAX_ARGS + 1];
+} DkCallback;
+
+typedef uint64_t (*DkCbFn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t, uint64_t);
+
+static uint64_t dk_ffi_arg_to_donky(char t, void* p) {
+    switch (t) {
+        case 'i': return make_number((double)*(int32_t*)p);
+        case 'u': return make_number((double)*(uint32_t*)p);
+        case 'l': return make_number((double)*(int64_t*)p);
+        case 'L': return make_number((double)*(uint64_t*)p);
+        case 'f': return make_number((double)*(float*)p);
+        case 'd': return make_number(*(double*)p);
+        case 's': { const char* s = *(const char**)p; return s ? donky_alloc_string(s) : TAG_BASE; }
+        case 'p': return make_number((double)(uint64_t)(uintptr_t)*(void**)p);
+    }
+    return TAG_BASE;
+}
+
+// Called by libffi on the C caller's thread, inside the C caller's frame.
+static void dk_ffi_trampoline(ffi_cif* cif, void* ret, void** args, void* userdata) {
+    (void)cif;
+    DkCallback* cb = (DkCallback*)userdata;
+    if (cb->rt != 'v') memset(ret, 0, sizeof(ffi_arg));      // C sees 0 if we bail out below
+    if (donky_has_exception()) return;                       // an earlier call already threw: don't run more Donky code
+
+    uint64_t a[DK_CB_MAX_ARGS];
+    for (int i = 0; i < DK_CB_MAX_ARGS; i++)
+        a[i] = i < cb->nargs ? dk_ffi_arg_to_donky(cb->at[i], args[i]) : TAG_BASE;   // unused params read as null
+
+    uint64_t r = ((DkCbFn)(uintptr_t)cb->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    if (donky_has_exception()) return;                       // stays pending; surfaces when the C call returns
+
+    switch (cb->rt) {
+        case 'v': break;
+        case 'i': *(ffi_sarg*)ret = (int32_t)dk_ffi_to_i64(r); break;
+        case 'u': *(ffi_arg*)ret  = (uint32_t)dk_ffi_to_u64(r); break;
+        case 'l': *(int64_t*)ret  = dk_ffi_to_i64(r); break;
+        case 'L': *(uint64_t*)ret = dk_ffi_to_u64(r); break;
+        case 'f': *(float*)ret    = is_number(r) ? (float)as_number(r) : 0.0f; break;
+        case 'd': *(double*)ret   = is_number(r) ? as_number(r) : 0.0; break;
+        case 'p': *(void**)ret    = is_number(r) ? (void*)(uintptr_t)dk_ffi_to_u64(r) : NULL; break;
+    }
+}
+
+// func_val is the RAW code address the AOT produces for a function name (same as donky_spawn's
+// func_val), not a boxed number. Returns the C entry point as a number (use with type 'p').
+// Callbacks are never freed (they are meant to live for the whole program).
+uint64_t donky_dll_callback(uint64_t ret_type_val, uint64_t arg_types_val, uint64_t func_val) {
+    char msg[96];
+    if (func_val == 0 || (func_val >> 48) != 0)
+        return dk_ffi_err("dll_callback: third argument must be a function");
+
+    if (get_tag(ret_type_val) != TAG_STRING || strlen((const char*)as_index(ret_type_val)) != 1)
+        return dk_ffi_err("dll_callback: return type must be a 1-char string (v i u l L f d p)");
+    char rt = ((const char*)as_index(ret_type_val))[0];
+    if (rt == 's') return dk_ffi_err("dll_callback: return type 's' is not supported (a Donky string may be freed by the GC); use 'p'");
+    ffi_type* rtype = dk_ffi_type_of(rt);
+    if (!rtype) { snprintf(msg, sizeof msg, "dll_callback: bad return type '%c'", rt); return dk_ffi_err(msg); }
+
+    const char* at = "";
+    if (get_tag(arg_types_val) == TAG_STRING) at = (const char*)as_index(arg_types_val);
+    else if (arg_types_val != TAG_BASE) return dk_ffi_err("dll_callback: arg types must be a string (or null for none)");
+    size_t n = strlen(at);
+    if (n > DK_CB_MAX_ARGS) return dk_ffi_err("dll_callback: too many arguments (max 8)");
+
+    DkCallback* cb = (DkCallback*)calloc(1, sizeof *cb);
+    if (!cb) return dk_ffi_err("dll_callback: out of memory");
+    for (size_t i = 0; i < n; i++) {
+        ffi_type* t = at[i] == 'v' ? NULL : dk_ffi_type_of(at[i]);
+        if (!t) {
+            snprintf(msg, sizeof msg, "dll_callback: bad arg type '%c' at position %zu", at[i], i);
+            free(cb); return dk_ffi_err(msg);
+        }
+        cb->atypes[i] = t;
+        cb->at[i] = at[i];
+    }
+    cb->nargs = (int)n; cb->rt = rt; cb->fn = func_val;
+
+    if (ffi_prep_cif(&cb->cif, FFI_DEFAULT_ABI, (unsigned)n, rtype, cb->atypes) != FFI_OK) {
+        free(cb); return dk_ffi_err("dll_callback: ffi_prep_cif failed");
+    }
+    ffi_closure* closure = (ffi_closure*)ffi_closure_alloc(sizeof(ffi_closure), &cb->code);
+    if (!closure) { free(cb); return dk_ffi_err("dll_callback: ffi_closure_alloc failed"); }
+    if (ffi_prep_closure_loc(closure, &cb->cif, dk_ffi_trampoline, cb, cb->code) != FFI_OK) {
+        ffi_closure_free(closure); free(cb);
+        return dk_ffi_err("dll_callback: ffi_prep_closure_loc failed");
+    }
+    return make_number((double)(uint64_t)(uintptr_t)cb->code);
+}
+
 // Read a NUL-terminated char* (as returned by dll_call) into a Donky string
 uint64_t donky_ffi_cstr(uint64_t ptr_val) {
     if (!is_number(ptr_val)) return donky_alloc_string("");
@@ -2606,6 +2867,173 @@ uint64_t donky_sys_eputs(uint64_t s) {
 uint64_t donky_sys_exit(uint64_t code) {
     fflush(stdout); fflush(stderr);
     exit(is_number(code) ? (int)as_number(code) : 0);
+    return 0;
+}
+
+// ---- raw syscalls + executable memory ------------------------------------------------------
+// All values are NaN-boxed Donky values (like every other runtime function): numbers in,
+// numbers out. Bad ARGUMENTS throw a Donky error; an OS-level failure is reported through the
+// return value (0 / 0.0), the way C reports it.
+//
+// Typical JIT flow:   p = mem_alloc(4096); mem_write(p, code); mem_protect(p, 4096, 2);
+//                     r = dll_call_sig(p, "i", "", []); mem_free(p, 4096);
+// Pointers travel as doubles, so they must fit in 48 bits (true for user-space on x64/arm64).
+
+// Make freshly written code visible to the instruction fetcher (required on arm64, a no-op on x86).
+static void dk_icache_flush(void* p, size_t n) {
+#if defined(_WIN32)
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+#elif defined(__GNUC__)
+    __builtin___clear_cache((char*)p, (char*)p + n);
+#else
+    (void)p; (void)n;
+#endif
+}
+
+// A usable address: a whole number in [1, 2^48).
+static int dk_mem_ptr(uint64_t v, void** out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (!(d >= 1.0) || d >= 281474976710656.0 || d != floor(d)) return 0;
+    *out = (void*)(uintptr_t)(uint64_t)d;
+    return 1;
+}
+
+// A byte count: a whole number in [1, 2^52].
+static int dk_mem_size(uint64_t v, size_t* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (!(d >= 1.0) || d > 4503599627370496.0 || d != floor(d)) return 0;
+    *out = (size_t)d;
+    return 1;
+}
+
+// syscall(nr, [a0..a5]): POSIX only. args is an array of up to 6 values (or null for none).
+// Numbers/bools are passed as 64-bit integers (negatives wrap, so -1 -> 0xFFFF...FFFF);
+// a string is passed as its char* (handy for write/open). Returns the raw result as a signed
+// number: -1 when the call failed. The syscall number is NOT validated: a bad number is the
+// kernel's problem, exactly as in C.
+uint64_t donky_syscall(uint64_t nr_val, uint64_t args_val) {
+#if defined(_WIN32)
+    (void)nr_val; (void)args_val;
+    return dk_ffi_err("syscall is not supported on Windows; use dll_call_sig with ntdll.dll");
+#elif defined(__linux__) || defined(__APPLE__)
+    if (!is_number(nr_val)) return dk_ffi_err("syscall: number must be a number");
+    uint64_t a[6] = {0, 0, 0, 0, 0, 0};
+    if (args_val != TAG_BASE) {
+        if (get_tag(args_val) != TAG_ARRAY) return dk_ffi_err("syscall: args must be an array (or null)");
+        Array* arr = (Array*)as_index(args_val);
+        if (arr->len > 6) return dk_ffi_err("syscall: too many arguments (max 6)");
+        for (size_t i = 0; i < arr->len; i++) {
+            uint64_t v = arr->data[i];
+            if (dk_ffi_is_numeric(v))             a[i] = dk_ffi_to_u64(v);
+            else if (get_tag(v) == TAG_STRING)    a[i] = (uint64_t)(uintptr_t)as_index(v);
+            else {
+                char msg[64];
+                snprintf(msg, sizeof msg, "syscall: arg %zu must be a number or string", i);
+                return dk_ffi_err(msg);
+            }
+        }
+    }
+#ifdef __APPLE__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"   // syscall() is deprecated on macOS
+#endif
+    long r = (long)syscall((long)dk_ffi_to_u64(nr_val), a[0], a[1], a[2], a[3], a[4], a[5]);
+#ifdef __APPLE__
+#pragma GCC diagnostic pop
+#endif
+    return make_number((double)(int64_t)r);
+#else
+    (void)nr_val; (void)args_val;
+    return dk_ffi_err("syscall is not supported on this platform");
+#endif
+}
+
+// Page-aligned, zero-filled, read/write block. Returns the address, or 0 if the OS refused.
+uint64_t donky_mem_alloc(uint64_t size_val) {
+    size_t sz;
+    if (!dk_mem_size(size_val, &sz)) return dk_ffi_err("mem_alloc: size must be a positive whole number");
+#ifdef _WIN32
+    void* p = VirtualAlloc(NULL, sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) p = NULL;
+#endif
+    return make_number((double)(uint64_t)(uintptr_t)p);
+}
+
+// Copies a string's bytes, or an array of numbers 0-255, to ptr. Returns the byte count.
+// The array is validated in full before the first byte is written. The target must be writable
+// (protection 1 or 3), otherwise the process faults like any C store would.
+uint64_t donky_mem_write(uint64_t ptr_val, uint64_t bytes_val) {
+    void* dst;
+    if (!dk_mem_ptr(ptr_val, &dst)) return dk_ffi_err("mem_write: ptr must be a non-null address from mem_alloc");
+    size_t n = 0;
+    if (!is_number(bytes_val) && get_tag(bytes_val) == TAG_STRING) {
+        const char* s = (const char*)as_index(bytes_val);
+        n = str_len(s);
+        if (n) memcpy(dst, s, n);
+    } else if (!is_number(bytes_val) && get_tag(bytes_val) == TAG_ARRAY) {
+        Array* arr = (Array*)as_index(bytes_val);
+        n = arr->len;
+        for (size_t i = 0; i < n; i++) {
+            uint64_t v = arr->data[i];
+            double d = is_number(v) ? as_number(v) : -1.0;
+            if (!(d >= 0.0 && d <= 255.0 && d == floor(d))) {
+                char msg[80];
+                snprintf(msg, sizeof msg, "mem_write: element %zu is not a byte (0-255)", i);
+                return dk_ffi_err(msg);
+            }
+        }
+        uint8_t* o = (uint8_t*)dst;
+        for (size_t i = 0; i < n; i++) o[i] = (uint8_t)as_number(arr->data[i]);
+    } else {
+        return dk_ffi_err("mem_write: bytes must be a string or an array of numbers (0-255)");
+    }
+    if (n) dk_icache_flush(dst, n);
+    return make_number((double)n);
+}
+
+// prot: 1 = read/write (also used when prot is null), 2 = read/execute, 3 = read/write/execute.
+// Returns 1.0 on success, 0.0 if the OS refused (e.g. RWX forbidden by SELinux / hardened runtime,
+// or a non-page-aligned ptr on POSIX). Pass pointers returned by mem_alloc.
+uint64_t donky_mem_protect(uint64_t ptr_val, uint64_t size_val, uint64_t prot_val) {
+    void* p; size_t sz;
+    if (!dk_mem_ptr(ptr_val, &p))      return dk_ffi_err("mem_protect: ptr must be a non-null address from mem_alloc");
+    if (!dk_mem_size(size_val, &sz))   return dk_ffi_err("mem_protect: size must be a positive whole number");
+    int prot = 1;
+    if (prot_val != TAG_BASE) {
+        double d = is_number(prot_val) ? as_number(prot_val) : 0.0;
+        if (d != 1.0 && d != 2.0 && d != 3.0) return dk_ffi_err("mem_protect: prot must be 1 (RW), 2 (RX) or 3 (RWX)");
+        prot = (int)d;
+    }
+#ifdef _WIN32
+    DWORD np = prot == 1 ? PAGE_READWRITE : prot == 2 ? PAGE_EXECUTE_READ : PAGE_EXECUTE_READWRITE;
+    DWORD old = 0;
+    int ok = VirtualProtect(p, sz, np, &old) != 0;
+#else
+    int np = prot == 1 ? (PROT_READ | PROT_WRITE)
+           : prot == 2 ? (PROT_READ | PROT_EXEC)
+                       : (PROT_READ | PROT_WRITE | PROT_EXEC);
+    int ok = mprotect(p, sz, np) == 0;
+#endif
+    if (ok && prot >= 2) dk_icache_flush(p, sz);
+    return make_number(ok ? 1.0 : 0.0);
+}
+
+// Releases a mem_alloc block. size must be the size given to mem_alloc (munmap needs it; Windows
+// ignores it). A bad ptr/size is a silent no-op, like free(NULL). Always returns 0.
+uint64_t donky_mem_free(uint64_t ptr_val, uint64_t size_val) {
+    void* p; size_t sz = 0;
+    if (!dk_mem_ptr(ptr_val, &p)) return 0;
+    (void)dk_mem_size(size_val, &sz);
+#ifdef _WIN32
+    (void)sz;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    if (sz) munmap(p, sz);
+#endif
     return 0;
 }
 

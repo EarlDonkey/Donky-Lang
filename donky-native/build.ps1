@@ -10,6 +10,11 @@
 # Requires on PATH: cargo (Rust), gcc (MinGW-w64), and Inno Setup 6 (iscc.exe is also
 # searched for in the standard install folders).
 #
+# Also requires libffi development files visible to gcc: ffi.h AND a STATIC libffi.a.
+#   MSYS2 MINGW64:  pacman -S mingw-w64-x86_64-libffi
+#   MSYS2 UCRT64:   pacman -S mingw-w64-ucrt-x86_64-libffi
+# libffi.a is staged to dist\lib and shipped by the installer; no libffi-8.dll is needed.
+#
 # Exit codes: 0 ok | 2 preflight | 3 cargo | 4 runtime compile | 5 staging | 6 self-test | 7 installer
 
 [CmdletBinding()]
@@ -157,6 +162,37 @@ if (-not (Test-Path $IssFile))    { Fail "installer.iss not found at $IssFile" 2
 if (-not (Test-Path (Join-Path $Root 'Cargo.toml'))) { Fail 'Cargo.toml not found - run this script from the repo root.' 2 }
 if (-not (Test-Path (Join-Path $ParentDir 'lib')))   { Fail 'lib\ directory not found (expected lib\*.donk).' 2 }
 
+# libffi: verify ffi.h AND a static libffi.a by compiling, statically linking and running a tiny program.
+$ffiTmp = Join-Path ([System.IO.Path]::GetTempPath()) ('donky-ffi-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $ffiTmp | Out-Null
+try {
+    $ffiC   = Join-Path $ffiTmp 'ffi_check.c'
+    $ffiExe = Join-Path $ffiTmp 'ffi_check.exe'
+    Set-Content -LiteralPath $ffiC -Encoding ASCII -Value @(
+        '#include <ffi.h>',
+        'int main(void) {',
+        '    ffi_cif cif; ffi_type *args[1];',
+        '    return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, &ffi_type_void, args) == FFI_OK ? 0 : 1;',
+        '}')
+    $r = Invoke-Native -Exe $gcc -Arguments @('-DFFI_STATIC_BUILD', $ffiC, '-o', $ffiExe, '-Wl,-Bstatic', '-lffi', '-Wl,-Bdynamic')
+    if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $ffiExe)) {
+        Show-Failure -What 'libffi check (ffi.h + static libffi.a)' -Result $r
+        Fail ("gcc could not compile/link against libffi. Install it, e.g. in an MSYS2 shell:`n" +
+              "  pacman -S mingw-w64-x86_64-libffi        (MINGW64)`n" +
+              "  pacman -S mingw-w64-ucrt-x86_64-libffi   (UCRT64)`n" +
+              "The package must provide ffi.h and libffi.a, and gcc must be the matching toolchain.") 2
+    }
+    $ra = Invoke-Native -Exe $ffiExe
+    if ($ra.ExitCode -ne 0) { Fail "libffi check program built but failed (exit $($ra.ExitCode))." 2 }
+} finally {
+    Remove-Item -LiteralPath $ffiTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+$LibFfiA = (& $gcc '-print-file-name=libffi.a' 2>$null | Select-Object -First 1)
+if (-not $LibFfiA -or -not (Test-Path -LiteralPath $LibFfiA)) {
+    Fail 'gcc linked libffi but libffi.a could not be located (needed to ship with the installer).' 2
+}
+Write-Host "  libffi: $LibFfiA"
+
 $gccMachine = (& $gcc -dumpmachine 2>$null | Select-Object -First 1)
 Write-Host "  cargo : $cargo"
 Write-Host "  gcc   : $gcc  ($gccMachine)"
@@ -191,7 +227,7 @@ if (-not (Test-Path -LiteralPath $CargoExe)) { Fail "cargo succeeded but $CargoE
 #                    applied here: it does nothing at link time once runtime.o is pre-built.
 # ---------------------------------------------------------------------------
 Step 'Compiling C runtime (runtime.o)'
-$gccArgs = @('-O2', '-mstackrealign', '-c', $RuntimeSrc, '-o', $RuntimeObj)
+$gccArgs = @('-O2', '-mstackrealign', '-DFFI_STATIC_BUILD', '-c', $RuntimeSrc, '-o', $RuntimeObj)
 $r = Invoke-Native -Exe $gcc -Arguments $gccArgs
 if ($r.ExitCode -ne 0) {
     # Fallback: older MinGW-w64 headers default to a pre-Vista _WIN32_WINNT and hide
@@ -215,6 +251,7 @@ New-Item -ItemType Directory -Force -Path @($DistBin, $DistLib, $DistExamples) |
 
 Copy-Item -LiteralPath $CargoExe   -Destination (Join-Path $DistBin 'donky.exe') -Force
 Copy-Item -LiteralPath $RuntimeObj -Destination (Join-Path $DistLib 'runtime.o') -Force
+Copy-Item -LiteralPath $LibFfiA    -Destination (Join-Path $DistLib 'libffi.a')  -Force
 
 $LibSrc   = (Resolve-Path -LiteralPath (Join-Path $ParentDir 'lib')).Path
 $libFiles = @(Get-ChildItem -LiteralPath $LibSrc -Recurse -File -Filter '*.donk')
@@ -261,6 +298,11 @@ if (-not $SkipSmokeTest) {
         $r = Invoke-Native -Exe $staged -Arguments @('build-exe', 'hello.donk')
         if ($r.ExitCode -ne 0) { Show-Failure -What 'staged donky.exe build-exe hello.donk' -Result $r; exit 6 }
         if (-not (Test-Path -LiteralPath (Join-Path $tmp 'donky_app.exe'))) { Fail 'build-exe reported success but donky_app.exe is missing.' 6 }
+        $objdump = Find-Tool 'objdump'
+        if ($objdump) {
+            $deps = @(& $objdump -p (Join-Path $tmp 'donky_app.exe') 2>$null | Select-String -Pattern 'DLL Name: libffi')
+            if ($deps.Count -gt 0) { Fail 'donky_app.exe imports a libffi DLL; libffi must be linked statically (libffi.a).' 6 }
+        }
         if (-not (($r.Stdout -join "`n") -match 'prebuilt runtime')) {
             Write-Host '  NOTE: build-exe did not report using the prebuilt runtime.o (it compiled the embedded C source instead).' -ForegroundColor Yellow
         }

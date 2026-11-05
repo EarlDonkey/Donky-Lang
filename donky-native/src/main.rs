@@ -157,17 +157,29 @@ fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         args.push("-mstackrealign".to_string());
+        // Static libffi: ffi.h must not use dllimport (matters when DONKY_RUNTIME=source compiles runtime.c here).
+        args.push("-DFFI_STATIC_BUILD".to_string());
+        // Installed layout: the installer ships <root>\lib\libffi.a, so users whose MinGW has no libffi still link.
+        if let Some(root) = install_root() {
+            let lib = root.join("lib");
+            if lib.join("libffi.a").is_file() {
+                args.push(format!("-L{}", lib.to_string_lossy().replace('\\', "/")));
+            }
+        }
         for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"] {
             args.push(l.to_string());
         }
+        // -Bstatic => only libffi.a is considered, so the exe never needs libffi-8.dll.
+        for l in ["-Wl,-Bstatic", "-lffi", "-Wl,-Bdynamic"] { args.push(l.to_string()); }
     }
     #[cfg(target_os = "linux")]
     {
-        for l in ["-lpthread", "-lcurl", "-lm", "-ldl"] { args.push(l.to_string()); }
+        for l in ["-lpthread", "-lcurl", "-lffi", "-lm", "-ldl"] { args.push(l.to_string()); }
     }
     #[cfg(target_os = "macos")]
     {
         args.push("-lcurl".to_string());
+        args.push("-lffi".to_string());
     }
 
     let status = std::process::Command::new(&gcc_bin)
