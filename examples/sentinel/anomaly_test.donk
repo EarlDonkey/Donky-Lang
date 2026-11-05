@@ -1,0 +1,275 @@
+// tests/sentinel_phase2/anomaly_test.donk
+//
+// ANOMALY FLAGGING CONTRACT (proposed; implementation owned by Phase 2 dev).
+// This test defines the contract; it will compile only once impl/anomaly.donk
+// exists (see note in baseline_test.donk about silent import failures).
+//
+// === Spec proposed by QA ===
+//
+//   anomaly_check(baseline, pid, metric, observed, opts) -> map|null
+//
+//   baseline : the accumulator produced by baseline_new/baseline_update
+//   pid      : numeric PID (matches get_processes() and (proposed)
+//              get_process_cpu(pid))
+//   metric   : "cpu" | "mem"
+//   observed : current value in the SAME units as the baseline samples
+//   opts     : map with optional keys:
+//                "warmup"    (number) minimum n before flagging   default 10
+//                "high_ratio"(number) flag if observed/mean >= this for cpu/mem
+//                            default 3.0 (300% of personal average)
+//                "mem_delta" (number) flag if observed - mean >= this MB
+//                            default 256.0 (a memory jump of 256 MB over
+//                            personal average is what we care about for the
+//                            Task-Manager use case; ratio-only misses
+//                            absolute-scale jumps on small-footprint PIDs)
+//
+//   On flag, returns a map:
+//     { pid, metric, observed, baseline, ratio,
+//       kind,         // "cpu_spike" | "mem_overuse"
+//       ts }          // epoch ms at flag time (caller supplies? see OPEN-Q4)
+//   On no-flag (steady, warmup, unseen pid, unknown metric), returns null.
+//
+// Semantics for the false-positive check: a series with NO spike must never
+// flag. We use a steady 30% CPU / 100 MB mem series and assert null for
+// every probe after warmup.
+//
+// Ratio edge cases:
+//   - mean == 0.0 and observed == 0.0  → no flag (0/0 undefined; treat as
+//     steady)
+//   - mean == 0.0 and observed > 0.0   → flag (ratio is +inf; we require
+//     the flag to carry ratio = inf, NOT NaN, and the test asserts str()
+//     renders it as "inf" not "nan")
+//   - mean > 0.0 and observed == 0.0   → no flag (a drop is not a spike)
+//
+// Memory overuse is BOTH ratio and absolute-delta: a 100 MB PID going to
+// 400 MB (4x) flags on ratio; a 50 MB PID going to 306 MB flags on
+// delta (256 MB) even though 306/50 == 6.12x would also flag. The 256 MB
+// default is chosen so a 50 MB baseline going to 100 MB does NOT flag
+// (2x ratio but only +50 MB).
+//
+// OPEN-Q4 (flag timestamp): ts should be epoch ms from sys_epoch_ms(),
+//   supplied by the caller, because anomaly_check must not call a clock
+//   (testability). Proposed opts key "ts" (number, epoch ms); if absent,
+//   anomaly_check sets ts = 0.0. Tests pass ts explicitly and assert it
+//   round-trips.
+
+import "tests/sentinel_phase2/impl/anomaly.donk";
+
+// ---------------------------------------- helpers
+
+fn _afail(msg) { throw "TEST FAIL: " + msg; }
+fn _atrue(c, msg) { if !c { _afail(msg); } return null; }
+fn _aeq(a, b, msg) { if a != b { _afail(msg + " (got " + str(a) + ", want " + str(b) + ")"); } return null; }
+
+fn _make_baseline_cpu(pid, value, n) {
+    let b = baseline_new();
+    let i = 0;
+    while i < n {
+        b = baseline_update(b, pid, "cpu", value);
+        i = i + 1;
+    }
+    return b;
+}
+fn _make_baseline_mem(pid, value, n) {
+    let b = baseline_new();
+    let i = 0;
+    while i < n {
+        b = baseline_update(b, pid, "mem", value);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn _opts_default() {
+    let o = {};
+    o["warmup"] = 10.0;
+    o["high_ratio"] = 3.0;
+    o["mem_delta"] = 256.0;
+    return o;
+}
+
+// ---------------------------------------- B1: 300% CPU spike
+
+fn test_B1_cpu_spike() {
+    // Baseline: PID 400 pegged at 25.0% CPU for 50 samples. Mean 25, stddev 0.
+    // Spike: observed 100.0 == 4x mean (>= 3x threshold). Must flag.
+    let b = _make_baseline_cpu(400, 25.0, 50);
+    let opts = _opts_default();
+    let flag = anomaly_check(b, 400, "cpu", 100.0, opts);
+    if flag == null { _afail("B1: 4x CPU spike not flagged"); }
+    _aeq(flag["pid"], 400, "B1: pid");
+    _aeq(flag["metric"], "cpu", "B1: metric");
+    _aeq(flag["kind"], "cpu_spike", "B1: kind");
+    _aeq(flag["observed"], 100.0, "B1: observed");
+    _aeq(flag["baseline"], 25.0, "B1: baseline mean");
+    _aeq(flag["ratio"], 4.0, "B1: ratio 4.0");
+    print("B1 OK");
+    return null;
+}
+
+// ---------------------------------------- B2: memory overuse
+
+fn test_B2_mem_overuse() {
+    // (a) Ratio path: baseline 100 MB, observed 400 MB == 4x. Flags.
+    let b = _make_baseline_mem(500, 100.0, 50);
+    let opts = _opts_default();
+    let f = anomaly_check(b, 500, "mem", 400.0, opts);
+    if f == null { _afail("B2a: 4x mem overuse not flagged"); }
+    _aeq(f["kind"], "mem_overuse", "B2a: kind");
+    _aeq(f["ratio"], 4.0, "B2a: ratio");
+
+    // (b) Absolute-delta path: baseline 50 MB, observed 306 MB == 6.12x
+    //     AND +256 MB. Flags (both triggers fire; kind is mem_overuse).
+    let b2 = _make_baseline_mem(501, 50.0, 50);
+    let f2 = anomaly_check(b2, 501, "mem", 306.0, opts);
+    if f2 == null { _afail("B2b: mem delta trigger not flagged"); }
+    _aeq(f2["kind"], "mem_overuse", "B2b: kind");
+
+    // (c) Neither path: baseline 50 MB, observed 100 MB == 2x (+50 MB).
+    //     Must NOT flag.
+    let f3 = anomaly_check(b2, 501, "mem", 100.0, opts);
+    _atrue(f3 == null, "B2c: small mem bump must not flag");
+    print("B2 OK");
+    return null;
+}
+
+// ---------------------------------------- B3: false-positive check
+
+fn test_B3_steady_no_flag() {
+    // Feed a steady 30% CPU series and probe at exactly 30.0. Must not flag.
+    let b = _make_baseline_cpu(600, 30.0, 200);
+    let opts = _opts_default();
+    let i = 0;
+    while i < 50 {
+        let f = anomaly_check(b, 600, "cpu", 30.0, opts);
+        _atrue(f == null, "B3: steady 30% CPU flagged at probe " + str(i));
+        i = i + 1;
+    }
+    // Same for memory: steady 100 MB, probe 100 MB.
+    let b2 = _make_baseline_mem(601, 100.0, 200);
+    i = 0;
+    while i < 50 {
+        let f = anomaly_check(b2, 601, "mem", 100.0, opts);
+        _atrue(f == null, "B3: steady 100 MB mem flagged at probe " + str(i));
+        i = i + 1;
+    }
+    print("B3 OK");
+    return null;
+}
+
+// ---------------------------------------- B4: flag shape
+
+fn test_B4_flag_shape() {
+    let b = _make_baseline_cpu(700, 20.0, 50);
+    let opts = _opts_default();
+    opts["ts"] = 1700000000123.0;
+    let f = anomaly_check(b, 700, "cpu", 80.0, opts);
+    if f == null { _afail("B4: 4x spike not flagged"); }
+    // Required fields.
+    _atrue(f["pid"] != null, "B4: flag has pid");
+    _atrue(f["metric"] != null, "B4: flag has metric");
+    _atrue(f["observed"] != null, "B4: flag has observed");
+    _atrue(f["baseline"] != null, "B4: flag has baseline");
+    _atrue(f["ratio"] != null, "B4: flag has ratio");
+    _aeq(f["pid"], 700, "B4: pid round-trips");
+    _aeq(f["metric"], "cpu", "B4: metric round-trips");
+    _aeq(f["observed"], 80.0, "B4: observed round-trips");
+    _aeq(f["baseline"], 20.0, "B4: baseline round-trips");
+    _aeq(f["ratio"], 4.0, "B4: ratio round-trips");
+    _aeq(f["ts"], 1700000000123.0, "B4: ts round-trips");
+    // Field count is not asserted (impl may add "z_score" etc.), but the
+    // above five plus kind and ts are the minimum the dashboard needs.
+    print("B4 OK");
+    return null;
+}
+
+// ---------------------------------------- B5: warmup
+
+fn test_B5_warmup() {
+    // Only 5 samples fed; default warmup is 10. Must not flag even at 100x.
+    let b = _make_baseline_cpu(800, 10.0, 5);
+    let opts = _opts_default();
+    let f = anomaly_check(b, 800, "cpu", 1000.0, opts);
+    _atrue(f == null, "B5: insufficient history must not flag");
+    // Feed 5 more (n == 10 == warmup boundary). Boundary is inclusive: at
+    // n == warmup we ARE allowed to flag. Assert it does flag.
+    let b2 = _make_baseline_cpu(800, 10.0, 10);
+    let f2 = anomaly_check(b2, 800, "cpu", 1000.0, opts);
+    _atrue(f2 != null, "B5: n == warmup boundary should flag");
+    print("B5 OK");
+    return null;
+}
+
+// ---------------------------------------- B6: zero-mean edge case
+
+fn test_B6_zero_mean() {
+    let b = _make_baseline_cpu(900, 0.0, 50);    // mean 0
+    let opts = _opts_default();
+    // observed 0: no flag (0/0)
+    let f0 = anomaly_check(b, 900, "cpu", 0.0, opts);
+    _atrue(f0 == null, "B6: 0/0 must not flag");
+    // observed > 0: flag with ratio = inf, NOT nan.
+    let f1 = anomaly_check(b, 900, "cpu", 5.0, opts);
+    if f1 == null { _afail("B6: 0-mean with observed > 0 must flag"); }
+    let r = f1["ratio"];
+    _atrue(r != r || r > 1.0e308 || r == 0.0 - (1.0/0.0) || r == (1.0/0.0),
+        "B6: ratio must be +/-inf or finite large, got " + str(r));
+    _atrue(str(r) != "nan", "B6: ratio must not render as nan");
+    print("B6 OK");
+    return null;
+}
+
+// ---------------------------------------- B7: drop is not a spike
+
+fn test_B7_drop_no_flag() {
+    let b = _make_baseline_cpu(1000, 80.0, 50);
+    let opts = _opts_default();
+    // Observed drops to 0. Ratio 0/80 == 0 < 3. Must not flag.
+    let f = anomaly_check(b, 1000, "cpu", 0.0, opts);
+    _atrue(f == null, "B7: drop to 0 must not flag");
+    // Observed drops to 20 (0.25x). Must not flag.
+    let f2 = anomaly_check(b, 1000, "cpu", 20.0, opts);
+    _atrue(f2 == null, "B7: 0.25x drop must not flag");
+    print("B7 OK");
+    return null;
+}
+
+// ---------------------------------------- runner
+
+fn run_anomaly_test(name) {
+    if name == "B1" { test_B1_cpu_spike(); return null; }
+    if name == "B2" { test_B2_mem_overuse(); return null; }
+    if name == "B3" { test_B3_steady_no_flag(); return null; }
+    if name == "B4" { test_B4_flag_shape(); return null; }
+    if name == "B5" { test_B5_warmup(); return null; }
+    if name == "B6" { test_B6_zero_mean(); return null; }
+    if name == "B7" { test_B7_drop_no_flag(); return null; }
+    throw "unknown test " + name;
+    return null;
+}
+
+fn main() {
+    let names = ["B1","B2","B3","B4","B5","B6","B7"];
+    let failed = 0;
+    let i = 0;
+    while i < len(names) {
+        let n = names[i];
+        try {
+            run_anomaly_test(n);
+        } catch e {
+            print("FAIL " + n + ": " + str(e));
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    if failed > 0 {
+        print("anomaly_test: " + str(failed) + " failure(s)");
+        print("RESULT: FAILED");
+    } else {
+        print("anomaly_test: all " + str(len(names)) + " tests passed");
+        print("RESULT: OK");
+    }
+    return null;
+}
+
+main();

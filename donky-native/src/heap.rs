@@ -42,7 +42,7 @@ impl Value {
     const TAG_MASK: u64 = 0xFFF8_0000_0000_0000;
     const TAG_BASE: u64 = 0x7FF8_0000_0000_0000;
     const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-    const CANONICAL_NAN: u64 = 0x7FF7_FFFF_FFFF_FFFF;
+    const CANONICAL_NAN: u64 = 0xFFF8_0000_0000_0000;   // negative quiet NaN; see runtime_template.c
 
     const TAG_NULL: u64 = 0;
     const TAG_BOOL: u64 = 1;

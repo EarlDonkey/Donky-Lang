@@ -109,7 +109,7 @@ spawn(background_cleanup, 0);
 
 print("=========================================");
 print("  Donky API Server running on :${port}  ");
-print("  Try: http://localhost:8081/api/users   ");
+print("  Try: http://localhost:8080/api/users   ");
 print("=========================================");
 
 while true {

@@ -132,6 +132,28 @@ static inline ULONGLONG GetTickCount64(void) {
 #define TAG_ARRAY 3ULL
 #define TAG_MAP 4ULL
 
+/* Canonical tagged-bool word forms (C1). */
+#define BOOL_TRUE_BITS  (TAG_BASE | (TAG_BOOL << 48) | 1ULL)
+#define BOOL_FALSE_BITS (TAG_BASE | (TAG_BOOL << 48))
+/* NaN canonicalization target (D-fix). Must equal heap.rs Value::CANONICAL_NAN.
+   Negative quiet NaN: not masked to TAG_BASE, survives arithmetic unchanged. */
+#define CANONICAL_NAN 0xFFF8000000000000ULL
+
+/* These MUST match aot.rs's inline tag constants and heap.rs's Value::TAG_*.
+   If you change one, change all three. */
+
+/* BEGIN TAG ASSERTIONS */
+typedef char dk_tag_check_MASK  [(TAG_MASK   == 0xFFF8000000000000ULL) ? 1 : -1];
+typedef char dk_tag_check_BASE  [(TAG_BASE   == 0x7FF8000000000000ULL) ? 1 : -1];
+typedef char dk_tag_check_BOOL  [(TAG_BOOL   == 1ULL) ? 1 : -1];
+typedef char dk_tag_check_STRING[(TAG_STRING == 2ULL) ? 1 : -1];
+typedef char dk_tag_check_ARRAY [(TAG_ARRAY  == 3ULL) ? 1 : -1];
+typedef char dk_tag_check_MAP   [(TAG_MAP    == 4ULL) ? 1 : -1];
+typedef char dk_tag_check_TRUE  [(BOOL_TRUE_BITS  == 0x7FF9000000000001ULL) ? 1 : -1];
+typedef char dk_tag_check_FALSE [(BOOL_FALSE_BITS == 0x7FF9000000000000ULL) ? 1 : -1];
+typedef char dk_tag_check_CNAN  [(CANONICAL_NAN   == 0xFFF8000000000000ULL) ? 1 : -1];
+/* END TAG ASSERTIONS */
+
 static int rand_seeded = 0;
 
 #define MAX_THREADS 64
@@ -147,6 +169,9 @@ typedef struct GCHeader {
     uint64_t type_tag;    // payload- 8
 } GCHeader;               // 24 bytes: field offsets from the payload are identical to the old 32-byte header
 typedef char gc_hdr_size_check[(sizeof(GCHeader) == 24) ? 1 : -1];
+
+/* Forward declaration: dk_render_value (and others) use str_len before its definition below. */
+static inline size_t str_len(const char* s);
 
 #define GC_CHUNK_SIZE  ((size_t)64 << 20)   // normal arena chunk
 #define GC_DEDICATED   ((size_t)4 << 20)    // blocks bigger than this get their own chunk
@@ -305,7 +330,18 @@ int is_number(uint64_t v) { return (v & TAG_MASK) != TAG_BASE; }
 double as_number(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
 uint64_t get_tag(uint64_t v) { return is_number(v) ? 0 : ((v >> 48) & 0x7); }
 uint64_t as_index(uint64_t v) { return v & 0x0000FFFFFFFFFFFFULL; }
-uint64_t make_number(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
+/* Any double whose bits collide with TAG_BASE (null) is rewritten to CANONICAL_NAN, so aarch64's
+   default quiet NaN (0x7FF8000000000000) can never be mistaken for null. Mirrors heap.rs Value::number. */
+uint64_t make_number(double d) {
+    uint64_t v; memcpy(&v, &d, 8);
+    if ((v & TAG_MASK) == TAG_BASE) v = CANONICAL_NAN;
+    return v;
+}
+/* For AOT inline fast paths (fadd/fsub/fmul/fdiv) that bypass make_number.
+   Agent 2 binds as `donky_make_number: (f64) -> i64` in aot.rs. */
+uint64_t donky_make_number(double d) { return make_number(d); }
+
+// Shortest %.Ng (N = 15..17) that parses back to the same double; integers print exactly.
 
 // Shortest %.Ng (N = 15..17) that parses back to the same double; integers print exactly.
 static void dk_fmt_num(double d, char* buf, size_t cap) {
@@ -318,35 +354,70 @@ static void dk_fmt_num(double d, char* buf, size_t cap) {
     }
 }
 
-void print_value(uint64_t val) {
+// ADD in runtime_template.c: dk_render_value (immediately BEFORE print_value)
+#define DK_RENDER_MAX_DEPTH 32
+
+static void dk_rput(char* out, size_t cap, size_t* pos, const char* s, size_t n) {
+    if (out && *pos < cap) {
+        size_t room = cap - *pos;
+        memcpy(out + *pos, s, n < room ? n : room);
+    }
+    *pos += n;
+}
+
+/* Single source of truth for print() and str(). Strings nested in containers are quoted
+   WITHOUT escaping (known limitation — a string containing a quote renders ambiguously).
+   Containers deeper than DK_RENDER_MAX_DEPTH render as "..." (also cycle protection).
+   Caller must NUL-terminate. */
+static void dk_render_value(char* out, size_t cap, size_t* pos, uint64_t val, int depth) {
     if (is_number(val)) {
         char nb[64]; dk_fmt_num(as_number(val), nb, sizeof nb);
-        fputs(nb, stdout);
-    } else if (get_tag(val) == TAG_BOOL) {
-        printf("%s", (val & 1) ? "true" : "false");
-    } else if (get_tag(val) == TAG_STRING) {
-        printf("\"%s\"", (char*)as_index(val));
-    } else if (get_tag(val) == TAG_ARRAY) {
-        Array* arr = (Array*)as_index(val);
-        printf("[");
-        for (size_t i = 0; i < arr->len; i++) {
-            print_value(arr->data[i]);
-            if (i < arr->len - 1) printf(", ");
-        }
-        printf("]");
-    } else if (get_tag(val) == TAG_MAP) {
-        Map* map = (Map*)as_index(val);
-        printf("{");
-        for (size_t i = 0; i < map->len; i++) {
-            print_value(map->keys[i]);
-            printf(": ");
-            print_value(map->vals[i]);
-            if (i < map->len - 1) printf(", ");
-        }
-        printf("}");
-    } else {
-        printf("null");
+        dk_rput(out, cap, pos, nb, strlen(nb));
+        return;
     }
+    uint64_t tag = get_tag(val);
+    if (tag == TAG_BOOL) {
+        if (val & 1) dk_rput(out, cap, pos, "true", 4); else dk_rput(out, cap, pos, "false", 5);
+    } else if (tag == TAG_STRING) {
+        const char* s = (const char*)as_index(val);
+        dk_rput(out, cap, pos, "\"", 1);
+        dk_rput(out, cap, pos, s, str_len(s));
+        dk_rput(out, cap, pos, "\"", 1);
+    } else if (tag == TAG_ARRAY) {
+        if (depth >= DK_RENDER_MAX_DEPTH) { dk_rput(out, cap, pos, "...", 3); return; }
+        Array* arr = (Array*)as_index(val);
+        dk_rput(out, cap, pos, "[", 1);
+        for (size_t i = 0; i < arr->len; i++) {
+            dk_render_value(out, cap, pos, arr->data[i], depth + 1);
+            if (i < arr->len - 1) dk_rput(out, cap, pos, ", ", 2);
+        }
+        dk_rput(out, cap, pos, "]", 1);
+    } else if (tag == TAG_MAP) {
+        if (depth >= DK_RENDER_MAX_DEPTH) { dk_rput(out, cap, pos, "...", 3); return; }
+        Map* map = (Map*)as_index(val);
+        dk_rput(out, cap, pos, "{", 1);
+        for (size_t i = 0; i < map->len; i++) {
+            dk_render_value(out, cap, pos, map->keys[i], depth + 1);
+            dk_rput(out, cap, pos, ": ", 2);
+            dk_render_value(out, cap, pos, map->vals[i], depth + 1);
+            if (i < map->len - 1) dk_rput(out, cap, pos, ", ", 2);
+        }
+        dk_rput(out, cap, pos, "}", 1);
+    } else {
+        dk_rput(out, cap, pos, "null", 4);
+    }
+}
+
+void print_value(uint64_t val) {
+    size_t n = 0;
+    dk_render_value(NULL, 0, &n, val, 0);
+    char* buf = (char*)malloc(n + 1);
+    if (!buf) gc_oom();
+    size_t w = 0;
+    dk_render_value(buf, n + 1, &w, val, 0);
+    buf[n] = 0;
+    fwrite(buf, 1, n, stdout);
+    free(buf);
 }
 
 void donky_print(uint64_t val) {
@@ -358,6 +429,7 @@ void donky_print(uint64_t val) {
 uint64_t donky_truthy(uint64_t val) {
     if (is_number(val)) return make_number(as_number(val) != 0.0 ? 1.0 : 0.0);
     if (get_tag(val) == TAG_BOOL) return make_number((val & 1) ? 1.0 : 0.0);
+    if (val == TAG_BASE) return make_number(0.0);        /* null is falsy */
     return make_number(1.0);
 }
 
@@ -402,20 +474,20 @@ uint64_t donky_array_push(uint64_t arr_val, uint64_t val) {
 
 #ifdef _WIN32
 uint64_t donky_kill_process(uint64_t pid_val) {
-    if (!is_number(pid_val)) return make_number(0.0);
+    if (!is_number(pid_val)) return BOOL_FALSE_BITS;
     DWORD pid = (DWORD)as_number(pid_val);
     HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-    if (!hProc) return make_number(0.0);
+    if (!hProc) return BOOL_FALSE_BITS;
     BOOL res = TerminateProcess(hProc, 1);
     CloseHandle(hProc);
-    return make_number(res ? 1.0 : 0.0); 
+    return res ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 #else
 uint64_t donky_kill_process(uint64_t pid_val) {
-    if (!is_number(pid_val)) return make_number(0.0);
+    if (!is_number(pid_val)) return BOOL_FALSE_BITS;
     pid_t pid = (pid_t)as_number(pid_val);
-    if (pid <= 1) return make_number(0.0);   // never signal init, our process group (0) or every process (-1)
-    return make_number(kill(pid, SIGKILL) == 0 ? 1.0 : 0.0);
+    if (pid <= 1) return BOOL_FALSE_BITS;   // never signal init, our process group (0) or every process (-1)
+    return kill(pid, SIGKILL) == 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 #endif
 
@@ -783,22 +855,66 @@ uint64_t donky_map_set(uint64_t map_val, uint64_t key, uint64_t val) {
     return 0;
 }
 
+static const char* dk_type_name(uint64_t val) {
+    if (is_number(val)) return "number";
+    uint64_t tag = get_tag(val);
+    if (tag == TAG_BOOL)   return "bool";
+    if (tag == TAG_STRING) return "string";
+    if (tag == TAG_ARRAY)  return "array";
+    if (tag == TAG_MAP) {
+        Map* m = (Map*)as_index(val);
+        for (size_t i = 0; i < m->len; i++) {
+            uint64_t k = m->keys[i];
+            if (is_number(k) || get_tag(k) != TAG_STRING) continue;
+            const char* ks = (const char*)as_index(k);
+            if (str_len(ks) == 8 && memcmp(ks, "__type__", 8) == 0) {
+                uint64_t v = m->vals[i];
+                if (!is_number(v) && get_tag(v) == TAG_STRING)
+                    return (const char*)as_index(v);
+                return "map";
+            }
+        }
+        return "map";
+    }
+    return "null";
+}
+
+static void dk_throw_binop(const char* verb, uint64_t a, uint64_t b) {
+    char msg[512];
+    snprintf(msg, sizeof msg, "cannot %s %s and %s", verb, dk_type_name(a), dk_type_name(b));
+    donky_throw(donky_alloc_string(msg));
+}
+
+/* Thread-safe strtok shim: identical call shape on POSIX and Windows. */
+static char* dk_strtok_r(char* s, const char* delim, char** save) {
+#ifdef _WIN32
+    return strtok_s(s, delim, save);
+#else
+    return strtok_r(s, delim, save);
+#endif
+}
+
 uint64_t donky_index_get(uint64_t target, uint64_t index) {
     if (get_tag(target) == TAG_ARRAY) {
         Array* arr = (Array*)as_index(target);
         double di = is_number(index) ? as_number(index) : -1.0;
         if (di >= 0 && di < (double)arr->len) return arr->data[(size_t)di];
+        return TAG_BASE;
     } else if (get_tag(target) == TAG_MAP) {
         Map* map = (Map*)as_index(target);
         int64_t f = map_find(map, index);
         if (f >= 0) return map->vals[f];
-    } else if (get_tag(target) == TAG_STRING && is_number(index)) {
+        return TAG_BASE;
+    } else if (get_tag(target) == TAG_STRING) {
         const char* s = (const char*)as_index(target);
-        double di = as_number(index);
-        if (di >= 0 && di < (double)str_len(s)) {
-            char one[2] = { s[(size_t)di], 0 };
-            return donky_alloc_string(one);
+        if (is_number(index)) {
+            double di = as_number(index);
+            if (di >= 0 && di < (double)str_len(s)) {
+                char one[2] = { s[(size_t)di], 0 };
+                return donky_alloc_string(one);
+            }
         }
+        return TAG_BASE;
     }
     return 0;
 }
@@ -806,8 +922,11 @@ uint64_t donky_index_get(uint64_t target, uint64_t index) {
 uint64_t donky_index_set(uint64_t target, uint64_t index, uint64_t val) {
     if (get_tag(target) == TAG_ARRAY) {
         Array* arr = (Array*)as_index(target);
-        size_t i = (size_t)as_number(index);
-        if (i < arr->len) arr->data[i] = val;
+        if (!is_number(index)) { donky_throw(donky_alloc_string("array index must be an integer")); return 0; }
+        double di = as_number(index);
+        if (di != floor(di)) { donky_throw(donky_alloc_string("array index must be an integer")); return 0; }
+        if (di < 0 || di >= (double)arr->len) { donky_throw(donky_alloc_string("index out of range")); return 0; }
+        arr->data[(size_t)di] = val;
     } else if (get_tag(target) == TAG_MAP) {
         donky_map_set(target, index, val);
     }
@@ -833,35 +952,41 @@ uint64_t donky_add(uint64_t a, uint64_t b) {
         ((GCHeader*)out - 1)->type_tag = TAG_STRING;
         return TAG_BASE | (TAG_STRING << 48) | (uint64_t)out;
     }
-    return 0;
+    dk_throw_binop("add", a, b);
+    return TAG_BASE;
 }
 
 uint64_t donky_sub(uint64_t a, uint64_t b) {
     if (is_number(a) && is_number(b)) return make_number(as_number(a) - as_number(b));
-    return make_number(0.0);
+    dk_throw_binop("subtract", a, b);
+    return TAG_BASE;
+}
+
+uint64_t donky_fdiv(uint64_t a, uint64_t b) {
+    if (!is_number(a) || !is_number(b)) { dk_throw_binop("divide", a, b); return TAG_BASE; }
+    double db = as_number(b);
+    if (db == 0.0) return make_number(a > 0 ? 1.0/0.0 : (a < 0 ? -1.0/0.0 : 0.0/0.0)); // IEEE inf/nan
+    return make_number(as_number(a) / db);
 }
 
 uint64_t donky_mul(uint64_t a, uint64_t b) {
     if (is_number(a) && is_number(b)) return make_number(as_number(a) * as_number(b));
-    return make_number(0.0);
+    dk_throw_binop("multiply", a, b);
+    return TAG_BASE;
 }
 
 uint64_t donky_div(uint64_t a, uint64_t b) {
-    if (is_number(a) && is_number(b)) {
-        double db = as_number(b);
-        if (db == 0.0) return make_number(0.0);
-        return make_number(as_number(a) / db);
-    }
-    return make_number(0.0);
+    if (!(is_number(a) && is_number(b))) { dk_throw_binop("divide", a, b); return TAG_BASE; }
+    double db = as_number(b);
+    if (db == 0.0) { donky_throw(donky_alloc_string("division by zero")); return TAG_BASE; }  /* also -0.0 */
+    return make_number(trunc(as_number(a) / db));   /* A2: integer division; checked (zero throws above) */
 }
 
 uint64_t donky_mod(uint64_t a, uint64_t b) {
-    if (is_number(a) && is_number(b)) {
-        double db = as_number(b);
-        if (db == 0.0) return make_number(0.0);
-        return make_number(fmod(as_number(a), db));
-    }
-    return make_number(0.0);
+    if (!(is_number(a) && is_number(b))) { dk_throw_binop("modulo", a, b); return TAG_BASE; }
+    double db = as_number(b);
+    if (db == 0.0) { donky_throw(donky_alloc_string("modulo by zero")); return TAG_BASE; }
+    return make_number(fmod(as_number(a), db));
 }
 
 uint64_t donky_byte_at(uint64_t s_val, uint64_t i_val) {
@@ -910,24 +1035,24 @@ uint64_t donky_pop(uint64_t arr_val) {
 }
 
 uint64_t donky_str(uint64_t val) {
-    char buf[256];
-    if (is_number(val)) {
-        dk_fmt_num(as_number(val), buf, sizeof buf);
-    } else if (get_tag(val) == TAG_STRING) return val;
-    else if (get_tag(val) == TAG_BOOL) strcpy(buf, (val & 1) ? "true" : "false");
-    else if (get_tag(val) == TAG_ARRAY) strcpy(buf, "[array]");
-    else if (get_tag(val) == TAG_MAP) strcpy(buf, "{map}");
-    else strcpy(buf, "null");
-    return donky_alloc_string(buf);
+    if (!is_number(val) && get_tag(val) == TAG_STRING) return val;   /* strings pass through unquoted */
+    size_t n = 0;
+    dk_render_value(NULL, 0, &n, val, 0);
+    char* buf = (char*)malloc(n + 1);
+    if (!buf) gc_oom();
+    size_t w = 0;
+    dk_render_value(buf, n + 1, &w, val, 0);                         /* identical to print_value's rendering */
+    buf[n] = 0;
+    uint64_t r = donky_alloc_string(buf);
+    free(buf);
+    return r;
 }
 
 uint64_t donky_type(uint64_t val) {
-    if (is_number(val)) return donky_alloc_string("number");
-    if (get_tag(val) == TAG_BOOL) return donky_alloc_string("bool");
-    if (get_tag(val) == TAG_STRING) return donky_alloc_string("string");
-    if (get_tag(val) == TAG_ARRAY) return donky_alloc_string("array");
-    if (get_tag(val) == TAG_MAP) return donky_alloc_string("map");
-    return donky_alloc_string("null");
+    /* TAG_MAP with a string "__type__" entry returns that string (type(Foo{x:1}) == "Foo"),
+       otherwise "map". donky_alloc_string copies, so the caller always owns a fresh string
+       (never the interned key/value). */
+    return donky_alloc_string(dk_type_name(val));
 }
 
 uint64_t donky_num(uint64_t val) {
@@ -972,20 +1097,20 @@ uint64_t donky_read_file(uint64_t path_val) {
 }
 
 uint64_t donky_write_file(uint64_t path_val, uint64_t content_val) {
-    if (get_tag(path_val) != TAG_STRING || get_tag(content_val) != TAG_STRING) return 0;
+    if (get_tag(path_val) != TAG_STRING || get_tag(content_val) != TAG_STRING) return BOOL_FALSE_BITS;
     FILE* f = fopen((char*)as_index(path_val), "wb");
-    if (!f) return 0;
+    if (!f) return BOOL_FALSE_BITS;
     char* content = (char*)as_index(content_val);
     fwrite(content, 1, strlen(content), f);
     fclose(f);
-    return make_number(1.0);
+    return BOOL_TRUE_BITS;
 }
 
 uint64_t donky_file_exists(uint64_t path_val) {
-    if (get_tag(path_val) != TAG_STRING) return make_number(0.0);
+    if (get_tag(path_val) != TAG_STRING) return BOOL_FALSE_BITS;
     FILE* f = fopen((char*)as_index(path_val), "r");
-    if (f) { fclose(f); return make_number(1.0); }
-    return make_number(0.0);
+    if (f) { fclose(f); return BOOL_TRUE_BITS; }
+    return BOOL_FALSE_BITS;
 }
 
 uint64_t donky_upper(uint64_t s_val) {
@@ -1008,10 +1133,15 @@ uint64_t donky_split(uint64_t s_val, uint64_t delim_val) {
     char* delim = (char*)as_index(delim_val);
     uint64_t arr_val = donky_alloc_array();
     char* copy = strdup(s);
-    char* token = strtok(copy, delim);
+    if (!copy) gc_oom();
+    /* NOTE (preserved strtok semantics): `delim` is a SET of delimiter characters, not a substring,
+       and consecutive delimiters do NOT produce empty tokens. split("a,,b", ",") == ["a","b"];
+       split("a, b", ", ") splits on ',' and ' ' individually. */
+    char* save = NULL;
+    char* token = dk_strtok_r(copy, delim, &save);
     while (token != NULL) {
         donky_array_push(arr_val, donky_alloc_string(token));
-        token = strtok(NULL, delim);
+        token = dk_strtok_r(NULL, delim, &save);
     }
     free(copy);
     return arr_val;
@@ -1021,16 +1151,27 @@ uint64_t donky_join(uint64_t arr_val, uint64_t delim_val) {
     if (get_tag(arr_val) != TAG_ARRAY || get_tag(delim_val) != TAG_STRING) return 0;
     Array* arr = (Array*)as_index(arr_val);
     char* delim = (char*)as_index(delim_val);
-    size_t total_len = 0;
+    size_t dlen = strlen(delim), total_len = 0;
     for (size_t i = 0; i < arr->len; i++) {
-        if (get_tag(arr->data[i]) == TAG_STRING) total_len += strlen((char*)as_index(arr->data[i]));
-        if (i < arr->len - 1) total_len += strlen(delim);
+        if (is_number(arr->data[i]) || get_tag(arr->data[i]) != TAG_STRING) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "join: non-string element at index %llu", (unsigned long long)i);
+            donky_throw(donky_alloc_string(msg));
+            return TAG_BASE;
+        }
+        total_len += strlen((char*)as_index(arr->data[i]));
+        if (i + 1 < arr->len) total_len += dlen;
     }
-    char* buf = malloc(total_len + 1); buf[0] = 0;
+    char* buf = (char*)malloc(total_len + 1);
+    if (!buf) gc_oom();
+    size_t pos = 0;
     for (size_t i = 0; i < arr->len; i++) {
-        if (get_tag(arr->data[i]) == TAG_STRING) strcat(buf, (char*)as_index(arr->data[i]));
-        if (i < arr->len - 1) strcat(buf, delim);
+        const char* e = (const char*)as_index(arr->data[i]);
+        size_t el = strlen(e);
+        memcpy(buf + pos, e, el); pos += el;
+        if (i + 1 < arr->len) { memcpy(buf + pos, delim, dlen); pos += dlen; }
     }
+    buf[pos] = 0;
     uint64_t res = donky_alloc_string(buf); free(buf); return res;
 }
 
@@ -1038,24 +1179,27 @@ uint64_t donky_contains(uint64_t haystack, uint64_t needle) {
     uint64_t h_tag = get_tag(haystack);
     uint64_t n_tag = get_tag(needle);
 
-    if (h_tag == TAG_STRING && n_tag == TAG_STRING) {
-        return make_number(strstr((char*)as_index(haystack), (char*)as_index(needle)) != NULL ? 1.0 : 0.0);
+    if (h_tag == TAG_STRING) {
+        if (n_tag == TAG_STRING)
+            return strstr((char*)as_index(haystack), (char*)as_index(needle)) != NULL ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
+        return BOOL_FALSE_BITS;
     }
     if (h_tag == TAG_ARRAY) {
         Array* arr = (Array*)as_index(haystack);
         for (size_t i = 0; i < arr->len; i++) {
-            if (as_number(donky_eq(arr->data[i], needle)) == 1.0) return make_number(1.0);
+            if (as_number(donky_eq(arr->data[i], needle)) == 1.0) return BOOL_TRUE_BITS;
         }
-        return make_number(0.0);
+        return BOOL_FALSE_BITS;
     }
     if (h_tag == TAG_MAP) {
         Map* map = (Map*)as_index(haystack);
         for (size_t i = 0; i < map->len; i++) {
-            if (as_number(donky_eq(map->keys[i], needle)) == 1.0) return make_number(1.0);
+            if (as_number(donky_eq(map->keys[i], needle)) == 1.0) return BOOL_TRUE_BITS;
         }
-        return make_number(0.0);
+        return BOOL_FALSE_BITS;
     }
-    return make_number(0.0);
+    donky_throw(donky_alloc_string("contains: unsupported haystack type"));
+    return TAG_BASE;
 }
 
 uint64_t donky_now() { return make_number((double)time(NULL)); }
@@ -1084,6 +1228,36 @@ uint64_t donky_floor(uint64_t val) {
     return make_number(0.0);
 }
 
+/* ---- math builtins (throw on non-number; NaN/inf results are canonicalized by make_number) ---- */
+uint64_t donky_pow(uint64_t a, uint64_t b) {
+    if (!is_number(a) || !is_number(b)) { dk_throw_binop("raise", a, b); return TAG_BASE; }
+    return make_number(pow(as_number(a), as_number(b)));
+}
+uint64_t donky_exp(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("exp: expected a number")); return TAG_BASE; }
+    return make_number(exp(as_number(a)));
+}
+uint64_t donky_log(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("log: expected a number")); return TAG_BASE; }
+    return make_number(log(as_number(a)));   /* natural log */
+}
+uint64_t donky_tanh(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("tanh: expected a number")); return TAG_BASE; }
+    return make_number(tanh(as_number(a)));
+}
+uint64_t donky_max(uint64_t a, uint64_t b) {
+    if (!is_number(a) || !is_number(b)) { dk_throw_binop("max", a, b); return TAG_BASE; }
+    return make_number(fmax(as_number(a), as_number(b)));
+}
+uint64_t donky_min(uint64_t a, uint64_t b) {
+    if (!is_number(a) || !is_number(b)) { dk_throw_binop("min", a, b); return TAG_BASE; }
+    return make_number(fmin(as_number(a), as_number(b)));
+}
+uint64_t donky_abs(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("abs: expected a number")); return TAG_BASE; }
+    return make_number(fabs(as_number(a)));
+}
+
 uint64_t donky_bytes_to_str(uint64_t arr_val) {
     if (get_tag(arr_val) != TAG_ARRAY) return 0;
     Array* arr = (Array*)as_index(arr_val);
@@ -1108,7 +1282,7 @@ uint64_t donky_char_code(uint64_t s_val) {
 #ifdef _WIN32
 uint64_t donky_cls() { system("cls"); return 0; }
 uint64_t donky_getch() { return make_number((double)_getch()); }
-uint64_t donky_kbhit() { return make_number(_kbhit() ? 1.0 : 0.0); }
+uint64_t donky_kbhit() { return _kbhit() ? BOOL_TRUE_BITS : BOOL_FALSE_BITS; }
 #else
 uint64_t donky_cls() { fputs("\033[2J\033[H", stdout); fflush(stdout); return 0; }
 
@@ -1131,7 +1305,7 @@ uint64_t donky_kbhit() {
     struct timeval tv = {0, 0};
     int ready = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
     if (tty) tcsetattr(STDIN_FILENO, TCSANOW, &o);
-    return make_number(ready > 0 ? 1.0 : 0.0);
+    return ready > 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 #endif
 
@@ -1405,7 +1579,7 @@ static int jp_value(JsonParser* jp, uint64_t* out, int depth) {
         if (left >= 5 && memcmp(jp->p, "false", 5) == 0) { jp->p += 5; *out = TAG_BASE | (TAG_BOOL << 48); return 1; }
         return jp_fail(jp, "invalid literal");
     case 'n':
-        if (left >= 4 && memcmp(jp->p, "null", 4) == 0) { jp->p += 4; *out = 0; return 1; }
+        if (left >= 4 && memcmp(jp->p, "null", 4) == 0) { jp->p += 4; *out = TAG_BASE; return 1; }   /* B2 */
         return jp_fail(jp, "invalid literal");
     default:
         return jp_number(jp, out);
@@ -1415,7 +1589,7 @@ static int jp_value(JsonParser* jp, uint64_t* out, int depth) {
 // json_decode(str) -> value, or 0 on error (check json_error() to tell error from a real null/0)
 uint64_t donky_json_decode(uint64_t s_val) {
     json_err_buf[0] = 0;
-    if (!JV_IS(s_val, TAG_STRING)) { snprintf(json_err_buf, sizeof json_err_buf, "json: expected a string"); return 0; }
+    if (!JV_IS(s_val, TAG_STRING)) { snprintf(json_err_buf, sizeof json_err_buf, "json: expected a string"); return TAG_BASE; }
     const char* s = (const char*)as_index(s_val);
     JsonParser jp = { s, s + str_len(s), NULL, 0, NULL, NULL };   // kc[] zero-initialised
     if (jp.end - jp.p >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) jp.p += 3;  // UTF-8 BOM
@@ -1427,7 +1601,7 @@ uint64_t donky_json_decode(uint64_t s_val) {
     }
     if (!ok) {
         snprintf(json_err_buf, sizeof json_err_buf, "json: %s at offset %lld", jp.err ? jp.err : "parse error", (long long)(jp.err_at - s));
-        result = 0;
+        result = TAG_BASE;                              /* B2: check json_error() to tell error from a real null */
     }
     free(jp.scratch);
     return result;
@@ -2414,8 +2588,8 @@ uint64_t donky_global_set(uint64_t k, uint64_t v) {
     return 0;
 }
 uint64_t donky_global_get(uint64_t k) {
-    if (!g_globals) return 0;
-    return donky_index_get(g_globals, k);
+    if (!g_globals) return TAG_BASE;                    /* B2: never set */
+    return donky_index_get(g_globals, k);               /* TAG_BASE on miss */
 }
 
 // ---- console / process ----
@@ -2476,15 +2650,15 @@ uint64_t donky_sys_cwd(void) {
     return donky_alloc_string(buf);
 }
 uint64_t donky_sys_chdir(uint64_t p) {
-    if (!dk_is_str(p)) return make_number(0.0);
-    return make_number(SetCurrentDirectoryA(dk_s(p)) ? 1.0 : 0.0);
+    if (!dk_is_str(p)) return BOOL_FALSE_BITS;
+    return SetCurrentDirectoryA(dk_s(p)) ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 // returns null (0) if the variable does not exist
 uint64_t donky_sys_getenv(uint64_t name) {
-    if (!dk_is_str(name)) return 0;
+    if (!dk_is_str(name)) return TAG_BASE;              /* B2 */
     SetLastError(0);
     DWORD n = GetEnvironmentVariableA(dk_s(name), NULL, 0);
-    if (n == 0) return GetLastError() == ERROR_ENVVAR_NOT_FOUND ? 0 : donky_alloc_string("");
+    if (n == 0) return GetLastError() == ERROR_ENVVAR_NOT_FOUND ? TAG_BASE : donky_alloc_string("");  /* B2 */
     char* buf = (char*)malloc(n + 1);
     DWORD m = GetEnvironmentVariableA(dk_s(name), buf, n + 1);
     buf[m < n + 1 ? m : n] = 0;
@@ -2493,16 +2667,16 @@ uint64_t donky_sys_getenv(uint64_t name) {
     return r;
 }
 uint64_t donky_sys_setenv(uint64_t name, uint64_t val) {
-    if (!dk_is_str(name) || !dk_is_str(val)) return make_number(0.0);
-    return make_number(SetEnvironmentVariableA(dk_s(name), dk_s(val)) ? 1.0 : 0.0);
+    if (!dk_is_str(name) || !dk_is_str(val)) return BOOL_FALSE_BITS;
+    return SetEnvironmentVariableA(dk_s(name), dk_s(val)) ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 uint64_t donky_sys_remove(uint64_t p) {
-    if (!dk_is_str(p)) return make_number(0.0);
-    return make_number(DeleteFileA(dk_s(p)) ? 1.0 : 0.0);
+    if (!dk_is_str(p)) return BOOL_FALSE_BITS;
+    return DeleteFileA(dk_s(p)) ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 uint64_t donky_sys_rename(uint64_t a, uint64_t b) {
-    if (!dk_is_str(a) || !dk_is_str(b)) return make_number(0.0);
-    return make_number(MoveFileExA(dk_s(a), dk_s(b), MOVEFILE_REPLACE_EXISTING) ? 1.0 : 0.0);
+    if (!dk_is_str(a) || !dk_is_str(b)) return BOOL_FALSE_BITS;
+    return MoveFileExA(dk_s(a), dk_s(b), MOVEFILE_REPLACE_EXISTING) ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 #else
 uint64_t donky_sys_cwd(void) {
@@ -2511,36 +2685,36 @@ uint64_t donky_sys_cwd(void) {
     return donky_alloc_string(buf);
 }
 uint64_t donky_sys_chdir(uint64_t p) {
-    if (!dk_is_str(p)) return make_number(0.0);
-    return make_number(chdir(dk_s(p)) == 0 ? 1.0 : 0.0);
+    if (!dk_is_str(p)) return BOOL_FALSE_BITS;
+    return chdir(dk_s(p)) == 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 // returns null (0) if the variable does not exist
 uint64_t donky_sys_getenv(uint64_t name) {
-    if (!dk_is_str(name)) return 0;
+    if (!dk_is_str(name)) return TAG_BASE;              /* B2 */
     const char* v = getenv(dk_s(name));
-    if (!v) return 0;
+    if (!v) return TAG_BASE;                            /* B2: unset is null */
     return donky_alloc_string(v);
 }
 uint64_t donky_sys_setenv(uint64_t name, uint64_t val) {
-    if (!dk_is_str(name) || !dk_is_str(val)) return make_number(0.0);
-    return make_number(setenv(dk_s(name), dk_s(val), 1) == 0 ? 1.0 : 0.0);
+    if (!dk_is_str(name) || !dk_is_str(val)) return BOOL_FALSE_BITS;
+    return setenv(dk_s(name), dk_s(val), 1) == 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 uint64_t donky_sys_remove(uint64_t p) {
-    if (!dk_is_str(p)) return make_number(0.0);
-    return make_number(unlink(dk_s(p)) == 0 ? 1.0 : 0.0);
+    if (!dk_is_str(p)) return BOOL_FALSE_BITS;
+    return unlink(dk_s(p)) == 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
 }
 uint64_t donky_sys_rename(uint64_t a, uint64_t b) {
-    if (!dk_is_str(a) || !dk_is_str(b)) return make_number(0.0);
-    return make_number(rename(dk_s(a), dk_s(b)) == 0 ? 1.0 : 0.0);   // POSIX rename() replaces the target
+    if (!dk_is_str(a) || !dk_is_str(b)) return BOOL_FALSE_BITS;
+    return rename(dk_s(a), dk_s(b)) == 0 ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;   // POSIX rename() replaces the target
 }
 #endif
 uint64_t donky_sys_append_file(uint64_t p, uint64_t c) {
-    if (!dk_is_str(p) || !dk_is_str(c)) return make_number(0.0);
+    if (!dk_is_str(p) || !dk_is_str(c)) return BOOL_FALSE_BITS;
     FILE* f = fopen(dk_s(p), "ab");
-    if (!f) return make_number(0.0);
+    if (!f) return BOOL_FALSE_BITS;
     fwrite(dk_s(c), 1, str_len(dk_s(c)), f);
     fclose(f);
-    return make_number(1.0);
+    return BOOL_TRUE_BITS;
 }
 
 // ---- time (all UTC, no CRT time functions so no Win32 strftime assertions) ----

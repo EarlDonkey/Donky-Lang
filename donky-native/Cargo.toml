@@ -1,6 +1,6 @@
 [package]
 name = "donky-native"
-version = "0.1.0"
+version = "2.3.0"
 edition = "2021"
 
 [dependencies]
@@ -17,7 +17,6 @@ image = { version = "0.25", features = ["png"] } # <-- Explicitly add png
 bincode = "1.3"
 cranelift-codegen = "0.119"
 cranelift-module = "0.119"
-cranelift-jit = "0.119"
 cranelift-frontend = "0.119"
 cranelift-native = "0.119"
 cranelift = "0.119"

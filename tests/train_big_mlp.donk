@@ -1,0 +1,175 @@
+// tests/train_big_mlp.donk
+// Requires: lib/micrograd.donk
+
+// ---------------------------------------------------------------- LCG PRNG
+// A deterministic pseudo-random number generator to avoid unknown builtins.
+
+import "lib/micrograd.donk";
+
+let PRNG = [12345.0];
+
+fn rand_weight() {
+    PRNG[0] = (1103515245.0 * PRNG[0] + 12345.0) % 2147483648.0;
+    return (PRNG[0] / 2147483648.0) * 2.0 - 1.0; // [-1.0, 1.0]
+}
+
+// ---------------------------------------------------------------- Neural Net
+// Weights are represented as arrays of Value nodes.
+
+fn neuron_init(nin) {
+    let w = [];
+    let i = 0;
+    while i < nin {
+        push(w, value_make(rand_weight()));
+        i = i + 1;
+    }
+    let b = value_make(rand_weight());
+    return [w, b];
+}
+
+fn layer_init(nin, nout) {
+    let neurons = [];
+    let i = 0;
+    while i < nout {
+        push(neurons, neuron_init(nin));
+        i = i + 1;
+    }
+    return neurons;
+}
+
+fn mlp_init(layer_sizes) {
+    let layers = [];
+    let i = 0;
+    while i < len(layer_sizes) - 1 {
+        push(layers, layer_init(layer_sizes[i], layer_sizes[i+1]));
+        i = i + 1;
+    }
+    return layers;
+}
+
+fn neuron_forward(n, x_vals) {
+    let w = n[0];
+    let b = n[1];
+    let act = b;
+    let i = 0;
+    while i < len(w) {
+        let wx = value_mul(w[i], x_vals[i]);
+        act = value_add(act, wx);
+        i = i + 1;
+    }
+    return value_tanh(act);
+}
+
+fn layer_forward(l, x_vals) {
+    let out = [];
+    let i = 0;
+    while i < len(l) {
+        push(out, neuron_forward(l[i], x_vals));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mlp_forward(m, x_vals) {
+    let current_x = x_vals;
+    let i = 0;
+    while i < len(m) {
+        current_x = layer_forward(m[i], current_x);
+        i = i + 1;
+    }
+    return current_x[0]; // Binary classifier returns 1 output
+}
+
+fn mlp_parameters(m) {
+    let params = [];
+    let i = 0;
+    while i < len(m) {
+        let layer = m[i];
+        let j = 0;
+        while j < len(layer) {
+            let neuron = layer[j];
+            let w = neuron[0];
+            let k = 0;
+            while k < len(w) {
+                push(params, w[k]);
+                k = k + 1;
+            }
+            push(params, neuron[1]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return params;
+}
+
+// ---------------------------------------------------------------- Training Loop
+
+// 3D Parity dataset (XOR generalized to 3 inputs)
+let xs = [
+    [-1.0, -1.0, -1.0], [-1.0, -1.0,  1.0],
+    [-1.0,  1.0, -1.0], [-1.0,  1.0,  1.0],
+    [ 1.0, -1.0, -1.0], [ 1.0, -1.0,  1.0],
+    [ 1.0,  1.0, -1.0], [ 1.0,  1.0,  1.0]
+];
+let ys = [-1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0];
+
+// Initialize a [3, 16, 16, 16, 1] network
+let model = mlp_init([3, 16, 16, 16, 1]);
+let params = mlp_parameters(model);
+let lr = 0.05;
+let epochs = 100;
+let e = 0;
+let total_loss = value_make(0.0); // Hoist to outer scope
+
+while e < epochs {
+    total_loss = value_make(0.0); // Re-initialize each epoch
+    
+    // Forward pass
+    let i = 0;
+    while i < len(xs) {
+        let x_vals = [
+            value_make(xs[i][0]), 
+            value_make(xs[i][1]), 
+            value_make(xs[i][2])
+        ];
+        
+        let y_pred = mlp_forward(model, x_vals);
+        let y_gt = value_make(ys[i]);
+        
+        // MSE Component
+        let diff = value_sub(y_pred, y_gt);
+        let loss_i = value_pow(diff, 2.0);
+        total_loss = value_add(total_loss, loss_i);
+        
+        i = i + 1;
+    }
+    
+    // Zero gradients
+    let p = 0;
+    while p < len(params) {
+        params[p][1] = 0.0;
+        p = p + 1;
+    }
+    
+    // Backward pass
+    value_backward(total_loss);
+    
+    // Gradient descent step
+    p = 0;
+    while p < len(params) {
+        params[p][0] = params[p][0] - lr * params[p][1];
+        p = p + 1;
+    }
+    
+    if (e % 10.0) == 0.0 {
+        print("--- Epoch ---");
+        print(e);
+        print("Loss:");
+        print(total_loss[0]);
+    }
+    
+    e = e + 1;
+}
+
+print("--- Final Loss ---");
+print(total_loss[0]);

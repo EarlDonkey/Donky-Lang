@@ -1,0 +1,136 @@
+// examples/sentinel/sentinel.donk — HTTP server for Sentinel.
+//
+// Reference: server.donk at repo root (tcp_listen/tcp_accept/tcp_read/
+// tcp_write + spawn per connection). Port 8082 (8080/8081 are taken by the
+// demo).
+//
+// STATIC CACHE: index.html is read once at top level. The top-level `let
+// HTML_CACHE` is written via donky_global_set by the AOT (SEMANTICS §11.3 /
+// aot.rs's top-level Let handling); handle_client reads it via
+// global_get("HTML_CACHE"). This is the documented escape hatch for top-level
+// `let` visibility inside functions.
+//
+// If index.html is missing, we serve a short placeholder so the server still
+// starts (and the collector still runs). The error is printed once at
+// startup, not per request.
+
+// ---------------------------------------------------------------------------
+// read_request(client) -> string. Reads until "\r\n\r\n" or peer close.
+// tcp_read on a closed socket returns "" (SEMANTICS §6 / runtime tcp_read),
+// so an empty first read means the client is already gone.
+// ---------------------------------------------------------------------------
+fn read_request(client) {
+    let buf = "";
+    while len(buf) < 8192 {
+        let chunk = tcp_read(client, 4096);
+        if len(chunk) == 0 {
+            return "";   // connection closed before any data
+        }
+        buf = buf + chunk;
+        if contains(buf, "\r\n\r\n") {
+            return buf;
+        }
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// request_path(raw) -> "/..." or "/". Pulls parts[1] out of
+// "GET /path HTTP/1.1\r\n...". Uses `split(raw, "\r\n")` — split's delimiter
+// is a SET of characters (SEMANTICS §4.1); "\r" and "\n" are both whitespace
+// boundaries for us, which is what we want here.
+// ---------------------------------------------------------------------------
+fn request_path(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return "/"; }
+    let parts = split(lines[0], " ");
+    if len(parts) < 2 { return "/"; }
+    return parts[1];
+}
+
+// ---------------------------------------------------------------------------
+// respond(client, status_line, mime, body) -> null. One write, one close.
+// ---------------------------------------------------------------------------
+fn respond(client, status_line, mime, body) {
+    let resp = "HTTP/1.1 " + status_line + "\r\n"
+             + "Content-Type: " + mime + "\r\n"
+             + "Content-Length: " + str(len(body)) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Access-Control-Allow-Origin: *\r\n"
+             + "Connection: close\r\n"
+             + "\r\n"
+             + body;
+    tcp_write(client, resp);
+    tcp_close(client);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// handle_client(conn_id) -> null. Top-level fn so spawn can call it
+// (SEMANTICS §11.5: spawn takes (func_ptr, arg), no closure capture).
+// ---------------------------------------------------------------------------
+fn handle_client(conn_id) {
+    let raw = read_request(conn_id);
+    if len(raw) == 0 {
+        // Client connected and immediately closed, or tcp_accept returned a
+        // dead id. Nothing to do.
+        tcp_close(conn_id);
+        return null;
+    }
+    let path = request_path(raw);
+
+    if path == "/" || path == "/index.html" {
+        let html = read_file("examples/sentinel/index.html");
+        if html == null {
+            html = "<!doctype html><title>Sentinel</title><p>index.html not found.</p>";
+        }
+        respond(conn_id, "200 OK", "text/html; charset=utf-8", html);
+        return null;
+    }
+
+    if path == "/api/snapshot" {
+        let buf = global_get("sentinel_buffer");
+        if buf == null { buf = []; }
+        respond(conn_id, "200 OK", "application/json", json_encode(buf));
+        return null;
+    }
+
+    if path == "/api/latest" {
+        let buf = global_get("sentinel_buffer");
+        if buf == null || len(buf) == 0 {
+            respond(conn_id, "200 OK", "application/json", "null");
+            return null;
+        }
+        let latest = buf[len(buf) - 1];
+        respond(conn_id, "200 OK", "application/json", json_encode(latest));
+        return null;
+    }
+
+    // Unknown route.
+    let body = "not found: " + path;
+    respond(conn_id, "404 Not Found", "text/plain; charset=utf-8", body);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// serve() -> null (never returns). Accept loop on the main thread.
+// ---------------------------------------------------------------------------
+fn serve() {
+    let port = 8082;
+    let server = tcp_listen(port);
+    if server == null || server < 0 {
+        print("sentinel: tcp_listen(" + str(port) + ") failed");
+        return null;
+    }
+    print("sentinel: listening on http://localhost:" + str(port) + "/");
+    while true {
+        let conn = tcp_accept(server);
+        if conn == null || conn < 0 {
+            // Accept failed (rare). Avoid a hot spin.
+            sleep(50);
+        } else {
+            spawn(handle_client, conn);
+        }
+    }
+    return null;
+}

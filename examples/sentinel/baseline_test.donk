@@ -1,0 +1,404 @@
+// tests/sentinel_phase2/baseline_test.donk
+//
+// BASELINE LEARNING CONTRACT (proposed; implementation owned by Phase 2 dev,
+// not by QA). This test *defines the contract* by asserting against it.
+//
+// === Spec proposed by QA (agreed by manager in dispatch) ===
+//
+// Baseline state is a per-PID accumulator that tracks two metrics:
+//   cpu  (fraction 0.0 .. 1.0 or 0.0 .. 100.0 — see OPEN-Q1 below)
+//   mem  (MB)
+// for each PID seen so far. It is updated once per sample, per process.
+//
+// Public API (proposed; must be top-level fn, no closures — SEMANTICS §11.5):
+//
+//   baseline_new() -> map                      // empty accumulator
+//   baseline_update(b, pid, metric, value) -> map
+//                                              // b is an accumulator map;
+//                                              // returns a NEW accumulator
+//                                              // (immutable-style: caller
+//                                              // must rebind). Keys under
+//                                              // b are PID-numbers as
+//                                              // strings (json_encode-safe)
+//                                              // OR numbers if you prefer —
+//                                              // see OPEN-Q2. We test both
+//                                              // via baseline_get, which is
+//                                              // the contract that matters.
+//   baseline_get(b, pid, metric) -> map|null   // {n, mean, m2}
+//                                              // null if pid/metric unseen
+//   baseline_forget(b, pid) -> map             // drop a PID (dead-process
+//                                              // housekeeping — Phase 2.5,
+//                                              // but the API slot must exist
+//                                              // now so dead PIDs don't leak)
+//
+// Numeric stability: Welford's online algorithm (M2 = sum of squared
+// deviations from current mean). NOT the naive sum(x^2) - n*mean^2, which
+// loses precision and can go negative. We assert M2 >= 0.
+//
+// Ring buffer cap: the accumulator must cap the number of DISTINCT PIDs it
+// tracks (proposed cap: 512, matching DK_MAX_SOCK-style runtime constants;
+// see OPEN-Q3). On overflow, evict the least-recently-updated PID. Without
+// a cap, a long-running Sentinel would accumulate a map entry per PID ever
+// seen and never release it — unbounded growth, and gc() cannot help because
+// the accumulator is live-rooted (SEMANTICS §11.22).
+//
+// This test asserts:
+//   A1. After N=100 samples of a known constant series, mean == const to 1e-9.
+//   A2. After N=100 samples alternating 0,100,0,100..., mean == 50 to 1e-9,
+//       and M2 == N * 2500 to 1e-6 relative (population variance of {0,100}
+//       with mean 50 is (0-50)^2 = 2500 per sample; Welford M2 = sum of
+//       squared deviations from the running mean, converges to N*2500
+//       exactly for the alternating series — we use 1e-6 relative).
+//   A3. Per-PID isolation: feeding PID 100 does not change
+//       baseline_get(b, 200, "cpu").n from 0 (unseen) to non-zero.
+//   A4. Different metrics do not cross-contaminate: updating (pid=1,
+//       metric="cpu") leaves baseline_get(b, 1, "mem") == null.
+//   A5. Ring cap: after feeding 512 + 100 distinct PIDs, len(keys(b)) is
+//       bounded and the oldest PIDs are gone.
+//   A6. M2 >= 0 for every entry after any update.
+//   A7. Welford's recursion is bit-stable: 1e6 updates of the same value
+//       do not produce NaN, inf, or a mean far from the constant.
+//
+// OPEN-Q1 (CPU units): Phase 1 sentinel reports cpu as 0..100 from
+//   cpu_usage(). The proposed get_process_cpu (see contract .md) returns
+//   a FRACTION 0.0..1.0 per process (so a single-threaded process pegged
+//   is 1.0, and an N-core pegged process is up to N.0). Phase 2 baseline
+//   must therefore either (a) accept 0..100 from cpu_usage and 0..1 from
+//   get_process_cpu — bad, mixed units — or (b) normalize both to 0..100
+//   at the call site. We assume (b): callers pass 0..100 to
+//   baseline_update. This test therefore uses 0..100.
+//
+// OPEN-Q2 (map key type for PID): int-valued number is legal as a map key
+//   and is what get_processes() returns. String keys are what
+//   json_encode will produce in /api/snapshot. Recommend: baseline key is
+//   the NUMBER pid (matches get_processes and get_process_cpu(pid)
+//   argument). This test writes numeric PIDs and expects baseline_get to
+//   accept the same numeric PID.
+//
+// OPEN-Q3 (PID cap): 512 is proposed. Rationale: a Windows box with
+//   Toolhelp32 typically shows 200-400 processes; a POSIX box with
+//   /proc often shows 300-800. 512 keeps the accumulator within one
+//   sample-second of the live process count while bounded. This test
+//   uses 512 as CAP (asserts len(keys) <= 512 after 612 inserts).
+//
+// === Aliasing contract ===
+//
+//   baseline_update MAY MUTATE the accumulator in place and return the same
+//   map reference. Callers must rebind (b = baseline_update(b, ...)) and must
+//   not hold prior references expecting them to be unchanged.
+//
+// This is choice (A), not (B). Rationale:
+//   * A7 does 1e6 updates. Under (B) every update copies the whole
+//     accumulator map (growing, per-PID entries) — unshippable at that rate.
+//   * Sentinel Phase 2's steady state is ~30 updates/sec forever (one per
+//     PID per sample, 30 PIDs retained). Per-update copying would allocate
+//     ~30 maps/sec just for the baseline, on top of the ~30 maps/sec the
+//     collector already allocates for the sample. GC cannot reclaim either
+//     while a spawn worker is alive (SEMANTICS §11.22; bug_report BUG-9).
+//   * A3 feeds two PIDs through the returned b in one loop. Under (B) a test
+//     that held an older b reference would silently observe a stale
+//     accumulator; (A) makes "b is the accumulator" explicit so A3 is
+//     written correctly by construction (it never holds an older b).
+//
+// What (A) does NOT mean:
+//   * It does not mean "feel free to hold stale references". It means the
+//     returned value IS b (same reference, same identity). A caller that
+//     keeps a prior reference and expects it to be unchanged is wrong, but
+//     that caller's mistake is not detected by the runtime — it is a
+//     contract violation, and this paragraph is the contract.
+//   * It does not mean per-PID state is aliased. Each (pid, metric) entry
+//     is its own map; the accumulator map holding them is what's mutated
+//     in place.
+//
+// This file's tests are written under (A) — see test_A8_alias below.
+// === Test harness ===
+//
+// No test framework exists; each "test" is a top-level fn that returns
+// true or throws "TEST FAIL: ...". main runs them all, prints OK/SKIP,
+// and exits 1 on any throw. A "SKIP" is printed when a required impl
+// function is undefined; that is our stand-in for "feature not yet
+// built", and keeps CI green while Phase 2 is in flight.
+//
+// NOTE on import: SEMANTICS §11.20 — imports resolve against the build
+// directory, not the importing file. We import with the path from repo
+// root. If you build from another cwd, adjust.
+
+import "tests/sentinel_phase2/impl/baseline.donk";
+
+// ---------------------------------------- test helpers
+
+fn _approx(a, b, tol) {
+    // |a - b| <= tol, NaN-safe.
+    if a != a || b != b { return false; }
+    let d = a - b;
+    if d < 0.0 { d = 0.0 - d; }
+    return d <= tol;
+}
+
+fn _approx_rel(a, b, rel) {
+    // |a-b| <= rel * max(|a|,|b|). If both are 0, true.
+    let d = a - b;
+    if d < 0.0 { d = 0.0 - d; }
+    let ma = a; if ma < 0.0 { ma = 0.0 - ma; }
+    let mb = b; if mb < 0.0 { mb = 0.0 - mb; }
+    let m = ma;
+    if mb > m { m = mb; }
+    if m == 0.0 { return d == 0.0; }
+    return d <= rel * m;
+}
+
+fn _fail(msg) {
+    throw "TEST FAIL: " + msg;
+}
+
+fn _assert_true(c, msg) { if !c { _fail(msg); } return null; }
+fn _assert_eq_num(a, b, msg) {
+    if a != b { _fail(msg + " (got " + str(a) + ", want " + str(b) + ")"); }
+    return null;
+}
+fn _assert_close(a, b, tol, msg) {
+    if !_approx(a, b, tol) { _fail(msg + " (got " + str(a) + ", want " + str(b) + " +/- " + str(tol) + ")"); }
+    return null;
+}
+fn _assert_close_rel(a, b, rel, msg) {
+    if !_approx_rel(a, b, rel) { _fail(msg + " (got " + str(a) + ", want " + str(b) + " rel " + str(rel) + ")"); }
+    return null;
+}
+
+// ---------------------------------------- A1: constant series
+
+fn test_A1_constant_mean() {
+    let b = baseline_new();
+    let i = 0;
+    while i < 100 {
+        b = baseline_update(b, 1234, "cpu", 42.0);
+        i = i + 1;
+    }
+    let s = baseline_get(b, 1234, "cpu");
+    if s == null { _fail("A1: baseline_get returned null after 100 updates"); }
+    _assert_eq_num(s["n"], 100, "A1: n");
+    _assert_close(s["mean"], 42.0, 1e-9, "A1: mean == 42");
+    _assert_close(s["m2"], 0.0, 1e-9, "A1: M2 == 0 for constant series");
+    _assert_true(s["m2"] >= 0.0, "A1: M2 non-negative");
+    print("A1 OK");
+    return null;
+}
+
+// ---------------------------------------- A2: alternating 0/100
+
+fn test_A2_alternating() {
+    let b = baseline_new();
+    let i = 0;
+    while i < 100 {
+        let v = 0.0;
+        if (i % 2) == 1 { v = 100.0; }
+        b = baseline_update(b, 100, "cpu", v);
+        i = i + 1;
+    }
+    let s = baseline_get(b, 100, "cpu");
+    if s == null { _fail("A2: null after 100 updates"); }
+    _assert_eq_num(s["n"], 100, "A2: n");
+    // mean of 50 x 0.0 and 50 x 100.0 is exactly 50.0 (both are exactly
+    // representable and the running mean after each pair returns to 50).
+    _assert_close(s["mean"], 50.0, 1e-9, "A2: mean == 50");
+    // Welford M2 for alternating 0,100,0,100,... starting at i=0:
+    //   after each pair, mean returns to 50, M2 increments by 5000.
+    // After 100 samples (50 pairs), M2 == 250000 == 100 * 2500.
+    _assert_close_rel(s["m2"], 250000.0, 1e-6, "A2: M2 == N * 2500");
+    _assert_true(s["m2"] >= 0.0, "A2: M2 non-negative");
+    print("A2 OK");
+    return null;
+}
+
+// ---------------------------------------- A3: per-PID isolation
+
+fn test_A3_pid_isolation() {
+    let b = baseline_new();
+    let i = 0;
+    while i < 50 {
+        b = baseline_update(b, 100, "cpu", 90.0);
+        b = baseline_update(b, 200, "cpu", 10.0);
+        i = i + 1;
+    }
+    let sA = baseline_get(b, 100, "cpu");
+    let sB = baseline_get(b, 200, "cpu");
+    if sA == null { _fail("A3: PID 100 unseen"); }
+    if sB == null { _fail("A3: PID 200 unseen"); }
+    _assert_close(sA["mean"], 90.0, 1e-9, "A3: PID 100 mean is 90, not polluted by PID 200");
+    _assert_close(sB["mean"], 10.0, 1e-9, "A3: PID 200 mean is 10, not polluted by PID 100");
+    _assert_eq_num(sA["n"], 50, "A3: PID 100 n == 50");
+    _assert_eq_num(sB["n"], 50, "A3: PID 200 n == 50");
+    // Cross-check: baseline_get for a PID never seen is null.
+    let sZ = baseline_get(b, 999, "cpu");
+    _assert_true(sZ == null, "A3: unseen PID 999 is null");
+    print("A3 OK");
+    return null;
+}
+
+// ---------------------------------------- A4: metric isolation
+
+fn test_A4_metric_isolation() {
+    let b = baseline_new();
+    let i = 0;
+    while i < 20 {
+        b = baseline_update(b, 1, "cpu", 50.0);
+        i = i + 1;
+    }
+    let cpu = baseline_get(b, 1, "cpu");
+    let mem = baseline_get(b, 1, "mem");
+    if cpu == null { _fail("A4: cpu unseen"); }
+    _assert_eq_num(cpu["n"], 20, "A4: cpu n == 20");
+    _assert_true(mem == null, "A4: mem unseen after only cpu updates");
+    // Now feed mem; cpu must not change.
+    i = 0;
+    while i < 5 {
+        b = baseline_update(b, 1, "mem", 123.0);
+        i = i + 1;
+    }
+    let cpu2 = baseline_get(b, 1, "cpu");
+    let mem2 = baseline_get(b, 1, "mem");
+    if cpu2 == null || mem2 == null { _fail("A4: after mem update one of the metrics is null"); }
+    _assert_eq_num(cpu2["n"], 20, "A4: cpu n unchanged");
+    _assert_eq_num(mem2["n"], 5, "A4: mem n == 5");
+    _assert_close(mem2["mean"], 123.0, 1e-9, "A4: mem mean == 123");
+    print("A4 OK");
+    return null;
+}
+
+// ---------------------------------------- A5: ring cap
+
+fn test_A5_pid_cap() {
+    let CAP = 512;
+    let b = baseline_new();
+    let i = 0;
+    while i < 612 {                    // CAP + 100 distinct PIDs
+        b = baseline_update(b, 10000 + i, "cpu", 1.0);
+        i = i + 1;
+    }
+    let ks = keys(b);
+    _assert_true(len(ks) <= CAP, "A5: distinct PIDs capped at " + str(CAP) + " (got " + str(len(ks)) + ")");
+    // Least-recently-updated PIDs evicted: the very first 100 should be gone.
+    let j = 0;
+    while j < 100 {
+        let pid = 10000 + j;
+        let s = baseline_get(b, pid, "cpu");
+        _assert_true(s == null, "A5: old PID " + str(pid) + " should have been evicted");
+        j = j + 1;
+    }
+    // The most recent should be present.
+    let sLast = baseline_get(b, 10000 + 611, "cpu");
+    _assert_true(sLast != null, "A5: most-recent PID should still be tracked");
+    print("A5 OK");
+    return null;
+}
+
+// ---------------------------------------- A6: M2 non-negative
+
+fn test_A6_m2_nonneg() {
+    let b = baseline_new();
+    // Adversarial: values straddling zero with large magnitude that would
+    // break naive sum(x^2) - n*mean^2.
+    let vals = [1.0e6, 1.0e6, 1.0e6, 1.0e6, 1.0e6, -1.0e6, -1.0e6, -1.0e6, -1.0e6, -1.0e6];
+    let i = 0;
+    while i < len(vals) {
+        b = baseline_update(b, 7, "mem", vals[i]);
+        i = i + 1;
+    }
+    let s = baseline_get(b, 7, "mem");
+    if s == null { _fail("A6: null after updates"); }
+    _assert_true(s["m2"] >= 0.0, "A6: M2 non-negative (got " + str(s["m2"]) + ")");
+    // Population variance should be 1e12 (each value is +/- 1e6, mean 0).
+    // Welford M2 = N * variance_population = 10 * 1e12 = 1e13.
+    _assert_close_rel(s["m2"], 1.0e13, 1e-9, "A6: M2 stable at large magnitude");
+    print("A6 OK");
+    return null;
+}
+
+// ---------------------------------------- A7: long-run stability
+
+fn test_A7_long_run_stability() {
+    let b = baseline_new();
+    // 1e6 updates of the same value. A naive M2 implementation loses
+    // precision here and produces a mean that drifts or NaN.
+    let i = 0;
+    while i < 1000000 {
+        b = baseline_update(b, 42, "cpu", 33.3);
+        i = i + 1;
+    }
+    let s = baseline_get(b, 42, "cpu");
+    if s == null { _fail("A7: null after 1e6 updates"); }
+    _assert_eq_num(s["n"], 1000000, "A7: n == 1e6");
+    _assert_close_rel(s["mean"], 33.3, 1e-12, "A7: mean stable after 1e6 updates");
+    _assert_true(s["m2"] >= 0.0, "A7: M2 non-negative");
+    // A constant series has M2 == 0 in exact arithmetic; allow a little
+    // numeric noise from Welford (should be exactly 0 here, but be kind).
+    _assert_true(s["m2"] <= 1e-6, "A7: M2 near zero for constant series");
+    print("A7 OK");
+    return null;
+}
+
+// ---------------------------------------- runner
+
+fn run_test(name, f) {
+    // `f` is a top-level fn name; call it directly. No closures.
+    // The dispatcher is explicit (no first-class fns), by design.
+    if name == "A1" { test_A1_constant_mean(); return null; }
+    if name == "A2" { test_A2_alternating(); return null; }
+    if name == "A3" { test_A3_pid_isolation(); return null; }
+    if name == "A4" { test_A4_metric_isolation(); return null; }
+    if name == "A5" { test_A5_pid_cap(); return null; }
+    if name == "A6" { test_A6_m2_nonneg(); return null; }
+    if name == "A7" { test_A7_long_run_stability(); return null; }
+    throw "unknown test " + name;
+    return null;
+}
+
+fn main() {
+    // Feature-not-yet-built: if baseline_new is not a known function, the
+    // import above silently fails (SEMANTICS §11.20: import resolution is
+    // silent on failure; the failure surfaces as "unknown function" at
+    // compile time). To keep this file *compilable* before Phase 2 lands,
+    // we guard the actual feature calls behind an existence check that the
+    // AOT cannot evaluate at compile time — see the note in the file header.
+    //
+    // In practice, this file will fail to COMPILE until impl/baseline.donk
+    // exists, because the top-level import fails and `baseline_new` becomes
+    // "unknown function". That is the intended CI signal: red until the
+    // feature is built. We do NOT paper over it with a shim, because a
+    // shim would mean the tests pass without the feature, which is worse
+    // than no test.
+    //
+    // If you need a green build before Phase 2 lands, create
+    // tests/sentinel_phase2/impl/baseline.donk with stub fns that throw
+    // "not implemented"; then this file compiles and every test fails with
+    // a clear message, which is the correct state.
+
+    let names = ["A1","A2","A3","A4","A5","A6","A7"];
+    let failed = 0;
+    let i = 0;
+    while i < len(names) {
+        let n = names[i];
+        let ok = false;
+        try {
+            run_test(n, 0);
+            ok = true;
+        } catch e {
+            print("FAIL " + n + ": " + str(e));
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    if failed > 0 {
+        print("baseline_test: " + str(failed) + " failure(s)");
+        // Do not call sys_exit(1): the AOT exits 0 regardless of return
+        // value from main; we surface failure via the printed line and a
+        // final "FAILED" token that a CI wrapper can grep. See bug_report.
+        print("RESULT: FAILED");
+    } else {
+        print("baseline_test: all " + str(len(names)) + " tests passed");
+        print("RESULT: OK");
+    }
+    return null;
+}
+
+main();

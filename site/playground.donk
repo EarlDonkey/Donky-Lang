@@ -1,0 +1,302 @@
+// site/playground.donk — Donky playground server (Windows).
+//
+// Build and run from the site/ directory (index.html next to this file):
+//     donky build-exe playground.donk
+//     ren donky_app.exe playground.exe        <- do NOT leave it as donky_app.exe
+//     playground.exe
+// Then open http://localhost:8084
+//
+// Routes:  GET /  -> index.html      POST /run  -> plain-text output of the posted program
+//
+// SECURITY: this endpoint compiles and executes code from strangers. The blocklist below is
+// defence-in-depth only. Run it inside a throwaway VM/container, no secrets, no inbound
+// network except :8084, and outbound network blocked.
+
+// ---------------------------------------------------------------- OS helpers (msvcrt via FFI)
+
+fn os_call(name, arg) {
+    let lib = dll_load("msvcrt.dll");
+    let f = dll_sym(lib, name);
+    return dll_calli(f, [arg]);
+}
+
+// ---------------------------------------------------------------- string helpers
+
+// First index of pat in s at or after `from`, or -1.
+fn idx_of(s, pat, from) {
+    let n = len(s);
+    let m = len(pat);
+    if m == 0 { return from; }
+    let first = byte_at(pat, 0);
+    let i = from;
+    while i + m <= n {
+        if byte_at(s, i) == first {
+            let j = 1;
+            let ok = true;
+            while j < m {
+                if byte_at(s, i + j) != byte_at(pat, j) { ok = false; break; }
+                j = j + 1;
+            }
+            if ok { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn http_response(status, ctype, body) {
+    return "HTTP/1.1 " + status + "\r\n"
+        + "Content-Type: " + ctype + "\r\n"
+        + "Content-Length: " + str(len(body)) + "\r\n"
+        + "Cache-Control: no-store\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + body;
+}
+
+fn text_response(status, body) {
+    return http_response(status, "text/plain; charset=utf-8", body);
+}
+
+// ---------------------------------------------------------------- request parsing
+
+// Returns null if the peer sent nothing, else { method, path, body }.
+// method is "BAD" for a malformed request and "TOOBIG" if Content-Length > 65536.
+fn read_request(c) {
+    let raw = tcp_read(c, 65536);
+    if len(raw) == 0 { return null; }
+
+    let hend = idx_of(raw, "\r\n\r\n", 0);
+    while hend < 0 && len(raw) < 65536 {
+        let more = tcp_read(c, 65536);
+        if len(more) == 0 { break; }
+        raw = raw + more;
+        hend = idx_of(raw, "\r\n\r\n", 0);
+    }
+
+    let req = {};
+    req["method"] = "BAD";
+    req["path"] = "";
+    req["body"] = "";
+    if hend < 0 { return req; }
+
+    let head = byte_substr(raw, 0, hend);
+    let sp1 = idx_of(head, " ", 0);
+    if sp1 < 0 { return req; }
+    let sp2 = idx_of(head, " ", sp1 + 1);
+    if sp2 < 0 { return req; }
+    let method = byte_substr(head, 0, sp1);
+    let path = byte_substr(head, sp1 + 1, sp2);
+    let q = idx_of(path, "?", 0);
+    if q >= 0 { path = byte_substr(path, 0, q); }
+
+    let lh = lower(head);
+    let cl = 0;
+    let p = idx_of(lh, "content-length:", 0);
+    if p >= 0 { cl = num(byte_substr(lh, p + 15, p + 40)); }
+    if cl > 65536 {
+        req["method"] = "TOOBIG";
+        return req;
+    }
+
+    let body = byte_substr(raw, hend + 4, len(raw));
+    while len(body) < cl {
+        let more2 = tcp_read(c, 65536);
+        if len(more2) == 0 { break; }
+        body = body + more2;
+    }
+
+    req["method"] = method;
+    req["path"] = path;
+    req["body"] = body;
+    return req;
+}
+
+// ---------------------------------------------------------------- sandbox runner
+
+// Written to disk at startup. Single quotes only, no backslashes, no dollar-brace sequence
+// (Donky would interpolate it). Statuses are chosen so none is a substring of another.
+fn ps_script() {
+    let L = [];
+    push(L, "param([string]$Dir)");
+    push(L, "$ErrorActionPreference = 'SilentlyContinue'");
+    push(L, "Set-Location $Dir");
+    push(L, "$d = (Get-Location).Path");
+    push(L, "function Put($name, $text) { [IO.File]::WriteAllText((Join-Path $d $name), $text) }");
+    push(L, "function Cap($name) {");
+    push(L, "  $p = Join-Path $d $name");
+    push(L, "  if (-not (Test-Path $p)) { return '' }");
+    push(L, "  $s = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')");
+    push(L, "  $buf = New-Object byte[] 16384");
+    push(L, "  $n = $s.Read($buf, 0, 16384)");
+    push(L, "  $s.Close()");
+    push(L, "  return [Text.Encoding]::UTF8.GetString($buf, 0, $n)");
+    push(L, "}");
+    // 1. compile (30 s cap)
+    push(L, "$b = Start-Process -FilePath 'donky' -ArgumentList 'build-exe','temp.donk' -WorkingDirectory $d -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $d 'build.out') -RedirectStandardError (Join-Path $d 'build.err')");
+    push(L, "$null = $b.Handle");
+    push(L, "if (-not $b.WaitForExit(30000)) { taskkill /PID $b.Id /T /F | Out-Null; Put 'status.txt' 'STATUS_BUILD_TIMEOUT'; exit }");
+    push(L, "if (-not (Test-Path (Join-Path $d 'donky_app.exe'))) { Put 'result.txt' ((Cap 'build.err') + (Cap 'build.out')); Put 'status.txt' 'STATUS_BUILD_FAILED'; exit }");
+    // 2. run (2 s cap)
+    push(L, "$r = Start-Process -FilePath (Join-Path $d 'donky_app.exe') -WorkingDirectory $d -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $d 'run.out') -RedirectStandardError (Join-Path $d 'run.err')");
+    push(L, "$null = $r.Handle");
+    push(L, "if (-not $r.WaitForExit(2000)) { taskkill /PID $r.Id /T /F | Out-Null; $r.WaitForExit(2000) | Out-Null; Put 'status.txt' 'STATUS_RUN_TIMEOUT'; exit }");
+    push(L, "Put 'result.txt' ((Cap 'run.out') + (Cap 'run.err'))");
+    push(L, "Put 'status.txt' 'STATUS_OK'");
+    return join(L, "\r\n");
+}
+
+// Programs may not touch the host. Builtins are dispatched by static name in the AOT,
+// so refusing these substrings closes the obvious doors. Conservative: it also matches
+// inside strings and comments.
+fn blocked_reason(code) {
+    let blocked = [
+        "dll_", "ffi_", "sys_", "read_file", "write_file", "file_exists",
+        "spawn", "tcp_", "http_", "kill_process", "get_processes", "gui_",
+        "input(", "getch", "kbhit", "import", "asm", "global_"
+    ];
+    let i = 0;
+    while i < len(blocked) {
+        if contains(code, blocked[i]) {
+            return "Rejected: `" + blocked[i] + "` is not available in the playground.";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn run_in_sandbox(dir, code) {
+    if os_call("_mkdir", dir) != 0 { throw "could not create sandbox directory"; }
+    if !write_file(dir + "/temp.donk", code) { throw "could not write temp.donk"; }
+
+    let cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File run_sandbox.ps1 -Dir " + dir + " >nul 2>&1";
+    os_call("system", cmd);
+
+    let sp = dir + "/status.txt";
+    if !file_exists(sp) { return "Server error: sandbox did not report a status."; }
+    let status = read_file(sp);
+
+    let text = "";
+    let rp = dir + "/result.txt";
+    if file_exists(rp) { text = read_file(rp); }
+
+    if contains(status, "STATUS_RUN_TIMEOUT") { return "Timeout"; }
+    if contains(status, "STATUS_BUILD_TIMEOUT") { return "Timeout (compilation took too long)"; }
+    if contains(status, "STATUS_BUILD_FAILED") { return "Compile error:\n" + text; }
+    if contains(status, "STATUS_OK") {
+        if len(text) == 0 { return "(no output)"; }
+        return text;
+    }
+    return "Server error: unknown sandbox status.";
+}
+
+fn cleanup(dir) {
+    let names = [
+        "temp.donk", "donky_app.exe", "donky_app.obj", "runtime.c",
+        "status.txt", "result.txt", "build.out", "build.err", "run.out", "run.err"
+    ];
+    let i = 0;
+    while i < len(names) {
+        sys_remove(dir + "/" + names[i]);
+        i = i + 1;
+    }
+    os_call("_rmdir", dir);
+}
+
+fn run_code(code) {
+    let why = blocked_reason(code);
+    if len(why) > 0 { return why; }
+
+    let id = "r" + str(sys_epoch_ms()) + "_" + str(random(100000));
+    let dir = "pg_tmp/" + id;
+
+    let out = "";
+    try {
+        out = run_in_sandbox(dir, code);
+    } catch e {
+        out = "Server error: " + str(e);
+    }
+    cleanup(dir);
+    return out;
+}
+
+// ---------------------------------------------------------------- routes
+
+fn handle_run(code) {
+    if len(code) == 0 { return text_response("200 OK", "Nothing to run."); }
+    if len(code) > 20000 { return text_response("200 OK", "Code too large (max 20000 bytes)."); }
+
+    let n = global_get("busy");
+    if n >= 2 { return text_response("503 Service Unavailable", "Server busy - try again in a few seconds."); }
+    global_set("busy", n + 1);
+
+    let out = "";
+    try {
+        out = run_code(code);
+    } catch e {
+        out = "Server error: " + str(e);
+    }
+
+    global_set("busy", global_get("busy") - 1);
+    return text_response("200 OK", out);
+}
+
+fn serve_index() {
+    let p = "index.html";
+    if !file_exists(p) { p = "site/index.html"; }
+    if !file_exists(p) { return text_response("404 Not Found", "index.html not found - run the server from site/"); }
+    return http_response("200 OK", "text/html; charset=utf-8", read_file(p));
+}
+
+fn handle_client(c) {
+    let resp = "";
+    try {
+        let req = read_request(c);
+        if req == null {
+            resp = "";
+        } else if req["method"] == "TOOBIG" {
+            resp = text_response("413 Payload Too Large", "Request too large.");
+        } else if req["method"] == "GET" && (req["path"] == "/" || req["path"] == "/index.html") {
+            resp = serve_index();
+        } else if req["method"] == "POST" && req["path"] == "/run" {
+            resp = handle_run(req["body"]);
+        } else if req["method"] == "BAD" {
+            resp = text_response("400 Bad Request", "Bad request.");
+        } else {
+            resp = text_response("404 Not Found", "Not found.");
+        }
+    } catch e {
+        resp = text_response("500 Internal Server Error", "Server error: " + str(e));
+    }
+    if len(resp) > 0 { tcp_write(c, resp); }
+    tcp_close(c);
+    return null;
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() {
+    os_call("system", "rd /s /q pg_tmp >nul 2>&1");      // clear leftovers from a previous run
+    os_call("_mkdir", "pg_tmp");
+    if !write_file("run_sandbox.ps1", ps_script()) {
+        print("Could not write run_sandbox.ps1");
+        return null;
+    }
+    global_set("busy", 0);
+
+    let server = tcp_listen(8084);
+    if server < 0 {
+        print("Could not listen on port 8084 (already in use?)");
+        return null;
+    }
+    print("Donky playground listening on http://localhost:8084");
+
+    while true {
+        gc();                                  // no-op while handler threads are alive
+        let c = tcp_accept(server);
+        if c > 0 { spawn(handle_client, c); }
+    }
+    return null;
+}
+
+main();

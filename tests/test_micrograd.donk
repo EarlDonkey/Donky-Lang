@@ -1,0 +1,234 @@
+// tests/micrograd_test.donk — regression test for lib/micrograd.donk.
+//
+// Build and run from the repo root (imports resolve against the build's working directory):
+//     donky build-exe tests/micrograd_test.donk
+//     donky_app            (exit code 0 = every check passed, 1 = at least one FAIL)
+//
+// Part 1: autograd arithmetic and per-op gradient checks.
+// Part 2: finite-difference gradient check, then train a 2->4->1 tanh MLP on XOR (50 epochs).
+
+import "lib/micrograd.donk";
+
+// Prints PASS/FAIL for one check; returns 0 on PASS, 1 on FAIL (so callers can sum failures).
+fn mt_check(name, got, want, tol) {
+    let d = got - want;
+    if d < 0.0 { d = 0.0 - d; }
+    if d <= tol {
+        print("PASS " + name);
+        return 0;
+    }
+    print("FAIL " + name + ": got " + str(got) + ", want " + str(want));
+    return 1;
+}
+
+// ---------------------------------------------------------------- XOR model
+// p is a flat array of 17 leaf Values:
+//   p[0..7]   hidden weights, neuron j uses p[2j], p[2j+1]
+//   p[8..11]  hidden biases
+//   p[12..15] output weights
+//   p[16]     output bias
+// Fixed initial weights (no random(), so the test is reproducible).
+fn mt_params() {
+    let raw = [1.0, 0.5, -0.7, 0.5, -0.4, -0.9, 0.8, -0.9, -1.0, -0.2, 0.7, -0.7, -0.9, 0.8, -0.9, 0.5, -0.2];
+    let p = [];
+    let i = 0;
+    while i < len(raw) {
+        push(p, value_make(raw[i]));
+        i = i + 1;
+    }
+    return p;
+}
+
+fn mt_forward(p, x0, x1) {
+    let xv0 = value_make(x0);
+    let xv1 = value_make(x1);
+    let out = p[16];
+    let j = 0;
+    while j < 4 {
+        let z = value_add(value_add(value_mul(p[2 * j], xv0), value_mul(p[2 * j + 1], xv1)), p[8 + j]);
+        let h = value_tanh(z);
+        out = value_add(out, value_mul(p[12 + j], h));
+        j = j + 1;
+    }
+    return out;
+}
+
+// Mean squared error over the four XOR examples, as a Value (the graph root).
+fn mt_loss(p) {
+    let total = value_make(0.0);
+    let k = 0;
+    while k < 4 {
+        let x0 = 0.0;
+        let x1 = 0.0;
+        let y = 0.0;
+        if k == 1 { x1 = 1.0; y = 1.0; }
+        if k == 2 { x0 = 1.0; y = 1.0; }
+        if k == 3 { x0 = 1.0; x1 = 1.0; }
+        let out = mt_forward(p, x0, x1);
+        let err = value_sub(out, value_make(y));
+        total = value_add(total, value_pow(err, 2.0));
+        k = k + 1;
+    }
+    return value_mul(total, value_make(0.25));
+}
+
+// Central finite difference of the loss w.r.t. parameter idx, versus the autograd gradient.
+// Returns [analytic, numeric].
+fn mt_grad_pair(idx) {
+    let p = mt_params();
+    let loss = mt_loss(p);
+    value_zero_grad(loss);
+    value_backward(loss);
+    let analytic = p[idx][1];
+
+    let h = 0.00001;
+    let pp = mt_params();
+    let w = pp[idx];
+    w[0] = w[0] + h;
+    let lp_graph = mt_loss(pp);
+    let lp = lp_graph[0];
+
+    let pm = mt_params();
+    let w2 = pm[idx];
+    w2[0] = w2[0] - h;
+    let lm_graph = mt_loss(pm);
+    let lm = lm_graph[0];
+
+    return [analytic, (lp - lm) / (2.0 * h)];
+}
+
+// 50 epochs of full-batch SGD. Returns [first_epoch_loss, final_loss].
+fn mt_train(p, epochs, lr) {
+    let first = 0.0;
+    let ep = 0;
+    while ep < epochs {
+        let loss = mt_loss(p);
+        if ep == 0 { first = loss[0]; }
+        value_zero_grad(loss);
+        value_backward(loss);
+        let i = 0;
+        while i < len(p) {
+            let w = p[i];
+            w[0] = w[0] - lr * w[1];
+            i = i + 1;
+        }
+        ep = ep + 1;
+    }
+    let final_loss = mt_loss(p);
+    return [first, final_loss[0]];
+}
+
+// ---------------------------------------------------------------- Part 1
+let failures = 0;
+print("== Part 1: autograd arithmetic ==");
+
+// c = a * b + a, a = 2, b = 3
+let a = value_make(2.0);
+let b = value_make(3.0);
+let c = value_add(value_mul(a, b), a);
+value_backward(c);
+failures = failures + mt_check("c.data == 8", c[0], 8.0, 0.000000001);
+failures = failures + mt_check("c.grad == 1", c[1], 1.0, 0.000000001);
+failures = failures + mt_check("a.grad == b + 1 == 4", a[1], 4.0, 0.000000001);
+failures = failures + mt_check("b.grad == a == 2", b[1], 2.0, 0.000000001);
+
+// worked example from the file header: c = a * b + 4
+let a2 = value_make(2.0);
+let b2 = value_make(3.0);
+let c2 = value_add(value_mul(a2, b2), value_make(4.0));
+value_backward(c2);
+failures = failures + mt_check("example c.data == 10", c2[0], 10.0, 0.000000001);
+failures = failures + mt_check("example a.grad == 3", a2[1], 3.0, 0.000000001);
+failures = failures + mt_check("example b.grad == 2", b2[1], 2.0, 0.000000001);
+
+// relu: relu(-2) + relu(3)
+let rx = value_make(-2.0);
+let ry = value_make(3.0);
+let rr = value_add(value_relu(rx), value_relu(ry));
+value_backward(rr);
+failures = failures + mt_check("relu data == 3", rr[0], 3.0, 0.000000001);
+failures = failures + mt_check("relu grad (x<0) == 0", rx[1], 0.0, 0.000000001);
+failures = failures + mt_check("relu grad (y>0) == 1", ry[1], 1.0, 0.000000001);
+
+// tanh(0.5): data and 1 - tanh^2
+let tx = value_make(0.5);
+let tt = value_tanh(tx);
+value_backward(tt);
+failures = failures + mt_check("tanh(0.5) data", tt[0], 0.46211715726000974, 0.000000001);
+failures = failures + mt_check("tanh(0.5) grad", tx[1], 1.0 - tt[0] * tt[0], 0.000000001);
+
+// pow: 3^3 (integer exponent), 4^0.5 (fractional exponent)
+let px = value_make(3.0);
+let pp1 = value_pow(px, 3.0);
+value_backward(pp1);
+failures = failures + mt_check("pow 3^3 data", pp1[0], 27.0, 0.000000001);
+failures = failures + mt_check("pow 3^3 grad == 27", px[1], 27.0, 0.000000001);
+let qx = value_make(4.0);
+let qq = value_pow(qx, 0.5);
+value_backward(qq);
+failures = failures + mt_check("pow 4^0.5 data", qq[0], 2.0, 0.000000001);
+failures = failures + mt_check("pow 4^0.5 grad == 0.25", qx[1], 0.25, 0.000000001);
+
+// sub / neg: 5 - 2
+let sx = value_make(5.0);
+let sy = value_make(2.0);
+let ss = value_sub(sx, sy);
+value_backward(ss);
+failures = failures + mt_check("sub data == 3", ss[0], 3.0, 0.000000001);
+failures = failures + mt_check("sub grad a == 1", sx[1], 1.0, 0.000000001);
+failures = failures + mt_check("sub grad b == -1", sy[1], -1.0, 0.000000001);
+
+// shared node: d = x*x + x at x = 3  ->  d = 12, dd/dx = 2x + 1 = 7
+let dx = value_make(3.0);
+let dd = value_add(value_mul(dx, dx), dx);
+value_backward(dd);
+failures = failures + mt_check("shared node data == 12", dd[0], 12.0, 0.000000001);
+failures = failures + mt_check("shared node grad == 7", dx[1], 7.0, 0.000000001);
+
+// diamond: z = (x + x) * (x + x) = 4x^2 at x = 3  ->  z = 36, dz/dx = 8x = 24
+let mx = value_make(3.0);
+let ms = value_add(mx, mx);
+let mz = value_mul(ms, ms);
+value_backward(mz);
+failures = failures + mt_check("diamond data == 36", mz[0], 36.0, 0.000000001);
+failures = failures + mt_check("diamond grad == 24", mx[1], 24.0, 0.000000001);
+
+// zero_grad then backward again must reproduce the same gradient (not double it)
+value_zero_grad(dd);
+value_backward(dd);
+failures = failures + mt_check("zero_grad + backward == 7", dx[1], 7.0, 0.000000001);
+
+// ---------------------------------------------------------------- Part 2
+print("== Part 2: XOR, 2 -> 4 -> 1 tanh MLP ==");
+
+let gi = [0, 9, 13, 16];
+let gk = 0;
+while gk < len(gi) {
+    let pair = mt_grad_pair(gi[gk]);
+    failures = failures + mt_check("finite-difference grad, param " + str(gi[gk]), pair[0], pair[1], 0.000001);
+    gk = gk + 1;
+}
+
+let result = mt_train(mt_params(), 50, 0.1);
+let first_loss = result[0];
+let final_loss = result[1];
+print("loss at epoch 0:  " + str(first_loss));
+print("loss after 50:    " + str(final_loss));
+if final_loss < first_loss {
+    print("PASS loss decreased");
+} else {
+    print("FAIL loss decreased");
+    failures = failures + 1;
+}
+if final_loss < 0.1 {
+    print("PASS final loss < 0.1");
+} else {
+    print("FAIL final loss < 0.1 (did not converge in 50 epochs at lr 0.1)");
+    failures = failures + 1;
+}
+
+if failures > 0 {
+    print("micrograd_test: " + str(failures) + " check(s) FAILED");
+    sys_exit(1);
+}
+print("micrograd_test: all checks passed");

@@ -1,0 +1,34 @@
+// examples/sentinel/run.donk — entrypoint for Sentinel.
+//
+// PROCESS MODEL: Option B from the brief.
+//   * Collector on a spawn worker (thread pool, 16 workers, SEMANTICS §11.5).
+//   * HTTP accept loop on the main thread.
+//   * Shared ring buffer via global_set/global_get (see header comment in
+//     collector.donk for the concurrency argument).
+//
+// Startup order matters:
+//   1. cpu_usage() is called once to prime the C-side delta baseline, then
+//      we sleep(1000). Without this the first recorded sample has cpu == 0.
+//   2. spawn(collector_loop, 0).
+//   3. serve() — blocks forever on the main thread.
+//
+// spawn(func, arg) takes a top-level function by name and a single argument
+// (SEMANTICS §11.5). We pass 0 because collector_loop ignores its argument.
+// Do NOT spawn a closure: the AOT stores a raw code address, not a tagged
+// function value, and non-function arguments segfault the process.
+
+import "examples/sentinel/collector.donk";
+import "examples/sentinel/sentinel.donk";
+
+let HTML_CACHE = read_file("examples/sentinel/index.html");
+if HTML_CACHE == null {
+    HTML_CACHE = "<!doctype html><title>Sentinel</title><p>index.html not found.</p>";
+}
+
+// Prime cpu_usage(). The runtime keeps prev_idle/prev_kernel/prev_user in
+// static storage per process; two calls >=1s apart yield a real delta.
+let _prime = cpu_usage();
+sleep(1000);
+
+spawn(collector_loop, 0);
+serve();

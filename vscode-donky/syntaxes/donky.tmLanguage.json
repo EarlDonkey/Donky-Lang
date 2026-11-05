@@ -1,0 +1,290 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Donky",
+  "scopeName": "source.donky",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#expression" }
+  ],
+  "repository": {
+    "expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#function-definition" },
+        { "include": "#struct-definition" },
+        { "include": "#keywords" },
+        { "include": "#constants" },
+        { "include": "#builtin-variables" },
+        { "include": "#builtins" },
+        { "include": "#struct-init" },
+        { "include": "#function-call" },
+        { "include": "#operators" },
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
+      ]
+    },
+
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.donky",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.donky" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.donky" } }
+        },
+        {
+          "name": "comment.line.double-slash.donky",
+          "match": "//.*$",
+          "captures": { "0": { "name": "punctuation.definition.comment.donky" } }
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.donky",
+          "begin": "\"",
+          "end": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.donky" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.donky" } },
+          "patterns": [
+            { "include": "#string-escape" },
+            { "include": "#interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.other.raw.donky",
+          "begin": "`",
+          "end": "`",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.donky" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.donky" } }
+        }
+      ]
+    },
+
+    "string-escape": {
+      "name": "constant.character.escape.donky",
+      "match": "\\\\(?:.|$)"
+    },
+
+    "interpolation": {
+      "name": "meta.interpolation.donky",
+      "begin": "\\$\\{",
+      "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.donky" } },
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.donky" } },
+      "contentName": "source.donky.embedded",
+      "patterns": [
+        { "include": "#interpolation-braces" },
+        { "include": "#expression" }
+      ]
+    },
+
+    "interpolation-braces": {
+      "begin": "\\{",
+      "end": "\\}",
+      "patterns": [
+        { "include": "#interpolation-braces" },
+        { "include": "#expression" }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.donky",
+          "match": "\\b0[xX][0-9a-fA-F][0-9a-fA-F_]*\\b"
+        },
+        {
+          "name": "constant.numeric.float.donky",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*(?:[eE][+-]?[0-9]+)?\\b|\\b[0-9][0-9_]*[eE][+-]?[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.donky",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+
+    "function-definition": {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)",
+      "captures": {
+        "1": { "name": "storage.type.function.donky" },
+        "2": { "name": "entity.name.function.donky" }
+      }
+    },
+
+    "struct-definition": {
+      "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.struct.donky" },
+        "2": { "name": "entity.name.type.struct.donky" }
+      }
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "storage.type.donky",
+          "match": "\\b(let|fn|struct)\\b"
+        },
+        {
+          "name": "keyword.control.flow.donky",
+          "match": "\\b(if|else|while|for|in|return|break|continue|match)\\b"
+        },
+        {
+          "name": "keyword.control.exception.donky",
+          "match": "\\b(try|catch|throw)\\b"
+        },
+        {
+          "name": "keyword.control.import.donky",
+          "match": "\\b(import)\\b"
+        },
+        {
+          "name": "keyword.other.asm.donky",
+          "match": "\\b(asm)\\b"
+        },
+        {
+          "name": "keyword.other.print.donky",
+          "match": "\\b(print)\\b"
+        },
+        {
+          "name": "keyword.operator.word.donky",
+          "match": "\\b(div)\\b"
+        }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.donky",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.donky",
+          "match": "\\bnull\\b"
+        }
+      ]
+    },
+
+    "builtin-variables": {
+      "name": "variable.language.args.donky",
+      "match": "\\bargs\\b"
+    },
+
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.core.donky",
+          "match": "\\b(len|push|pop|keys|str|num|type|floor|format|contains|random|gc|spawn|now|now_ms|sleep|input)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.math.donky",
+          "match": "\\b(sub|mul|pow|exp|log|tanh|max|min|abs)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.string.donky",
+          "match": "\\b(upper|lower|split|join|substr|byte_substr|byte_at|char_code|bytes_to_str)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.io.donky",
+          "match": "\\b(read_file|write_file|file_exists|cls|getch|kbhit)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.json.donky",
+          "match": "\\b(json_decode|json_encode|json_pretty|json_error)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.net.donky",
+          "match": "\\b(http_get|http_request|http_status|tcp_listen|tcp_accept|tcp_read|tcp_write|tcp_close)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.sys.donky",
+          "match": "\\b(sys_cwd|sys_chdir|sys_getenv|sys_setenv|sys_remove|sys_rename|sys_append_file|sys_puts|sys_eputs|sys_exit|sys_epoch_ms|sys_gmtime|sys_timegm|sys_strftime|sys_md5|sys_sha1|sys_sha256|sys_hmac_sha256|total_mem|used_mem|get_processes|cpu_usage|cpu_cores|uptime|disk_info|kill_process|global_get|global_set)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.ffi.donky",
+          "match": "\\b(ffi_alloc|ffi_free|ffi_peek|ffi_poke|ffi_cstr|dll_load|dll_sym|dll_call|dll_calli)\\b(?=\\s*\\()"
+        },
+        {
+          "name": "support.function.builtin.gui.donky",
+          "match": "\\b(gui_init|gui_draw_text|gui_update|gui_add_button|gui_add_label|gui_update_text|gui_get_clicked|gui_clear|gui_repaint|gui_draw_rect|gui_webview)\\b(?=\\s*\\()"
+        }
+      ]
+    },
+
+    "struct-init": {
+      "match": "\\b([A-Z][A-Za-z0-9_]*)\\s*(?=\\{)",
+      "captures": {
+        "1": { "name": "entity.name.type.struct.donky" }
+      }
+    },
+
+    "function-call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.call.donky" }
+      }
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.donky",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.comparison.donky",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.donky",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.assignment.compound.donky",
+          "match": "\\+=|-=|\\*=|/=|%="
+        },
+        {
+          "name": "keyword.operator.increment-decrement.donky",
+          "match": "\\+\\+|--"
+        },
+        {
+          "name": "keyword.operator.range.donky",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.assignment.donky",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.arithmetic.donky",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.ternary.donky",
+          "match": "\\?"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.statement.donky", "match": ";" },
+        { "name": "punctuation.separator.comma.donky", "match": "," },
+        { "name": "punctuation.separator.colon.donky", "match": ":" },
+        { "name": "punctuation.accessor.donky", "match": "\\." }
+      ]
+    },
+
+    "identifiers": {
+      "name": "variable.other.donky",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+    }
+  }
+}

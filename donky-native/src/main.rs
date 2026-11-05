@@ -7,7 +7,6 @@ mod heap;
 mod package;
 mod repl;
 mod profiler;
-mod codegen;
 mod aot;
 
 use std::env;
@@ -18,6 +17,8 @@ fn main() {
     if args.len() < 2 { print_usage(); return; }
 
     match args[1].as_str() {
+        "--help" | "-h" => print_usage(),
+        "--version" | "-V" => println!("Donky {}", env!("CARGO_PKG_VERSION")),
         "install" => { if let Err(e) = package::install_from_manifest() { eprintln!("Package Error: {}", e); } }
         "add" => {
             if args.len() < 4 { eprintln!("Usage: donky-native add <name> <url-or-path>"); return; }
@@ -33,18 +34,6 @@ fn main() {
         "profile" => {
             if args.len() < 3 { eprintln!("Usage: donky-native profile <file.donk>"); return; }
             if let Err(e) = cmd_profile(&args[2]) { eprintln!("Profile: {}", e); std::process::exit(1); }
-        }
-        "build-native" => {
-            if args.len() < 3 { eprintln!("Usage: donky-native build-native <file.donk>"); return; }
-            let path = &args[2];
-            let source = match fs::read_to_string(path) { Ok(s) => s, Err(e) => { eprintln!("Runtime Error: build-native: {}", e); return; } };
-            let tokens = match lexer::Lexer::new(&source).tokenize() { Ok(t) => t, Err(e) => { eprintln!("Lex Error: {}", e); return; } };
-            let ast = match parser::Parser::new(tokens).parse() { Ok(a) => a, Err(e) => { eprintln!("Parse Error: {}", e); return; } };
-            let mut compiler = codegen::NativeCompiler::new();
-            println!("Compiling natively...");
-            let start = std::time::Instant::now();
-            compiler.compile_and_run(&ast);
-            println!("Native execution finished in {:?}", start.elapsed());
         }
         "build-exe" => {
             if args.len() < 3 { eprintln!("Usage: donky-native build-exe <file.donk>"); return; }
@@ -83,18 +72,20 @@ fn main() {
 }
 
 fn print_usage() {
+    println!("Donky {}", env!("CARGO_PKG_VERSION"));
+    println!();
     println!("Usage:");
-    println!("  donky-native <file.donk>                 tree-walker");
-    println!("  donky-native run <file.donk|file.bc>     VM");
-    println!("  donky-native build <file.donk>           compile to .bc");
-    println!("  donky-native build-native <file.donk>    JIT");
-    println!("  donky-native build-exe <file.donk>       standalone .exe");
-    println!("  donky-native test [dir|file]             run tests");
-    println!("  donky-native bench [dir]                 benchmark");
-    println!("  donky-native profile <file.donk>         profile");
-    println!("  donky-native repl                        REPL");
-    println!("  donky-native install                     install packages");
-    println!("  donky-native add <name> <url|path>       add dependency");
+    println!("  donky <file.donk>                 tree-walker");
+    println!("  donky run <file.donk|file.bc>     VM");
+    println!("  donky build <file.donk>           compile to .bc");
+    println!("  donky build-exe <file.donk>       standalone .exe (needs gcc on PATH)");
+    println!("  donky test [dir|file]             run tests");
+    println!("  donky bench [dir]                 benchmark");
+    println!("  donky profile <file.donk>         profile");
+    println!("  donky repl                        REPL");
+    println!("  donky install                     install packages");
+    println!("  donky add <name> <url|path>       add dependency");
+    println!("  donky --help | --version");
 }
 
 #[cfg(target_os = "windows")]
@@ -103,8 +94,12 @@ fn install_root() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok()?.parent()?.parent().map(|p| p.to_path_buf())
 }
 
+/// Search order for the pre-compiled C runtime (best to worst):
+///   1. {exe_dir}/../lib/runtime.o   installed layout   (C:\Program Files\Donky\bin\donky.exe)
+///   2. {exe_dir}/runtime.o          portable / dev layout
+///   3. ./runtime.o                  dev layout from the repo root
+///   4. ./dist/lib/runtime.o         build.ps1 staging
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
 fn find_runtime_obj() -> Result<std::path::PathBuf, String> {
     let mut c: Vec<std::path::PathBuf> = Vec::new();
     if let Some(root) = install_root() { c.push(root.join("lib").join("runtime.o")); }
@@ -113,7 +108,7 @@ fn find_runtime_obj() -> Result<std::path::PathBuf, String> {
     }
     c.push("runtime.o".into());
     c.push("dist/lib/runtime.o".into());
-    for p in c { if p.exists() { return Ok(p); } }
+    for p in c { if p.is_file() { return Ok(p); } }
     Err("runtime.o not found (expected <install>\\lib\\runtime.o). Run build.ps1.".to_string())
 }
 
@@ -130,8 +125,25 @@ fn find_gcc() -> String {
 /// Shared by `build-exe` and `test` (the test runner used to hard-code Windows-only link flags
 /// and `test_app.exe`, so `donky-native test` could not work on Linux/macOS).
 fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
-    fs::write("runtime.c", include_str!("runtime_template.c"))
-        .map_err(|e| format!("Could not write runtime.c: {}", e))?;
+    // Installed/staged layout: link the pre-compiled runtime.o (see find_runtime_obj).
+    // Dev checkout, or DONKY_RUNTIME=source: compile the C runtime embedded in this binary.
+    #[cfg(target_os = "windows")]
+    let prebuilt: Option<std::path::PathBuf> =
+        if env::var("DONKY_RUNTIME").map(|v| v == "source").unwrap_or(false) { None } else { find_runtime_obj().ok() };
+    #[cfg(not(target_os = "windows"))]
+    let prebuilt: Option<std::path::PathBuf> = None;
+
+    let runtime_input: String = match &prebuilt {
+        Some(p) => {
+            println!("Linking prebuilt runtime: {}", p.display());
+            p.to_string_lossy().into_owned()
+        }
+        None => {
+            fs::write("runtime.c", include_str!("runtime_template.c"))
+                .map_err(|e| format!("Could not write runtime.c: {}", e))?;
+            "runtime.c".to_string()
+        }
+    };
 
     #[cfg(target_os = "windows")]
     let gcc_bin = find_gcc();
@@ -139,7 +151,7 @@ fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
     let gcc_bin = "gcc".to_string();
 
     let mut args: Vec<String> = vec![
-        obj_path.to_string(), "runtime.c".to_string(),
+        obj_path.to_string(), runtime_input,
         "-o".to_string(), exe_path.to_string(),
     ];
     #[cfg(target_os = "windows")]
@@ -161,7 +173,7 @@ fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
     let status = std::process::Command::new(&gcc_bin)
         .args(&args)
         .status()
-        .map_err(|e| format!("Failed to run {}: {}. Make sure GCC/MinGW is in your PATH.", gcc_bin, e))?;
+        .map_err(|e| format!("Failed to run {}: {}. donky build-exe needs GCC (MinGW-w64) on your PATH to link executables.", gcc_bin, e))?;
     if status.success() { Ok(()) } else { Err("Linker failed.".to_string()) }
 }
 

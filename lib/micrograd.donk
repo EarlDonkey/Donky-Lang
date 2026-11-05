@@ -1,0 +1,254 @@
+// lib/micrograd.donk — scalar reverse-mode autograd engine (after Karpathy's micrograd).
+//
+// Value layout (a Value is a fixed-layout array of length 6):
+//   [0] data      number
+//   [1] grad      number — always initialised to 0.0
+//   [2] op        string — "" for a leaf, else "add" / "mul" / "pow" / "relu" / "tanh" / "neg"
+//   [3] child_a   Value or null
+//   [4] child_b   Value or null
+//   [5] reserved  number — 0.0, except "pow" nodes, which keep their exponent here
+//
+// Why arrays and free functions (SEMANTICS.md v2.3):
+//   - A struct is a map with a __type__ entry (§7), and v.field compiles to alloc_string("field")
+//     plus a donky_index_get call (§3.3): one string allocation and a map lookup per read.
+//     v[0] is a donky_index_get call with a number key: no string, no map.
+//   - Methods (v.backward()) are not implemented in the AOT (§11.8); closures and first-class
+//     function values are not supported (§11.5, §9.2). So: free functions, array-as-struct.
+//   - Top-level `let` is not visible inside functions (§11.3), so no file-level constants:
+//     numeric constants are written inline.
+//
+// Maths: pow, tanh, exp, log, max, abs and sqrt are not in the §4/§6 builtin lists, so this file
+// implements what it needs from + - * / floor and comparisons: mg_exp, mg_ln, mg_pow, mg_tanh.
+// Accuracy is ~5e-14 relative for mg_exp, ~4e-15 absolute for mg_ln; mg_exp saturates at e^+-709.
+//
+// Contract notes:
+//   - value_backward does NOT zero gradients: it accumulates (+=) into existing grads.
+//     Call value_zero_grad(root) first when re-running backward on a graph you already used.
+//   - Traversal is iterative (explicit stack), so graph depth is bounded by memory, not by the
+//     native stack. Nodes are tracked by identity in a map (arrays hash and compare by identity,
+//     §1.7 / §3.1), so shared nodes (x * x, diamonds) are visited exactly once.
+//   - Public names are value_*; helpers are mg_*. All names share one namespace across imports.
+
+// ---------------------------------------------------------------- maths helpers
+
+fn mg_exp(x) {
+    let t = x;
+    if t > 709.0 { t = 709.0; }
+    if t < -709.0 { t = -709.0; }
+    // range reduction: t = k*ln2 + r, |r| <= ln2/2
+    let k = floor(t / 0.6931471805599453 + 0.5);
+    let r = t - k * 0.6931471805599453;
+    // Taylor series for e^r (14 terms)
+    let term = 1.0;
+    let sum = 1.0;
+    let i = 1;
+    while i <= 14 {
+        term = term * r / i;
+        sum = sum + term;
+        i = i + 1;
+    }
+    // 2^|k| by repeated squaring (exact in f64)
+    let n = k;
+    if n < 0.0 { n = 0.0 - n; }
+    let base = 2.0;
+    let p = 1.0;
+    while n > 0.0 {
+        if (n % 2.0) == 1.0 { p = p * base; }
+        base = base * base;
+        n = floor(n / 2.0);
+    }
+    if k < 0.0 { return sum / p; }
+    return sum * p;
+}
+
+// Natural log, x > 0 (throws a string otherwise).
+fn mg_ln(x) {
+    if x <= 0.0 { throw "micrograd: log of a non-positive number"; }
+    let m = x;
+    let k = 0;
+    while m > 1.5 { m = m / 2.0; k = k + 1; }
+    while m < 0.75 { m = m * 2.0; k = k - 1; }
+    // ln(m) = 2 * atanh(z), z = (m - 1) / (m + 1), |z| <= 0.2
+    let z = (m - 1.0) / (m + 1.0);
+    let z2 = z * z;
+    let term = z;
+    let s = 0.0;
+    let i = 1;
+    while i <= 25 {
+        s = s + term / i;
+        term = term * z2;
+        i = i + 2;
+    }
+    return k * 0.6931471805599453 + 2.0 * s;
+}
+
+// x^e. Integer exponents use exponentiation by squaring (any sign of x);
+// fractional exponents need x > 0 and go through exp(e * ln(x)).
+fn mg_pow(x, e) {
+    if floor(e) == e {
+        let n = e;
+        let neg = false;
+        if n < 0.0 { n = 0.0 - n; neg = true; }
+        let result = 1.0;
+        let base = x;
+        while n > 0.0 {
+            if (n % 2.0) == 1.0 { result = result * base; }
+            base = base * base;
+            n = floor(n / 2.0);
+        }
+        if neg { return 1.0 / result; }
+        return result;
+    }
+    if x > 0.0 { return mg_exp(e * mg_ln(x)); }
+    if x == 0.0 {
+        if e > 0.0 { return 0.0; }
+    }
+    throw "micrograd: pow of a non-positive base with a fractional exponent";
+}
+
+fn mg_tanh(x) {
+    if x > 20.0 { return 1.0; }
+    if x < -20.0 { return -1.0; }
+    let e2 = mg_exp(2.0 * x);
+    return (e2 - 1.0) / (e2 + 1.0);
+}
+
+// ---------------------------------------------------------------- constructors
+
+fn value_make(data) {              // (number) -> Value: leaf
+    return [data, 0.0, "", null, null, 0.0];
+}
+
+fn value_add(a, b) {               // (Value, Value) -> Value
+    return [a[0] + b[0], 0.0, "add", a, b, 0.0];
+}
+
+fn value_mul(a, b) {               // (Value, Value) -> Value
+    return [a[0] * b[0], 0.0, "mul", a, b, 0.0];
+}
+
+fn value_pow(a, e) {               // (Value, number) -> Value; e is kept in slot [5] for backward
+    return [mg_pow(a[0], e), 0.0, "pow", a, null, e];
+}
+
+fn value_relu(a) {                 // (Value) -> Value
+    let d = 0.0;
+    if a[0] > 0.0 { d = a[0]; }
+    return [d, 0.0, "relu", a, null, 0.0];
+}
+
+fn value_tanh(a) {                 // (Value) -> Value
+    return [mg_tanh(a[0]), 0.0, "tanh", a, null, 0.0];
+}
+
+fn value_neg(a) {                  // (Value) -> Value
+    return [-a[0], 0.0, "neg", a, null, 0.0];
+}
+
+fn value_sub(a, b) {               // (Value, Value) -> Value
+    return value_add(a, value_neg(b));
+}
+
+fn value_data(v) { return v[0]; }  // (Value) -> number
+fn value_grad(v) { return v[1]; }  // (Value) -> number
+
+// ---------------------------------------------------------------- graph traversal
+
+// Post-order of every node reachable from root: children come before parents.
+// Iterative DFS with enter/exit markers: states[i] is 0 (enter) or 1 (exit) for stack[i].
+fn mg_topo(root) {
+    let topo = [];
+    let visited = {};
+    let stack = [root];
+    let states = [0];
+    while len(stack) > 0 {
+        let node = pop(stack);
+        let st = pop(states);
+        if st == 1 {
+            push(topo, node);
+            continue;
+        }
+        if visited[node] { continue; }
+        visited[node] = true;
+        push(stack, node);
+        push(states, 1);
+        let a = node[3];
+        let b = node[4];
+        if type(b) == "array" { push(stack, b); push(states, 0); }
+        if type(a) == "array" { push(stack, a); push(states, 0); }
+    }
+    return topo;
+}
+
+// Push one node's gradient into its children (the local derivative of its op).
+fn mg_backprop_node(v) {
+    let op = v[2];
+    let g = v[1];
+    if op == "" { return null; }
+    let a = v[3];
+    let b = v[4];
+    if op == "add" {
+        a[1] = a[1] + g;
+        b[1] = b[1] + g;
+        return null;
+    }
+    if op == "mul" {
+        a[1] = a[1] + b[0] * g;
+        b[1] = b[1] + a[0] * g;
+        return null;
+    }
+    if op == "pow" {
+        let e = v[5];
+        a[1] = a[1] + e * mg_pow(a[0], e - 1.0) * g;
+        return null;
+    }
+    if op == "relu" {
+        if a[0] > 0.0 { a[1] = a[1] + g; }
+        return null;
+    }
+    if op == "tanh" {
+        a[1] = a[1] + (1.0 - v[0] * v[0]) * g;
+        return null;
+    }
+    if op == "neg" {
+        a[1] = a[1] - g;
+        return null;
+    }
+    throw "micrograd: unknown op " + op;
+}
+
+fn value_backward(root) {          // (Value) -> null
+    let topo = mg_topo(root);
+    root[1] = 1.0;
+    let i = len(topo) - 1;
+    while i >= 0 {
+        mg_backprop_node(topo[i]);
+        i = i - 1;
+    }
+    return null;
+}
+
+fn value_zero_grad(v) {            // (Value) -> null: zero v and everything reachable from it
+    let visited = {};
+    let stack = [v];
+    while len(stack) > 0 {
+        let node = pop(stack);
+        if visited[node] { continue; }
+        visited[node] = true;
+        node[1] = 0.0;
+        let a = node[3];
+        let b = node[4];
+        if type(a) == "array" { push(stack, a); }
+        if type(b) == "array" { push(stack, b); }
+    }
+    return null;
+}
+
+// ---- worked example (documentation only) ----
+// let a = value_make(2.0);
+// let b = value_make(3.0);
+// let c = value_add(value_mul(a, b), value_make(4.0));
+// value_backward(c);
+// // c[0] = 10.0, c[1] = 1.0
+// // a[1] = 3.0  (b[0])
+// // b[1] = 2.0  (a[0])

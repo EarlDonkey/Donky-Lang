@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Donky — The compiled language built for speed and scale</title>
+<meta name="description" content="Donky compiles to native machine code through Cranelift, with a built-in runtime for networking, JSON, hashing and FFI.">
+<style>
+  :root {
+    --bg: #0e0e11; --surface: #16161b; --elevated: #1e1e25; --border: #2b2b35;
+    --text: #e6e8ee; --muted: #9aa0ae; --dim: #6b7180;
+    --orange: #f4a261; --accent: #ff8c37; --green: #7ee2a8; --blue: #8ab4ff; --purple: #c4a1ff;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, Menlo, monospace;
+    --sans: Inter, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+
+  /* nav */
+  header { position: sticky; top: 0; z-index: 10; background: rgba(14,14,17,.85); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); }
+  .nav { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { font-weight: 800; font-size: 18px; display: flex; align-items: center; gap: 10px; }
+  .brand i { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, var(--orange), var(--accent)); display: inline-block; }
+  .nav nav { display: flex; gap: 22px; font-size: 14px; color: var(--muted); align-items: center; }
+  .nav nav a:hover { color: var(--text); }
+  @media (max-width: 640px) { .nav nav a.hide-sm { display: none; } }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 10px; font-weight: 700; font-size: 14px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; transition: transform .15s, background .15s, box-shadow .15s; font-family: inherit; }
+  .btn:hover { background: var(--elevated); transform: translateY(-1px); }
+  .btn.primary { background: linear-gradient(135deg, var(--orange), var(--accent)); color: #17120d; border-color: transparent; box-shadow: 0 6px 24px rgba(244,162,97,.22); }
+  .btn.primary:hover { box-shadow: 0 8px 30px rgba(244,162,97,.35); background: linear-gradient(135deg, var(--orange), var(--accent)); }
+  .btn.small { padding: 8px 14px; font-size: 13px; }
+  .btn:disabled { opacity: .55; cursor: wait; transform: none; }
+
+  /* hero */
+  .hero { position: relative; padding: 96px 0 72px; text-align: center; overflow: hidden; }
+  .hero::before { content: ""; position: absolute; inset: 0; background:
+      radial-gradient(600px 300px at 50% 0%, rgba(244,162,97,.16), transparent 70%),
+      linear-gradient(to right, #1a1a21 1px, transparent 1px), linear-gradient(to bottom, #1a1a21 1px, transparent 1px);
+    background-size: auto, 56px 56px, 56px 56px; -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, #000 60%, transparent 100%); mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, #000 60%, transparent 100%); }
+  .hero .wrap { position: relative; }
+  .pill { display: inline-block; font-family: var(--mono); font-size: 12px; color: var(--orange); border: 1px solid rgba(244,162,97,.35); background: rgba(244,162,97,.08); padding: 5px 12px; border-radius: 999px; margin-bottom: 22px; }
+  h1 { font-size: clamp(34px, 6vw, 62px); line-height: 1.08; letter-spacing: -.02em; margin: 0 auto 20px; max-width: 880px; font-weight: 800; }
+  h1 em { font-style: normal; background: linear-gradient(90deg, var(--orange), var(--accent)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lead { color: var(--muted); font-size: clamp(16px, 2vw, 19px); max-width: 680px; margin: 0 auto 32px; }
+  .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .meta { margin-top: 18px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+
+  /* sections */
+  section { padding: 72px 0; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; color: var(--orange); text-transform: uppercase; letter-spacing: .12em; }
+  h2 { font-size: clamp(26px, 4vw, 38px); margin: 8px 0 12px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); max-width: 640px; margin: 0 0 32px; }
+
+  /* code blocks */
+  .code { background: #0b0b0e; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+  .code-bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 14px; background: var(--surface); border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .dots { display: flex; gap: 6px; margin-right: 10px; }
+  .dots b { width: 10px; height: 10px; border-radius: 50%; background: #3a3a46; display: block; }
+  .tabs { display: flex; gap: 4px; }
+  .tab { background: none; border: 0; color: var(--muted); font-family: var(--mono); font-size: 12px; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+  .tab.active { background: var(--elevated); color: var(--orange); }
+  pre { margin: 0; }
+  pre.src { padding: 18px 20px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.7; color: #d7dae3; }
+  .k { color: var(--purple); } .s { color: var(--green); } .c { color: var(--dim); font-style: italic; } .n { color: var(--orange); }
+  .copy { background: none; border: 1px solid var(--border); color: var(--muted); font-size: 11px; padding: 3px 9px; border-radius: 6px; cursor: pointer; font-family: var(--mono); }
+  .copy:hover { color: var(--text); border-color: var(--orange); }
+
+  /* playground */
+  .pg { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .pg { grid-template-columns: 1fr; } }
+  .pane { display: flex; flex-direction: column; min-height: 380px; }
+  textarea#code { flex: 1; width: 100%; min-height: 340px; resize: vertical; background: #0b0b0e; color: #d7dae3; border: 0; outline: none; padding: 16px 18px; font-family: var(--mono); font-size: 13.5px; line-height: 1.7; tab-size: 4; }
+  pre#out { flex: 1; min-height: 340px; max-height: 480px; overflow: auto; padding: 16px 18px; font-family: var(--mono); font-size: 13.5px; line-height: 1.6; color: #d7dae3; white-space: pre-wrap; word-break: break-word; background: #0b0b0e; }
+  pre#out.err { color: #ff8a8a; } pre#out.ok { color: #d7dae3; } pre#out.dim { color: var(--dim); }
+  select { background: var(--elevated); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; }
+  .pg-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+  .status { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .note { font-size: 12.5px; color: var(--dim); margin-top: 10px; }
+
+  /* features */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; transition: border-color .2s, transform .2s; }
+  .card:hover { border-color: rgba(244,162,97,.5); transform: translateY(-2px); }
+  .card h3 { margin: 0 0 6px; font-size: 16px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card code, .lead code, .sub code { font-family: var(--mono); font-size: 12.5px; color: var(--orange); }
+
+  /* download */
+  .dl { text-align: center; background: linear-gradient(180deg, var(--surface), var(--bg)); border: 1px solid var(--border); border-radius: 20px; padding: 56px 24px; }
+  .dl h2 { margin-top: 0; }
+  .dl .cmd { display: inline-block; margin-top: 22px; font-family: var(--mono); font-size: 13px; background: #0b0b0e; border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; color: var(--muted); }
+  .dl .cmd b { color: var(--orange); font-weight: 400; }
+
+  footer { border-top: 1px solid var(--border); padding: 28px 0; color: var(--dim); font-size: 13px; }
+  footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top"><i></i> Donky</a>
+    <nav>
+      <a class="hide-sm" href="#code">Code</a>
+      <a href="#playground">Playground</a>
+      <a class="hide-sm" href="#features">Features</a>
+      <a class="btn primary small" href="DonkySetup.exe" download>Download</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <div class="hero">
+    <div class="wrap">
+      <span class="pill">v2.3 · native AOT · Windows</span>
+      <h1>Donky: The compiled language built for <em>speed and scale.</em></h1>
+      <p class="lead">Donky compiles straight to native machine code through Cranelift, with NaN-boxed values and a garbage-collected runtime. Sockets, JSON, hashing and FFI are built in, so a real server is a few lines long.</p>
+      <div class="cta">
+        <a class="btn primary" href="DonkySetup.exe" download>⬇ Download DonkySetup.exe</a>
+        <a class="btn" href="#playground">▶ Try it in your browser</a>
+      </div>
+      <div class="meta">donky build-exe hello.donk &nbsp;→&nbsp; donky_app.exe</div>
+    </div>
+  </div>
+
+  <section id="code" style="padding-top: 24px;">
+    <div class="wrap">
+      <div class="eyebrow">Real code</div>
+      <h2>Small language. Real programs.</h2>
+      <p class="sub">A working HTTP server, and an autograd engine written in Donky itself. Both compile to a standalone executable.</p>
+
+      <div class="code">
+        <div class="code-bar">
+          <div style="display:flex;align-items:center">
+            <div class="dots"><b></b><b></b><b></b></div>
+            <div class="tabs">
+              <button class="tab active" data-snip="http">server.donk</button>
+              <button class="tab" data-snip="grad">autograd.donk</button>
+            </div>
+          </div>
+          <button class="copy" id="copy-snip">copy</button>
+        </div>
+        <pre class="src" id="snip"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="playground" style="padding-top: 24px;">
+    <div class="wrap">
+      <div class="eyebrow">Playground</div>
+      <h2>Write it. Compile it. Run it.</h2>
+      <p class="sub">Your code is compiled to a real native executable on the server and run with a 2-second limit. The first run can take a few seconds while the compiler and linker work.</p>
+
+      <div class="pg">
+        <div class="code pane">
+          <div class="code-bar">
+            <span>main.donk</span>
+            <select id="sample" aria-label="Example programs"></select>
+          </div>
+          <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Donky source code"></textarea>
+        </div>
+        <div class="code pane">
+          <div class="code-bar"><span>output</span><span class="status" id="status">idle</span></div>
+          <pre id="out" class="dim">Press Run (Ctrl+Enter) to compile and execute.</pre>
+        </div>
+      </div>
+
+      <div class="pg-actions">
+        <button class="btn primary" id="run">▶ Run</button>
+        <button class="btn" id="reset">Reset</button>
+        <span class="status">Ctrl+Enter to run</span>
+      </div>
+      <p class="note">The playground runs a restricted subset: file, network, process, FFI and import features are disabled. Install Donky locally for the full language.</p>
+    </div>
+  </section>
+
+  <section id="features" style="padding-top: 24px;">
+    <div class="wrap">
+      <div class="eyebrow">Why Donky</div>
+      <h2>Built to run fast and stay simple.</h2>
+      <p class="sub">One compiler, one small runtime, one executable out.</p>
+      <div class="grid">
+        <div class="card"><h3>Native code, not an interpreter</h3><p>Donky lowers to Cranelift IR and emits an object file that links into a standalone <code>.exe</code>. Builtin calls and operators are direct native calls.</p></div>
+        <div class="card"><h3>Compact value model</h3><p>Every value is one 64-bit NaN-boxed word. Numbers need no allocation, and strings, arrays and maps are garbage collected.</p></div>
+        <div class="card"><h3>Batteries in the runtime</h3><p>TCP sockets, HTTP client, JSON encode/decode, MD5/SHA-1/SHA-256/HMAC, time, and a worker-thread pool via <code>spawn</code>.</p></div>
+        <div class="card"><h3>Math for numerical work</h3><p><code>pow</code>, <code>exp</code>, <code>log</code>, <code>tanh</code>, <code>max</code>, <code>min</code> and <code>abs</code> are builtins. The bundled micrograd engine trains a small neural net entirely in Donky.</p></div>
+        <div class="card"><h3>Catchable errors</h3><p><code>try</code> / <code>catch</code> / <code>throw</code> work across call boundaries. Type errors, division by zero and bad indexes throw instead of corrupting state.</p></div>
+        <div class="card"><h3>FFI when you need it</h3><p>Load a DLL, resolve a symbol, call it. <code>ffi_alloc</code>, <code>ffi_peek</code> and <code>ffi_poke</code> cover raw memory.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section style="padding-top: 24px;">
+    <div class="wrap">
+      <div class="dl">
+        <div class="eyebrow">Get started</div>
+        <h2>Install Donky in a minute.</h2>
+        <p class="sub" style="margin-left:auto;margin-right:auto;">The installer bundles the compiler, the C runtime and a GCC toolchain for linking.</p>
+        <a class="btn primary" href="DonkySetup.exe" download>⬇ Download DonkySetup.exe</a>
+        <div><span class="cmd"><b>&gt;</b> donky build-exe hello.donk &amp;&amp; donky_app.exe</span></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Donky · the compiled language built for speed and scale.</span>
+    <span>Playground runs on port 8084.</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- snippets ----------
+  var SNIPPETS = {
+    http: [
+      'let server = tcp_listen(8080);',
+      '',
+      'while true {',
+      '    let client = tcp_accept(server);',
+      '    tcp_read(client, 65536);',
+      '    tcp_write(client, "HTTP/1.1 200 OK\\r\\nContent-Length: 13\\r\\nConnection: close\\r\\n\\r\\nHello, Donky!");',
+      '    tcp_close(client);',
+      '}'
+    ].join('\n'),
+    grad: [
+      '// reverse-mode autograd, written in Donky',
+      'import "lib/micrograd.donk";',
+      '',
+      'let a = value_make(2.0);',
+      'let b = value_make(3.0);',
+      'let c = value_add(value_mul(a, b), value_make(4.0));',
+      'value_backward(c);',
+      '',
+      'print(value_data(c));   // 10',
+      'print(value_grad(a));   // 3',
+      'print(value_grad(b));   // 2'
+    ].join('\n')
+  };
+
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  var TOKEN = /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|\b(fn|let|if|else|while|for|in|return|try|catch|throw|import|print|true|false|null)\b|\b(\d+(?:\.\d+)?)\b/g;
+  function highlight(src) {
+    var out = '', last = 0, m;
+    TOKEN.lastIndex = 0;
+    while ((m = TOKEN.exec(src)) !== null) {
+      out += esc(src.slice(last, m.index));
+      var cls = m[1] ? 'c' : m[2] ? 's' : m[3] ? 'k' : 'n';
+      out += '<span class="' + cls + '">' + esc(m[0]) + '</span>';
+      last = m.index + m[0].length;
+    }
+    return out + esc(src.slice(last));
+  }
+
+  var snipEl = document.getElementById('snip'), current = 'http';
+  function showSnippet(name) {
+    current = name;
+    snipEl.innerHTML = highlight(SNIPPETS[name]);
+    document.querySelectorAll('.tab').forEach(function (t) { t.classList.toggle('active', t.dataset.snip === name); });
+  }
+  document.querySelectorAll('.tab').forEach(function (t) { t.addEventListener('click', function () { showSnippet(t.dataset.snip); }); });
+  document.getElementById('copy-snip').addEventListener('click', function () {
+    var b = this;
+    if (navigator.clipboard) navigator.clipboard.writeText(SNIPPETS[current]).then(function () { b.textContent = 'copied'; setTimeout(function () { b.textContent = 'copy'; }, 1200); });
+  });
+  showSnippet('http');
+
+  // ---------- playground samples (self-contained: no imports, no I/O) ----------
+  var SAMPLES = {
+    'Hello, Donky': [
+      'let name = "Donky";',
+      'print("Hello, " + name + "!");',
+      '',
+      'for i in 1 .. 4 {',
+      '    print("count = " + str(i));',
+      '}'
+    ].join('\n'),
+    'Fibonacci': [
+      'fn fib(n) {',
+      '    if n < 2 { return n; }',
+      '    return fib(n - 1) + fib(n - 2);',
+      '}',
+      '',
+      'for i in 0 .. 20 {',
+      '    print("fib(" + str(i) + ") = " + str(fib(i)));',
+      '}'
+    ].join('\n'),
+    'Math builtins': [
+      'print(pow(2, 10));          // 1024',
+      'print(exp(1));',
+      'print(log(100));            // natural log',
+      'print(tanh(0.5));',
+      'print(max(3, 9) + min(3, 9));',
+      'print(abs(0 - 42));'
+    ].join('\n'),
+    'Maps, arrays, JSON': [
+      'let user = { "name": "Ada", "langs": ["Donky", "C"] };',
+      'push(user["langs"], "Rust");',
+      'user["age"] = 36;',
+      '',
+      'print(json_encode(user));',
+      'print(json_pretty(user));',
+      'print("keys: " + str(keys(user)));'
+    ].join('\n'),
+    'Errors with try/catch': [
+      'fn safe_div(a, b) {',
+      '    try {',
+      '        return a div b;',
+      '    } catch e {',
+      '        print("caught: " + str(e));',
+      '        return 0;',
+      '    }',
+      '}',
+      '',
+      'print(safe_div(7, 2));',
+      'print(safe_div(1, 0));'
+    ].join('\n'),
+    'Numeric derivative': [
+      '// f(x) = x^3 + 2x, so f\'(x) = 3x^2 + 2',
+      'fn f(x) { return x * x * x + 2 * x; }',
+      '',
+      'let x = 3;',
+      'let h = 0.0001;',
+      'print("numeric  f\'(3) = " + str((f(x + h) - f(x - h)) / (2 * h)));',
+      'print("analytic f\'(3) = " + str(3 * x * x + 2));'
+    ].join('\n')
+  };
+
+  var sel = document.getElementById('sample');
+  var codeEl = document.getElementById('code');
+  var outEl = document.getElementById('out');
+  var statusEl = document.getElementById('status');
+  var runBtn = document.getElementById('run');
+  var firstName = null;
+
+  Object.keys(SAMPLES).forEach(function (name) {
+    if (!firstName) firstName = name;
+    var o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o);
+  });
+  codeEl.value = SAMPLES[firstName];
+  sel.addEventListener('change', function () { codeEl.value = SAMPLES[sel.value]; setOut('Press Run (Ctrl+Enter) to compile and execute.', 'dim'); statusEl.textContent = 'idle'; });
+  document.getElementById('reset').addEventListener('click', function () { codeEl.value = SAMPLES[sel.value]; });
+
+  // Tab inserts four spaces
+  codeEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Tab' && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      var s = codeEl.selectionStart, t = codeEl.selectionEnd;
+      codeEl.value = codeEl.value.slice(0, s) + '    ' + codeEl.value.slice(t);
+      codeEl.selectionStart = codeEl.selectionEnd = s + 4;
+    }
+  });
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+  });
+
+  function setOut(text, cls) { outEl.textContent = text; outEl.className = cls || 'ok'; }
+
+  var running = false;
+  function run() {
+    if (running) return;
+    var code = codeEl.value;
+    running = true; runBtn.disabled = true; runBtn.textContent = 'Running…';
+    statusEl.textContent = 'compiling…'; setOut('Compiling and running…', 'dim');
+    var t0 = performance.now();
+
+    fetch('/run', { method: 'POST', headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: code })
+      .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, text: t }; }); })
+      .then(function (res) {
+        var secs = ((performance.now() - t0) / 1000).toFixed(1);
+        var bad = !res.ok || /^(Timeout|Compile error:|Rejected:|Server error:)/.test(res.text);
+        setOut(res.text, bad ? 'err' : 'ok');
+        statusEl.textContent = (bad ? 'failed' : 'done') + ' · ' + secs + 's';
+      })
+      .catch(function () {
+        setOut('Playground server is not reachable.\n\nStart playground.exe from the site/ folder and open http://localhost:8084, or install Donky and run code locally.', 'err');
+        statusEl.textContent = 'offline';
+      })
+      .then(function () { running = false; runBtn.disabled = false; runBtn.textContent = '▶ Run'; });
+  }
+  runBtn.addEventListener('click', run);
+})();
+</script>
+</body>
+</html>

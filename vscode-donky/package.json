@@ -1,0 +1,30 @@
+{
+  "name": "donky-lang",
+  "displayName": "Donky",
+  "description": "Official syntax highlighting for the Donky programming language.",
+  "version": "1.0.0",
+  "publisher": "donky",
+  "engines": {
+    "vscode": "^1.50.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "donky",
+        "aliases": ["Donky", "donky"],
+        "extensions": [".donk"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "donky",
+        "scopeName": "source.donky",
+        "path": "./syntaxes/donky.tmLanguage.json"
+      }
+    ]
+  }
+}

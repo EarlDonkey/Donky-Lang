@@ -1,0 +1,153 @@
+// examples/sentinel/collector.donk — sampling loop + ring buffer for Sentinel.
+//
+// THREADING: single writer (the spawned collector worker), single reader (the
+// main-thread HTTP server). The buffer is shared via global_set/global_get.
+// Concurrency assumption: donky_map_set replaces the map's `vals[i]` word
+// under gc_lock, so the reader sees either the previous buffer or the new
+// buffer, never a torn one. Last-write-wins. There is no mutex; we do not
+// need one for this access pattern (SEMANTICS §6.5, §11, and the note in the
+// task brief).
+//
+// CPU CAVEAT: cpu_usage() returns 0 on its first-ever call (it needs a delta
+// against a prior /proc/stat or GetSystemTimes read). `run.donk` primes it by
+// calling cpu_usage() once and sleeping 1000 ms before spawning us, so the
+// first recorded sample has a real CPU value. If you ever call
+// collector_loop() directly without priming, sample 0's cpu is 0.
+//
+// GC: each collect_once() allocates a fresh procs array plus 30 maps. Over
+// 300 samples that is ~9000 maps in the ring buffer. SEMANTICS §11.22: no
+// automatic GC. gc() is refused while any spawned worker is alive
+// (runtime_template.c gc_collect checks active_threads > 0). We therefore do
+// not call gc() — the ring buffer is capped, old samples are dropped by
+// array-trim, and the totals stay bounded.
+//
+// Everything here uses only builtins that appear in SEMANTICS §6.1/§6.3/§6.4:
+// get_processes, cpu_usage, used_mem, total_mem, disk_info, sys_epoch_ms,
+// sleep, len, push, pop, index_get, index_set.
+
+// ---------------------------------------------------------------------------
+// collect_once() -> one sample map, shape:
+//   { ts, cpu, mem_used, mem_total, disk_used, disk_total,
+//     procs: [ {pid, name, threads, mem}, ... ] }   (procs sorted by mem desc,
+//                                                    capped at 30)
+// ---------------------------------------------------------------------------
+fn collect_once() {
+    let sample = {};
+    sample["ts"] = sys_epoch_ms();
+
+    // System-wide metrics.
+    sample["cpu"] = cpu_usage();
+    sample["mem_used"] = used_mem();
+    sample["mem_total"] = total_mem();
+    let d = disk_info();
+    if d == null {
+        sample["disk_used"] = 0.0;
+        sample["disk_total"] = 0.0;
+    } else {
+        sample["disk_used"] = d["used_gb"];
+        sample["disk_total"] = d["total_gb"];
+    }
+
+    // Process table: get_processes() returns [{pid,name,threads,mem}, ...].
+    // We build a fresh array of the same shape sorted by mem desc and trimmed
+    // to top 30. We do not mutate the maps returned by the runtime — that
+    // keeps the runtime's array (which is dropped on the next call) and our
+    // retained sample array independent.
+    let raw = get_processes();
+    let n = len(raw);
+    let procs = [];
+    let i = 0;
+    while i < n {
+        let p = raw[i];
+        let m = {};
+        m["pid"] = p["pid"];
+        m["name"] = p["name"];
+        m["threads"] = p["threads"];
+        m["mem"] = p["mem"];
+        push(procs, m);
+        i = i + 1;
+    }
+    sort_procs_by_mem_desc(procs);
+    if len(procs) > 30 {
+        let trimmed = [];
+        let j = 0;
+        while j < 30 {
+            push(trimmed, procs[j]);
+            j = j + 1;
+        }
+        procs = trimmed;
+    }
+    sample["procs"] = procs;
+    return sample;
+}
+
+// Insertion sort, descending by mem. Tie-break: original relative order
+// (stable). n <= ~400 (process count) so insertion sort is fine.
+fn sort_procs_by_mem_desc(a) {
+    let n = len(a);
+    let i = 1;
+    while i < n {
+        let key = a[i];
+        let key_mem = key["mem"];
+        let j = i - 1;
+        while j >= 0 {
+            if a[j]["mem"] >= key_mem {
+                break;
+            }
+            a[j + 1] = a[j];
+            j = j - 1;
+        }
+        a[j + 1] = key;
+        i = i + 1;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// push_sample(buf, sample) -> array. Appends; trims to last 300.
+// `buf` is the current ring buffer (array). Returns a fresh array. We never
+// mutate `buf` in place — the reader may be holding a reference to it.
+// ---------------------------------------------------------------------------
+fn push_sample(buf, sample) {
+    let out = [];
+    if buf != null {
+        let n = len(buf);
+        let i = 0;
+        while i < n {
+            push(out, buf[i]);
+            i = i + 1;
+        }
+    }
+    push(out, sample);
+    let cap = 300;
+    let over = len(out) - cap;
+    if over > 0 {
+        let trimmed = [];
+        let k = over;
+        let n2 = len(out);
+        while k < n2 {
+            push(trimmed, out[k]);
+            k = k + 1;
+        }
+        return trimmed;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// collector_loop(_ignored) -> null (never returns). Forever loop; the argument
+// is ignored (spawn passes one word; we don't need it).
+// ---------------------------------------------------------------------------
+fn collector_loop(_ignored) {
+    // Recover any buffer a previous (hypothetical) run left behind. Normally
+    // null on startup.
+    let buf = global_get("sentinel_buffer");
+    if buf == null { buf = []; }
+    while true {
+        let sample = collect_once();
+        buf = push_sample(buf, sample);
+        global_set("sentinel_buffer", buf);
+        sleep(1000);
+    }
+    return null;
+}

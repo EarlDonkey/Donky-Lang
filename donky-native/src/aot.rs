@@ -16,7 +16,21 @@ fn fatal(pos: Pos, msg: &str) -> ! {
 
 static STRING_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 26] = [
+// NaN-boxing constants. MUST match runtime_template.c (see its BEGIN TAG ASSERTIONS block).
+#[allow(dead_code)] const TAG_MASK: u64 = 0xFFF8_0000_0000_0000;
+#[allow(dead_code)] const TAG_BASE: u64 = 0x7FF8_0000_0000_0000;
+#[allow(dead_code)] const TAG_BOOL_VAL: u64 = 1;
+const BOOL_TRUE_BITS:  i64 = (TAG_BASE | (TAG_BOOL_VAL << 48) | 1) as i64;
+const BOOL_FALSE_BITS: i64 = (TAG_BASE | (TAG_BOOL_VAL << 48))     as i64;
+const NULL_BITS:       i64 = TAG_BASE as i64;
+#[allow(dead_code)] const NUM_ZERO: f64 = 0.0;
+#[allow(dead_code)] const NUM_ONE: f64 = 1.0;
+#[allow(dead_code)] const NUM_ZERO_BITS: i64 = 0;
+#[allow(dead_code)] const NUM_FALSE_BITS: i64 = 0;
+#[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
+#[allow(dead_code)] const TYPE_KEY: &str = "__type__";
+
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 33] = [
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -43,11 +57,18 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 26] = [
     ("ffi_free",  "donky_ffi_free",  1),
     ("ffi_peek",  "donky_ffi_peek",  2),
     ("ffi_poke",  "donky_ffi_poke",  3),
+    ("pow",  "donky_pow",  2),
+    ("exp",  "donky_exp",  1),
+    ("log",  "donky_log",  1),
+    ("tanh", "donky_tanh", 1),
+    ("max",  "donky_max",  2),
+    ("min",  "donky_min",  2),
+    ("abs",  "donky_abs",  1),
 ];
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFuncs {
-    pub print_id: FuncId, pub alloc_array_id: FuncId, pub array_push_id: FuncId,
+    pub print_id: FuncId, pub make_number_id: FuncId, pub alloc_array_id: FuncId, pub array_push_id: FuncId,
     pub alloc_map_id: FuncId, pub map_set_id: FuncId, pub index_get_id: FuncId,
     pub index_set_id: FuncId, pub alloc_string_id: FuncId,
     pub len_id: FuncId, pub push_id: FuncId, pub pop_id: FuncId, pub str_id: FuncId,
@@ -78,7 +99,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 26],
+    pub stdlib_ids: [FuncId; 33], pub fdiv_id: FuncId,
 }
 
 pub struct AotCompiler {
@@ -88,6 +109,7 @@ pub struct AotCompiler {
     user_functions: HashMap<String, FuncId>,
     runtime: RuntimeFuncs,
     pending_closures: Vec<(String, Vec<String>, Box<Stmt>)>,
+    top_lets: HashSet<String>,
 }
 
 struct FunctionContext {
@@ -96,6 +118,69 @@ struct FunctionContext {
     next_var: usize,
     exception_target: Option<Block>,
     loop_stack: Vec<(Block, Block)>,
+    top_lets: HashSet<String>,
+}
+
+fn emit_exception_check(
+    builder: &mut FunctionBuilder,
+    module: &mut ObjectModule,
+    runtime: &RuntimeFuncs,
+    fctx: &FunctionContext,
+) {
+    let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
+    let exc_call = builder.ins().call(has_exc_func, &[]);
+    let has_exc = builder.inst_results(exc_call)[0];
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    let cmp = builder.ins().icmp(IntCC::NotEqual, has_exc, zero_i32);
+    let cont_block = builder.create_block();
+    let exc_block = builder.create_block();
+    builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
+    builder.seal_block(exc_block);
+    builder.seal_block(cont_block);
+    builder.switch_to_block(exc_block);
+    if let Some(target) = fctx.exception_target {
+        builder.ins().jump(target, &[]);
+    } else {
+        let null_val = builder.ins().iconst(types::I64, NULL_BITS);
+        builder.ins().return_(&[null_val]);
+    }
+    builder.switch_to_block(cont_block);
+}
+
+/// Boxes a compile-time string constant as a Donky string value (same pattern as FieldSet/FieldAccess).
+fn alloc_str_const(builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs, s: &str) -> Value {
+    let idx = STRING_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let data_id = module.declare_data(&format!("str_{}", idx), Linkage::Export, true, false).unwrap();
+    let mut data_ctx = DataDescription::new();
+    let mut bytes = s.as_bytes().to_vec(); bytes.push(0);
+    data_ctx.define(bytes.into_boxed_slice()); module.define_data(data_id, &data_ctx).unwrap();
+    let local_data = module.declare_data_in_func(data_id, builder.func);
+    let ptr = builder.ins().global_value(types::I64, local_data);
+    let alloc_func = module.declare_func_in_func(runtime.alloc_string_id, builder.func);
+    let call = builder.ins().call(alloc_func, &[ptr]);
+    builder.inst_results(call)[0]
+}
+
+/// FuncId of a STDLIB_BUILTINS entry by Donky name (same lookup the builtin dispatch uses).
+fn stdlib_func_id(runtime: &RuntimeFuncs, name: &str) -> FuncId {
+    let i = STDLIB_BUILTINS.iter().position(|(n, _, _)| *n == name)
+        .unwrap_or_else(|| panic!("STDLIB_BUILTINS has no `{}`", name));
+    runtime.stdlib_ids[i]
+}
+
+/// donky_global_set("name", val). Result ignored; global_set never throws.
+fn emit_global_set(builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs, name: &str, val: Value) {
+    let key = alloc_str_const(builder, module, runtime, name);
+    let set_func = module.declare_func_in_func(stdlib_func_id(runtime, "global_set"), builder.func);
+    builder.ins().call(set_func, &[key, val]);
+}
+
+/// donky_global_get("name"): the value, or null if never set.
+fn emit_global_get(builder: &mut FunctionBuilder, module: &mut ObjectModule, runtime: &RuntimeFuncs, name: &str) -> Value {
+    let key = alloc_str_const(builder, module, runtime, name);
+    let get_func = module.declare_func_in_func(stdlib_func_id(runtime, "global_get"), builder.func);
+    let call = builder.ins().call(get_func, &[key]);
+    builder.inst_results(call)[0]
 }
 
 impl AotCompiler {
@@ -114,13 +199,14 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 26] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 33] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });
 
         let runtime = RuntimeFuncs {
             print_id: declare("donky_print", &[types::I64], None),
+            make_number_id: declare("donky_make_number", &[types::F64], Some(types::I64)),
             alloc_array_id: declare("donky_alloc_array", &[], Some(types::I64)),
             array_push_id: declare("donky_array_push", &[types::I64, types::I64], Some(types::I64)),
             alloc_map_id: declare("donky_alloc_map", &[], Some(types::I64)),
@@ -160,7 +246,7 @@ impl AotCompiler {
             get_exception_id: declare("donky_get_exception", &[], Some(types::I64)),
             clear_exception_id: declare("donky_clear_exception", &[], None),
             get_args_id: declare("donky_get_args", &[], Some(types::I64)),
-            cls_id: declare("donky_cls", &[], None),
+            cls_id: declare("donky_cls", &[], Some(types::I64)),
             getch_id: declare("donky_getch", &[], Some(types::I64)),
             kbhit_id: declare("donky_kbhit", &[], Some(types::I64)),
             input_id: declare("donky_input", &[types::I64], Some(types::I64)),
@@ -205,11 +291,12 @@ impl AotCompiler {
             json_encode_id: declare("donky_json_encode", &[types::I64], Some(types::I64)),
             json_pretty_id: declare("donky_json_pretty", &[types::I64], Some(types::I64)),
             json_error_id:  declare("donky_json_error",  &[], Some(types::I64)),
+            fdiv_id: declare("donky_fdiv", &[types::I64, types::I64], Some(types::I64)),
             stdlib_ids,
             
         };
         
-        AotCompiler { builder_context: FunctionBuilderContext::new(), ctx: codegen::Context::new(), module, user_functions: HashMap::new(), runtime, pending_closures: Vec::new() }
+        AotCompiler { builder_context: FunctionBuilderContext::new(), ctx: codegen::Context::new(), module, user_functions: HashMap::new(), runtime, pending_closures: Vec::new(), top_lets: HashSet::new() }
     }
 
     pub fn compile_to_object(mut self, stmts: &[Stmt], output_path: &str) -> Result<(), String> {
@@ -217,6 +304,17 @@ impl AotCompiler {
         let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
         resolve_imports(stmts, ".", &mut latest_funcs, &mut visited)?;
         // ----------------------------------------
+
+        // Top-level `let`s become globals (readable inside functions via donky_global_get).
+        // Only DIRECT top-level lets count (not inside blocks/ifs). `args` is the builtin slot: never a global.
+        for s in stmts {
+            if let Stmt::Let(name, _) = s {
+                if name != "args" { self.top_lets.insert(name.clone()); }
+            }
+        }
+        // Function bodies (main + imported), cloned before the compile loop consumes latest_funcs,
+        // so DCE sees names that only functions read.
+        let fn_bodies: Vec<Stmt> = latest_funcs.values().map(|(_, b)| (**b).clone()).collect();
 
         for (name, (params, _)) in &latest_funcs {
             let mut sig = self.module.make_signature();
@@ -250,7 +348,8 @@ impl AotCompiler {
                 num_vars: HashSet::new(), 
                 next_var: 0, 
                 exception_target: None, 
-                loop_stack: Vec::new() 
+                loop_stack: Vec::new(),
+                top_lets: self.top_lets.clone()
             };
             
             let get_args_func = self.module.declare_func_in_func(self.runtime.get_args_id, builder.func);
@@ -262,7 +361,7 @@ impl AotCompiler {
             fctx.variables.insert("args".to_string(), args_var);
             
             // --- DCE Optimization ---
-            let optimized_stmts = Self::optimize_block(stmts.to_vec());
+            let optimized_stmts = Self::optimize_block(stmts.to_vec(), &fn_bodies);
 
             let root = Stmt::Block(optimized_stmts.clone());
             fctx.num_vars = Self::analyze_numeric(&[], &root);
@@ -270,7 +369,17 @@ impl AotCompiler {
             let mut terminated = false;
             
             for stmt in &optimized_stmts {
-                if !matches!(stmt, Stmt::Function(_, _, _)) {
+                if let Stmt::Let(name, expr) = stmt {
+                    // Top-level let, inlined (RHS compiled once): local slot AND donky_global_set.
+                    let val = Self::compile_expr(
+                        &mut builder, &mut self.module, &self.runtime, &self.user_functions,
+                        &mut self.pending_closures, &mut fctx, expr
+                    );
+                    let var = Variable::new(fctx.next_var); fctx.next_var += 1;
+                    builder.declare_var(var, types::I64); builder.def_var(var, val);
+                    fctx.variables.insert(name.clone(), var);
+                    emit_global_set(&mut builder, &mut self.module, &self.runtime, name, val);
+                } else if !matches!(stmt, Stmt::Function(_, _, _)) {
                     terminated = Self::compile_stmt(
                         &mut builder, &mut self.module, &self.runtime, &self.user_functions, 
                         &mut self.pending_closures, &mut fctx, stmt
@@ -280,8 +389,8 @@ impl AotCompiler {
             }
             
             if !terminated { 
-                let zero = builder.ins().iconst(types::I64, 0);
-                builder.ins().return_(&[zero]); 
+                let null_val = builder.ins().iconst(types::I64, NULL_BITS);
+                builder.ins().return_(&[null_val]); 
             }
             builder.seal_all_blocks();
             builder.finalize();
@@ -314,7 +423,7 @@ impl AotCompiler {
         Ok(())
     }
 
-    fn optimize_block(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    fn optimize_block(stmts: Vec<Stmt>, fn_bodies: &[Stmt]) -> Vec<Stmt> {
         use std::collections::HashSet;
 
         fn ex(e: &Expr, u: &mut HashSet<String>) {
@@ -322,8 +431,8 @@ impl AotCompiler {
                 Expr::Ident(n) => { u.insert(n.clone()); }
                 Expr::Binary(l, _, r) => { ex(l, u); ex(r, u); }
                 Expr::Unary(_, x) => ex(x, u),
-                Expr::Call(_, args, _) => { for a in args { ex(a, u); } }
-                Expr::MethodCall(obj, _, args, _) => { ex(obj, u); for a in args { ex(a, u); } }
+                Expr::Call(n, args, _) => { u.insert(n.clone()); for a in args { ex(a, u); } }
+                Expr::MethodCall(obj, m, args, _) => { u.insert(m.clone()); ex(obj, u); for a in args { ex(a, u); } }
                 Expr::Index(o, i) => { ex(o, u); ex(i, u); }
                 Expr::FieldAccess(o, _) => ex(o, u),
                 Expr::Array(v) => { for a in v { ex(a, u); } }
@@ -331,6 +440,7 @@ impl AotCompiler {
                 Expr::InterpolatedString(p) => { for a in p { ex(a, u); } }
                 Expr::StructInit(_, f) => { for (_, v) in f { ex(v, u); } }
                 Expr::Ternary(c, t, f) => { ex(c, u); ex(t, u); ex(f, u); }
+                Expr::Function(_, body) => st(body, u),
                 _ => {}
             }
         }
@@ -365,6 +475,8 @@ impl AotCompiler {
 
         let mut used: HashSet<String> = HashSet::new();
         for s in &stmts { st(s, &mut used); }
+        // A top-level let is now a global: any function body that mentions its name keeps it alive.
+        for b in fn_bodies { st(b, &mut used); }
 
         stmts.into_iter().filter(|s| match s {
             Stmt::Let(name, e) => used.contains(name) || !pure(e),
@@ -388,7 +500,8 @@ impl AotCompiler {
                 num_vars: HashSet::new(), 
                 next_var: 0, 
                 exception_target: None, 
-                loop_stack: Vec::new() 
+                loop_stack: Vec::new(),
+                top_lets: self.top_lets.clone()
             };
             
             // Analyze numeric types for this function
@@ -424,8 +537,8 @@ impl AotCompiler {
             );
             *pending_closures = pc;
             if !terminated { 
-                let zero = builder.ins().iconst(types::I64, 0);
-                builder.ins().return_(&[zero]); 
+                let null_val = builder.ins().iconst(types::I64, NULL_BITS);
+                builder.ins().return_(&[null_val]); 
             }
             builder.seal_all_blocks();
             builder.finalize();
@@ -460,7 +573,9 @@ impl AotCompiler {
                 let i = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, index);
                 let v = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, val);
                 let local_callee = module.declare_func_in_func(runtime.index_set_id, builder.func);
-                builder.ins().call(local_callee, &[t, i, v]); false
+                builder.ins().call(local_callee, &[t, i, v]);
+                emit_exception_check(builder, module, runtime, fctx);
+                false
             }
             Stmt::FieldSet(obj, field, val) => {
                 let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, obj);
@@ -478,19 +593,22 @@ impl AotCompiler {
                 let v = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, val);
                 let set_func = module.declare_func_in_func(runtime.index_set_id, builder.func);
                 builder.ins().call(set_func, &[t, key, v]);
+                emit_exception_check(builder, module, runtime, fctx);
                 false
             }
             Stmt::Print(expr) => {
                 let val = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr);
                 let local_callee = module.declare_func_in_func(runtime.print_id, builder.func);
-                builder.ins().call(local_callee, &[val]); false
+                builder.ins().call(local_callee, &[val]);
+                emit_exception_check(builder, module, runtime, fctx);
+                false
             }
             Stmt::ExprStmt(expr) => { Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, expr); false }
             Stmt::Return(expr) => {
                 let val = if let Some(e) = expr { 
                     Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, e) 
                 } else { 
-                    builder.ins().iconst(types::I64, 0) 
+                    builder.ins().iconst(types::I64, NULL_BITS) 
                 };
                 builder.ins().return_(&[val]); true
             }
@@ -515,8 +633,8 @@ impl AotCompiler {
                 if let Some(target) = &fctx.exception_target {
                     builder.ins().jump(*target, &[]);
                 } else {
-                    let zero = builder.ins().iconst(types::I64, 0);
-                    builder.ins().return_(&[zero]);
+                    let null_val = builder.ins().iconst(types::I64, NULL_BITS);
+                    builder.ins().return_(&[null_val]);
                 }
                 true
             }
@@ -663,7 +781,9 @@ impl AotCompiler {
                 let cur_f = builder.ins().bitcast(types::F64, MemFlags::new(), cur_idx);
                 let one_f = builder.ins().f64const(1.0);
                 let sum_f = builder.ins().fadd(cur_f, one_f);
-                let next_idx = builder.ins().bitcast(types::I64, MemFlags::new(), sum_f);
+                let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                let call = builder.ins().call(mk, &[sum_f]);
+                let next_idx = builder.inst_results(call)[0];
                 builder.def_var(idx_var, next_idx);
                 builder.ins().jump(header, &[]);
                 builder.switch_to_block(exit_block);
@@ -709,7 +829,9 @@ impl AotCompiler {
                 let c2f = builder.ins().bitcast(types::F64, MemFlags::new(), c2);
                 let one = builder.ins().f64const(1.0);
                 let sum = builder.ins().fadd(c2f, one);
-                let nxt = builder.ins().bitcast(types::I64, MemFlags::new(), sum);
+                let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                let call = builder.ins().call(mk, &[sum]);
+                let nxt = builder.inst_results(call)[0];
                 builder.def_var(idx_var, nxt);
                 builder.ins().jump(header, &[]);
                 builder.switch_to_block(exit_block);
@@ -826,7 +948,7 @@ impl AotCompiler {
             }
             Expr::Ident(name) => { 
                 if name == "null" {
-                    return builder.ins().iconst(types::I64, 0);
+                    return builder.ins().iconst(types::I64, NULL_BITS);
                 }
                 // Don't panic on unknown identifiers. Return null so the program
                 // can continue and throw a proper runtime error if needed.
@@ -837,9 +959,12 @@ impl AotCompiler {
                     let func_ref = module.declare_func_in_func(*func_id, builder.func);
                     let addr = builder.ins().func_addr(types::I64, func_ref);
                     addr 
+                } else if fctx.top_lets.contains(name) {
+                    // Top-level `let` read from inside a function: go through the global map.
+                    emit_global_get(builder, module, runtime, name)
                 } else {
-                    eprintln!("warning: undefined variable `{}` evaluates to null (functions cannot see top-level `let`s; use global_get/global_set or pass it as an argument)", name);
-                    builder.ins().iconst(types::I64, 0) // Return null
+                    eprintln!("warning: undefined variable `{}` evaluates to null", name);
+                    builder.ins().iconst(types::I64, NULL_BITS) // Return null
                 }
             }
             Expr::Unary(op, right) => {
@@ -848,7 +973,9 @@ impl AotCompiler {
                     TokenType::Minus => {
                         let v_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), val);
                         let neg = builder.ins().fneg(v_f64);
-                        builder.ins().bitcast(types::I64, MemFlags::new(), neg)
+                        let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                        let call = builder.ins().call(mk, &[neg]);
+                        builder.inst_results(call)[0]
                     }
                     TokenType::Bang => {
                         let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
@@ -857,9 +984,9 @@ impl AotCompiler {
                         let truthy_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), truthy_val);
                         let zero_f64 = builder.ins().f64const(0.0);
                         let is_zero = builder.ins().fcmp(FloatCC::Equal, truthy_f64, zero_f64);
-                        let int_val = builder.ins().uextend(types::I64, is_zero);
-                        let f64_result = builder.ins().fcvt_from_uint(types::F64, int_val);
-                        builder.ins().bitcast(types::I64, MemFlags::new(), f64_result)
+                        let t = builder.ins().iconst(types::I64, BOOL_TRUE_BITS);
+                        let f = builder.ins().iconst(types::I64, BOOL_FALSE_BITS);
+                        builder.ins().select(is_zero, t, f)
                     }
                     _ => val,
                 }
@@ -911,25 +1038,7 @@ impl AotCompiler {
                     Self::pad_args(builder, local_callee, &mut arg_vals);
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let ret_val = builder.inst_results(call)[0];
-                    let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
-                    let exc_call = builder.ins().call(has_exc_func, &[]);
-                    let has_exc = builder.inst_results(exc_call)[0];
-                    let zero = builder.ins().iconst(types::I32, 0);
-                    let cmp = builder.ins().icmp(IntCC::NotEqual, has_exc, zero);
-                    let cont_block = builder.create_block(); let exc_block = builder.create_block();
-                    
-                    builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
-                    builder.seal_block(exc_block); builder.seal_block(cont_block);
-                    
-                    builder.switch_to_block(exc_block);
-                    if let Some(target) = &fctx.exception_target {
-                        builder.ins().jump(*target, &[]);
-                    } else {
-                        let zero_val = builder.ins().iconst(types::I64, 0);
-                        builder.ins().return_(&[zero_val]);
-                    }
-                    
-                    builder.switch_to_block(cont_block);
+                    emit_exception_check(builder, module, runtime, fctx);
                     ret_val
                 } else {
                     let builtin_id = match name.as_str() {
@@ -1000,31 +1109,10 @@ impl AotCompiler {
                     Self::pad_args(builder, local_callee, &mut arg_vals);
                     let call = builder.ins().call(local_callee, &arg_vals);
                     let results = builder.inst_results(call);
-                    let ret_val = if results.is_empty() { builder.ins().iconst(types::I64, 0) } else { results[0] };
+                    let ret_val = if results.is_empty() { builder.ins().iconst(types::I64, NULL_BITS) } else { results[0] };
 
                     // --- Check for exceptions thrown by builtins ---
-                    let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
-                    let exc_call = builder.ins().call(has_exc_func, &[]);
-                    let has_exc = builder.inst_results(exc_call)[0];
-                    let zero_i32 = builder.ins().iconst(types::I32, 0);
-                    let cmp = builder.ins().icmp(IntCC::NotEqual, has_exc, zero_i32);
-                    
-                    let cont_block = builder.create_block();
-                    let exc_block = builder.create_block();
-                    
-                    builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
-                    builder.seal_block(exc_block);
-                    builder.seal_block(cont_block);
-                    
-                    builder.switch_to_block(exc_block);
-                    if let Some(target) = &fctx.exception_target {
-                        builder.ins().jump(*target, &[]);
-                    } else {
-                        let zero_val = builder.ins().iconst(types::I64, 0);
-                        builder.ins().return_(&[zero_val]);
-                    }
-                    
-                    builder.switch_to_block(cont_block);
+                    emit_exception_check(builder, module, runtime, fctx);
                     ret_val
                 }
             }
@@ -1105,7 +1193,9 @@ impl AotCompiler {
                 let i = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, index);
                 let get_func = module.declare_func_in_func(runtime.index_get_id, builder.func);
                 let call = builder.ins().call(get_func, &[t, i]);
-                builder.inst_results(call)[0]
+                let r = builder.inst_results(call)[0];
+                emit_exception_check(builder, module, runtime, fctx);
+                r
             }
             Expr::FieldAccess(obj, field) => {
                 let t = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, obj);
@@ -1122,7 +1212,9 @@ impl AotCompiler {
                 
                 let get_func = module.declare_func_in_func(runtime.index_get_id, builder.func);
                 let call = builder.ins().call(get_func, &[t, key]);
-                builder.inst_results(call)[0]
+                let r = builder.inst_results(call)[0];
+                emit_exception_check(builder, module, runtime, fctx);
+                r
             }
             Expr::Binary(left, op, right) if matches!(op, TokenType::And | TokenType::Or) => {
                 // Short-circuit: the right operand is only evaluated when it can change the result.
@@ -1142,17 +1234,16 @@ impl AotCompiler {
                 builder.seal_block(short_block);
 
                 builder.switch_to_block(short_block);
-                let short_bits = (if is_and { 0.0f64 } else { 1.0f64 }).to_bits() as i64;
-                let short_val = builder.ins().iconst(types::I64, short_bits);
+                let short_val = builder.ins().iconst(types::I64, if is_and { BOOL_FALSE_BITS } else { BOOL_TRUE_BITS });
                 builder.ins().jump(merge, &[short_val]);
 
                 builder.switch_to_block(rhs_block);
                 let rhs = Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, right);
                 let rknown = Self::is_num(right, &fctx.num_vars);
                 let rb = Self::cond_to_bool(builder, module, runtime, rhs, rknown);
-                let r_int = builder.ins().uextend(types::I64, rb);
-                let r_f = builder.ins().fcvt_from_uint(types::F64, r_int);
-                let r_val = builder.ins().bitcast(types::I64, MemFlags::new(), r_f);
+                let rt = builder.ins().iconst(types::I64, BOOL_TRUE_BITS);
+                let rf = builder.ins().iconst(types::I64, BOOL_FALSE_BITS);
+                let r_val = builder.ins().select(rb, rt, rf);
                 builder.ins().jump(merge, &[r_val]);
 
                 builder.seal_block(merge);
@@ -1162,18 +1253,21 @@ impl AotCompiler {
             Expr::Binary(left, op, right) => {
                 // --- Constant Folding ---
                 if let (Expr::Number(l), Expr::Number(r)) = (left.as_ref(), right.as_ref()) {
+                    let cmp_fold = match op {
+                        TokenType::EqEq => Some(l == r), TokenType::NotEq => Some(l != r),
+                        TokenType::Lt => Some(l < r), TokenType::LtEq => Some(l <= r),
+                        TokenType::Gt => Some(l > r), TokenType::GtEq => Some(l >= r),
+                        _ => None,
+                    };
+                    if let Some(b) = cmp_fold {
+                        return builder.ins().iconst(types::I64, if b { BOOL_TRUE_BITS } else { BOOL_FALSE_BITS });
+                    }
                     let result = match op {
                         TokenType::Plus => Some(l + r),
                         TokenType::Minus => Some(l - r),
                         TokenType::Star => Some(l * r),
                         TokenType::Slash => if *r != 0.0 { Some(l / r) } else { None },
                         TokenType::Percent => Some(l % r),
-                        TokenType::EqEq => Some(if l == r { 1.0 } else { 0.0 }),
-                        TokenType::NotEq => Some(if l != r { 1.0 } else { 0.0 }),
-                        TokenType::Lt => Some(if l < r { 1.0 } else { 0.0 }),
-                        TokenType::LtEq => Some(if l <= r { 1.0 } else { 0.0 }),
-                        TokenType::Gt => Some(if l > r { 1.0 } else { 0.0 }),
-                        TokenType::GtEq => Some(if l >= r { 1.0 } else { 0.0 }),
                         _ => None,
                     };
                     if let Some(val) = result.filter(|v| v.is_finite()) {
@@ -1198,19 +1292,23 @@ impl AotCompiler {
                     let eq_func = module.declare_func_in_func(runtime.eq_id, builder.func);
                     let call = builder.ins().call(eq_func, &[lhs, rhs]);
                     let is_eq = builder.inst_results(call)[0];
-                    if op == &TokenType::NotEq {
-                        let f = builder.ins().bitcast(types::F64, MemFlags::new(), is_eq);
-                        let one = builder.ins().f64const(1.0);
-                        let inv = builder.ins().fsub(one, f);
-                        builder.ins().bitcast(types::I64, MemFlags::new(), inv)
-                    } else { is_eq }
+                    let eq_f = builder.ins().bitcast(types::F64, MemFlags::new(), is_eq);
+                    let zero = builder.ins().f64const(0.0);
+                    let c = if op == &TokenType::NotEq {
+                        builder.ins().fcmp(FloatCC::Equal, eq_f, zero)
+                    } else {
+                        builder.ins().fcmp(FloatCC::NotEqual, eq_f, zero)
+                    };
+                    let t = builder.ins().iconst(types::I64, BOOL_TRUE_BITS);
+                    let f = builder.ins().iconst(types::I64, BOOL_FALSE_BITS);
+                    builder.ins().select(c, t, f)
                 } else if let Some(cc) = cmp {
                     let a_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
                     let b_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
-                    let bool_val = builder.ins().fcmp(cc, a_f64, b_f64);
-                    let int_val = builder.ins().uextend(types::I64, bool_val);
-                    let f64_val = builder.ins().fcvt_from_uint(types::F64, int_val);
-                    builder.ins().bitcast(types::I64, MemFlags::new(), f64_val)
+                    let c = builder.ins().fcmp(cc, a_f64, b_f64);
+                    let t = builder.ins().iconst(types::I64, BOOL_TRUE_BITS);
+                    let f = builder.ins().iconst(types::I64, BOOL_FALSE_BITS);
+                    builder.ins().select(c, t, f)
                 } else {
                     match op {
                         TokenType::Plus => {
@@ -1218,36 +1316,81 @@ impl AotCompiler {
                                 let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
                                 let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
                                 let res = builder.ins().fadd(a, b);
-                                builder.ins().bitcast(types::I64, MemFlags::new(), res)
+                                let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                                let call = builder.ins().call(mk, &[res]);
+                                builder.inst_results(call)[0]
                             } else {
                                 let add_func = module.declare_func_in_func(runtime.add_id, builder.func);
                                 let call = builder.ins().call(add_func, &[lhs, rhs]);
-                                builder.inst_results(call)[0]
+                                let r = builder.inst_results(call)[0];
+                                emit_exception_check(builder, module, runtime, fctx);
+                                r
                             }
                         }
-                        TokenType::Minus => { 
-                            let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs); 
-                            let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs); 
-                            let res = builder.ins().fsub(a, b);
-                            builder.ins().bitcast(types::I64, MemFlags::new(), res) 
+                                                TokenType::Minus => {
+                            if both_num {
+                                let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+                                let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+                                let res = builder.ins().fsub(a, b);
+                                let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                                let call = builder.ins().call(mk, &[res]);
+                                builder.inst_results(call)[0]
+                            } else {
+                                // checked: throws "cannot subtract X and Y" on non-numbers
+                                let f = module.declare_func_in_func(runtime.sub_id, builder.func);
+                                let call = builder.ins().call(f, &[lhs, rhs]);
+                                let r = builder.inst_results(call)[0];
+                                emit_exception_check(builder, module, runtime, fctx);
+                                r
+                            }
                         }
-                        TokenType::Star => { 
-                            let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs); 
-                            let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs); 
-                            let res = builder.ins().fmul(a, b);
-                            builder.ins().bitcast(types::I64, MemFlags::new(), res) 
+                        TokenType::Star => {
+                            if both_num {
+                                let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+                                let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+                                let res = builder.ins().fmul(a, b);
+                                let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                                let call = builder.ins().call(mk, &[res]);
+                                builder.inst_results(call)[0]
+                            } else {
+                                // checked: throws "cannot multiply X and Y" on non-numbers
+                                let f = module.declare_func_in_func(runtime.mul_id, builder.func);
+                                let call = builder.ins().call(f, &[lhs, rhs]);
+                                let r = builder.inst_results(call)[0];
+                                emit_exception_check(builder, module, runtime, fctx);
+                                r
+                            }
                         }
-                        TokenType::Slash => { 
-                            let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs); 
-                            let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs); 
+                        TokenType::Slash => {
+                            if !both_num {
+                                // checked: throws "cannot divide X and Y" on non-numbers
+                                let chk = module.declare_func_in_func(runtime.fdiv_id, builder.func);
+                                builder.ins().call(chk, &[lhs, rhs]);
+                                emit_exception_check(builder, module, runtime, fctx);
+                            }
+                            let a = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+                            let b = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
                             let res = builder.ins().fdiv(a, b);
-                            builder.ins().bitcast(types::I64, MemFlags::new(), res) 
+                            let mk = module.declare_func_in_func(runtime.make_number_id, builder.func);
+                            let call = builder.ins().call(mk, &[res]);
+                            builder.inst_results(call)[0]
+                        }
+                        TokenType::Div => {
+                            // div = checked integer division: calls donky_div, throws on zero and on type mismatch. / = raw IEEE.
+                            let div_func = module.declare_func_in_func(runtime.div_id, builder.func);
+                            let call = builder.ins().call(div_func, &[lhs, rhs]);
+                            let r = builder.inst_results(call)[0];
+                            emit_exception_check(builder, module, runtime, fctx);
+                            r
                         }
                         TokenType::Percent => {
                             let mod_func = module.declare_func_in_func(runtime.mod_id, builder.func);
                             let call = builder.ins().call(mod_func, &[lhs, rhs]);
-                            builder.inst_results(call)[0]
+                            let r = builder.inst_results(call)[0];
+                            emit_exception_check(builder, module, runtime, fctx);
+                            r
                         }
+                        // dead: short-circuit arm matches first
                         TokenType::And => {
                             let truthy_func = module.declare_func_in_func(runtime.truthy_id, builder.func);
                             let lhs_t_call = builder.ins().call(truthy_func, &[lhs]);
@@ -1326,24 +1469,7 @@ impl AotCompiler {
         let call = builder.ins().call_indirect(sigref, fptr, &arg_vals);
         let ret_val = builder.inst_results(call)[0];
 
-        let has_exc_func = module.declare_func_in_func(runtime.has_exception_id, builder.func);
-        let exc_call = builder.ins().call(has_exc_func, &[]);
-        let has_exc = builder.inst_results(exc_call)[0];
-        let zero_i32 = builder.ins().iconst(types::I32, 0);
-        let cmp = builder.ins().icmp(IntCC::NotEqual, has_exc, zero_i32);
-        let cont_block = builder.create_block();
-        let exc_block = builder.create_block();
-        builder.ins().brif(cmp, exc_block, &[], cont_block, &[]);
-        builder.seal_block(exc_block);
-        builder.seal_block(cont_block);
-        builder.switch_to_block(exc_block);
-        if let Some(target) = &fctx.exception_target {
-            builder.ins().jump(*target, &[]);
-        } else {
-            let zero_val = builder.ins().iconst(types::I64, 0);
-            builder.ins().return_(&[zero_val]);
-        }
-        builder.switch_to_block(cont_block);
+        emit_exception_check(builder, module, runtime, fctx);
         ret_val
     }
 
@@ -1376,12 +1502,11 @@ impl AotCompiler {
             Expr::Number(_) => true,
             Expr::Ident(n) => num.contains(n),
             Expr::Unary(TokenType::Minus, x) => Self::is_num(x, num),
-            Expr::Unary(TokenType::Bang, _) => true,
+            // `!x`, comparisons, && and || produce TAG_BOOL after Fix 2: not numeric.
             Expr::Binary(l, op, r) => match op {
                 TokenType::Plus => Self::is_num(l, num) && Self::is_num(r, num),
                 TokenType::Minus | TokenType::Star | TokenType::Slash | TokenType::Percent
-                | TokenType::EqEq | TokenType::NotEq | TokenType::Lt | TokenType::LtEq
-                | TokenType::Gt | TokenType::GtEq | TokenType::And | TokenType::Or => true,
+                | TokenType::Div => true,
                 _ => false,
             },
             Expr::Ternary(_, t, f) => Self::is_num(t, num) && Self::is_num(f, num),

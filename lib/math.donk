@@ -1,27 +1,69 @@
-// lib/math.donk — math helpers
+// lib/math.donk — math helpers.
+//
+// As of SEMANTICS.md revision-3 (v2.3), `abs`, `min`, `max`, `pow`, and `floor`
+// exist as AOT builtins (C runtime, §6.1.1). Because user-defined top-level `fn`
+// resolves before builtins in the AOT (§6.1.1), the `abs`/`min`/`max`/`pow`/`floor`
+// definitions that used to live here shadowed the builtins for any code that
+// imported this file. They have been renamed to `math_abs` / `math_min` /
+// `math_max` / `math_pow` / `math_floor` so the builtins are reachable, and the
+// pure-Donky implementations remain callable under the new names.
+//
+// For new code: call the builtins directly (`abs(x)`, `max(a,b)`, `pow(b,e)`,
+// `floor(x)`) — they are faster and more accurate (libm-grade) than the
+// pure-Donky versions. `math_*` variants are for pedagogy and for callers who
+// specifically need the pure-Donky behavior (e.g. to avoid the builtin's
+// canonicalized NaN).
+//
+// Compatibility note: any existing caller of `lib/math.donk`'s `abs(x)`,
+// `min(a,b)`, `max(a,b)`, `pow(b,e)`, or `floor(x)` must be updated to call the
+// builtin (same name, no import needed) or `math_abs(x)` etc. Grep
+// `lib/`, `tests/`, and top-level `*.donk` for these names before relying on
+// the old behavior.
 
-fn abs(n) {
+// ---- pure-Donky math (renamed to avoid shadowing the builtins) ----
+
+fn math_abs(n) {
     if n < 0 { return -n; }
     return n;
 }
 
-fn min(a, b) {
+fn math_min(a, b) {
     let res = b;
     if a < b { res = a; }
     return res;
 }
 
-fn max(a, b) {
+fn math_max(a, b) {
     let res = b;
     if a > b { res = a; }
     return res;
 }
 
-fn floor(n) {
+fn math_floor(n) {
     let t = n - (n % 1);
     if n < 0 && n % 1 != 0 { t = t - 1; }
     return t;
 }
+
+// Exponentiation by squaring, O(log e) instead of O(e).
+// Fractional exponents are not supported (throws); use the builtin `pow`.
+fn math_pow(base, exp) {
+    if exp == 0 { return 1; }
+    if exp < 0 { return 1 / math_pow(base, -exp); }
+    if exp - (exp % 1) != exp { throw "math_pow: non-integer exponent not supported; use builtin pow"; }
+    let n = exp;
+    let result = 1;
+    let b = base;
+    while n > 0 {
+        if (n % 2) == 1 { result = result * b; }
+        b = b * b;
+        n = n - (n % 2);
+        n = n / 2;
+    }
+    return result;
+}
+
+// ---- functions that do NOT collide with builtins (kept as-is) ----
 
 fn ceil(n) {
     let t = n - (n % 1);
@@ -30,36 +72,23 @@ fn ceil(n) {
 }
 
 fn round(n) {
-    if n >= 0 { return floor(n + 0.5); }
-    return -floor(-n + 0.5);
+    if n >= 0 { return math_floor(n + 0.5); }
+    return -math_floor(-n + 0.5);
 }
 
+// Newton's method for sqrt. Starting from x = n/2 (not n) so large n converge;
+// 40 iterations is enough for n in [1e-15, 1e15] to full f64 precision.
 fn sqrt(n) {
     if n < 0 { throw "sqrt of negative: " + str(n); }
     if n == 0 { return 0; }
-    let x = n;
+    let x = n / 2;
+    if x < 1 { x = 1; }
     let i = 0;
-    while i < 20 {
+    while i < 40 {
         x = (x + n / x) / 2;
         i = i + 1;
     }
     return x;
-}
-
-fn pow(base, exp) {
-    if exp == 0 { return 1; }
-    if exp < 0 { return 1 / pow(base, -exp); }
-    // integer exponent fast path
-    if exp - (exp % 1) == exp {
-        let r = 1;
-        let i = 0;
-        while i < exp {
-            r = r * base;
-            i = i + 1;
-        }
-        return r;
-    }
-    throw "pow with non-integer exponent not supported";
 }
 
 fn sign(n) {
@@ -75,8 +104,8 @@ fn clamp(n, lo, hi) {
 }
 
 fn gcd(a, b) {
-    let x = abs(a);
-    let y = abs(b);
+    let x = math_abs(a);
+    let y = math_abs(b);
     while y != 0 {
         let t = y;
         y = x - (x / y) * y;
@@ -87,7 +116,7 @@ fn gcd(a, b) {
 
 fn lcm(a, b) {
     if a == 0 || b == 0 { return 0; }
-    return abs(a * b) / gcd(a, b);
+    return math_abs(a * b) / gcd(a, b);
 }
 
 fn pi() { return 3.141592653589793; }
