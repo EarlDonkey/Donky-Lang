@@ -1,0 +1,7 @@
+fn map(arr, func) {
+    let out = [];
+    for x in arr {
+        push(out, func(x));
+    }
+    return out;
+}

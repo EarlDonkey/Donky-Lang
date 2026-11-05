@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 40] = [
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 60] = [
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -71,6 +71,26 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 40] = [
     ("mem_write", "donky_mem_write", 2),
     ("mem_protect", "donky_mem_protect", 3),
     ("mem_free", "donky_mem_free", 1),
+    ("fork", "donky_fork", 0),
+    ("exec", "donky_exec", 2),
+    ("wait", "donky_wait", 1),
+    ("pipe", "donky_pipe", 0),
+    ("dup2", "donky_dup2", 2),
+    ("mmap", "donky_mmap", 3),
+    ("munmap", "donky_munmap", 2),
+    ("setuid", "donky_setuid", 1),
+    ("setgid", "donky_setgid", 1),
+    ("seteuid", "donky_seteuid", 1),
+    ("setegid", "donky_setegid", 1),
+    ("chroot", "donky_chroot", 1),
+    ("unshare", "donky_unshare", 1),
+    ("prctl", "donky_prctl", 5),
+    ("seccomp", "donky_seccomp", 3),
+    ("getpwnam", "donky_getpwnam", 1),
+    ("getpwuid", "donky_getpwuid", 1),
+    ("uname", "donky_uname", 0),
+    ("getrlimit", "donky_getrlimit", 1),
+    ("setrlimit", "donky_setrlimit", 3),
 ];
 
 #[derive(Clone, Copy)]
@@ -106,7 +126,8 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 40], pub fdiv_id: FuncId,
+        pub stdlib_ids: [FuncId; 60], pub fdiv_id: FuncId,
+    pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
 pub struct AotCompiler {
@@ -206,7 +227,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 40] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 60] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });
@@ -299,6 +320,8 @@ impl AotCompiler {
             json_pretty_id: declare("donky_json_pretty", &[types::I64], Some(types::I64)),
             json_error_id:  declare("donky_json_error",  &[], Some(types::I64)),
             fdiv_id: declare("donky_fdiv", &[types::I64, types::I64], Some(types::I64)),
+            alloc_function_id: declare("donky_alloc_function", &[types::I64], Some(types::I64)),
+            call_function_id:  declare("donky_call_function",  &[types::I64, types::I64], Some(types::I64)),
             stdlib_ids,
             
         };
@@ -933,7 +956,9 @@ impl AotCompiler {
                 let func_id = module.declare_function(&format!("donky_fn_{}", anon_name), Linkage::Export, &sig).unwrap();
                 let func_ref = module.declare_func_in_func(func_id, builder.func);
                 let addr = builder.ins().func_addr(types::I64, func_ref);
-                addr
+                let alloc_fn = module.declare_func_in_func(runtime.alloc_function_id, builder.func);
+                let call = builder.ins().call(alloc_fn, &[addr]);
+                builder.inst_results(call)[0]
             }
             Expr::Number(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
             Expr::Bool(b) => {
@@ -962,10 +987,13 @@ impl AotCompiler {
                 if let Some(var) = fctx.variables.get(name) {
                     builder.use_var(*var)
                 } else if let Some(func_id) = user_funcs.get(name) {
-                    // If it's a function name, return its memory address
+                    // Function name used as a value (e.g. passing to map or spawn).
+                    // Wrap it in a TAG_FUNCTION object so donky_call_function accepts it.
                     let func_ref = module.declare_func_in_func(*func_id, builder.func);
                     let addr = builder.ins().func_addr(types::I64, func_ref);
-                    addr 
+                    let alloc_fn = module.declare_func_in_func(runtime.alloc_function_id, builder.func);
+                    let call = builder.ins().call(alloc_fn, &[addr]);
+                    builder.inst_results(call)[0] 
                 } else if fctx.top_lets.contains(name) {
                     // Top-level `let` read from inside a function: go through the global map.
                     emit_global_get(builder, module, runtime, name)
@@ -1468,12 +1496,15 @@ impl AotCompiler {
     ) -> Value {
         let mut arg_vals = Vec::new();
         for arg in args { arg_vals.push(Self::compile_expr(builder, module, runtime, user_funcs, pending_closures, fctx, arg)); }
-        let fptr = builder.use_var(var);
-        let mut sig = module.make_signature();
-        for _ in 0..arg_vals.len() { sig.params.push(AbiParam::new(types::I64)); }
-        sig.returns.push(AbiParam::new(types::I64));
-        let sigref = builder.import_signature(sig);
-        let call = builder.ins().call_indirect(sigref, fptr, &arg_vals);
+        let fobj = builder.use_var(var);
+        // Pack the arguments into a Donky array: donky_call_function(fn_obj, args_array)
+        let arr_fn = module.declare_func_in_func(runtime.alloc_array_id, builder.func);
+        let arr_call = builder.ins().call(arr_fn, &[]);
+        let args_arr = builder.inst_results(arr_call)[0];
+        let push_fn = module.declare_func_in_func(runtime.array_push_id, builder.func);
+        for v in &arg_vals { builder.ins().call(push_fn, &[args_arr, *v]); }
+        let call_fn = module.declare_func_in_func(runtime.call_function_id, builder.func);
+        let call = builder.ins().call(call_fn, &[fobj, args_arr]);
         let ret_val = builder.inst_results(call)[0];
 
         emit_exception_check(builder, module, runtime, fctx);

@@ -55,7 +55,14 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include #include <sys/mman.h>
+#include <sys/mman.h>
+#include <pwd.h>
+#include <sys/utsname.h>
+#include <sys/resource.h>
+#include <sched.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/syscall.h>
 #endif
@@ -135,6 +142,7 @@ static inline ULONGLONG GetTickCount64(void) {
 #define TAG_STRING 2ULL
 #define TAG_ARRAY 3ULL
 #define TAG_MAP 4ULL
+#define TAG_FUNCTION 6ULL  
 
 /* Canonical tagged-bool word forms (C1). */
 #define BOOL_TRUE_BITS  (TAG_BASE | (TAG_BOOL << 48) | 1ULL)
@@ -153,6 +161,7 @@ typedef char dk_tag_check_BOOL  [(TAG_BOOL   == 1ULL) ? 1 : -1];
 typedef char dk_tag_check_STRING[(TAG_STRING == 2ULL) ? 1 : -1];
 typedef char dk_tag_check_ARRAY [(TAG_ARRAY  == 3ULL) ? 1 : -1];
 typedef char dk_tag_check_MAP   [(TAG_MAP    == 4ULL) ? 1 : -1];
+typedef char dk_tag_check_FUNC  [(TAG_FUNCTION == 6ULL) ? 1 : -1];
 typedef char dk_tag_check_TRUE  [(BOOL_TRUE_BITS  == 0x7FF9000000000001ULL) ? 1 : -1];
 typedef char dk_tag_check_FALSE [(BOOL_FALSE_BITS == 0x7FF9000000000000ULL) ? 1 : -1];
 typedef char dk_tag_check_CNAN  [(CANONICAL_NAN   == 0xFFF8000000000000ULL) ? 1 : -1];
@@ -382,6 +391,8 @@ static void dk_render_value(char* out, size_t cap, size_t* pos, uint64_t val, in
     uint64_t tag = get_tag(val);
     if (tag == TAG_BOOL) {
         if (val & 1) dk_rput(out, cap, pos, "true", 4); else dk_rput(out, cap, pos, "false", 5);
+    } else if (tag == TAG_FUNCTION) {
+        dk_rput(out, cap, pos, "<function>", 10);
     } else if (tag == TAG_STRING) {
         const char* s = (const char*)as_index(val);
         dk_rput(out, cap, pos, "\"", 1);
@@ -551,12 +562,67 @@ uint64_t donky_alloc_map() {
     return TAG_BASE | (TAG_MAP << 48) | (uint64_t)map;
 }
 
+// --- First-class functions (TAG_FUNCTION) ---
+// A function value is a heap object whose 8-byte payload is the raw code address. It owns no
+// children and needs no finalizer; gc_mark / gc_valid_object just have to accept the tag.
+uint64_t donky_alloc_function(uint64_t code_addr) {
+    uint64_t* cell = (uint64_t*)gc_malloc(sizeof(uint64_t));
+    *cell = code_addr;
+    GCHeader* h = ((GCHeader*)cell) - 1;
+    h->type_tag = TAG_FUNCTION;
+    return TAG_BASE | (TAG_FUNCTION << 48) | (uint64_t)(uintptr_t)cell;
+}
+
+// Raw code address of a function value; any other word is returned unchanged, so code that used
+// to receive a raw address (spawn, dll_callback) accepts both forms.
+static inline uint64_t dk_fn_raw(uint64_t v) {
+    if (!is_number(v) && get_tag(v) == TAG_FUNCTION) return *(uint64_t*)as_index(v);
+    return v;
+}
+
+typedef uint64_t (*DkFuncFn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                             uint64_t, uint64_t, uint64_t, uint64_t);
+#define DK_CALL_MAX_ARGS 8
+
+// call_function(f, args): args is an array of up to 8 values (or null for none). Missing
+// arguments are 0.0, the same padding aot.rs's pad_args uses, so a callee of any arity <= 8 can be
+// called through the 8-slot pointer (the caller cleans the stack on every supported ABI). If the
+// callee left an exception pending this returns null and leaves it pending for the caller's
+// has_exception check.
+uint64_t donky_call_function(uint64_t func_val, uint64_t args_array_val) {
+    if (is_number(func_val) || get_tag(func_val) != TAG_FUNCTION) {
+        donky_throw(donky_alloc_string("call_function: not a function"));
+        return TAG_BASE;
+    }
+    uint64_t addr = *(uint64_t*)as_index(func_val);
+    if (!addr) {
+        donky_throw(donky_alloc_string("call_function: null function address"));
+        return TAG_BASE;
+    }
+    uint64_t a[DK_CALL_MAX_ARGS] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (args_array_val != TAG_BASE) {
+        if (is_number(args_array_val) || get_tag(args_array_val) != TAG_ARRAY) {
+            donky_throw(donky_alloc_string("call_function: args must be an array (or null)"));
+            return TAG_BASE;
+        }
+        Array* arr = (Array*)as_index(args_array_val);
+        if (arr->len > DK_CALL_MAX_ARGS) {
+            donky_throw(donky_alloc_string("call_function: too many arguments (max 8)"));
+            return TAG_BASE;
+        }
+        for (size_t i = 0; i < arr->len; i++) a[i] = arr->data[i];
+    }
+    uint64_t r = ((DkFuncFn)(uintptr_t)addr)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    if (donky_has_exception()) return TAG_BASE;
+    return r;
+}
+
 // --- Garbage Collection Mark & Sweep ---
 void gc_mark(uint64_t val) {
     if (is_number(val)) return; 
     uint64_t tag = get_tag(val);
     void* ptr = (void*)as_index(val);
-    if (tag != TAG_STRING && tag != TAG_ARRAY && tag != TAG_MAP) return;
+    if (tag != TAG_STRING && tag != TAG_ARRAY && tag != TAG_MAP && tag != TAG_FUNCTION) return;
     if (!ptr) return;
     
     GCHeader* header = ((GCHeader*)ptr) - 1;
@@ -579,7 +645,7 @@ void gc_mark(uint64_t val) {
 // currently-allocated object of the matching type. Stale stack words fail this.
 static int gc_valid_object(uint64_t val) {
     uint64_t tag = get_tag(val);
-    if (tag != TAG_STRING && tag != TAG_ARRAY && tag != TAG_MAP) return 0;
+    if (tag != TAG_STRING && tag != TAG_ARRAY && tag != TAG_MAP && tag != TAG_FUNCTION) return 0;
     uintptr_t p = (uintptr_t)as_index(val);
     if (p & 7) return 0;
     for (GCChunk* c = gc_chunks; c; c = c->next) {
@@ -865,6 +931,7 @@ static const char* dk_type_name(uint64_t val) {
     if (tag == TAG_BOOL)   return "bool";
     if (tag == TAG_STRING) return "string";
     if (tag == TAG_ARRAY)  return "array";
+    if (tag == TAG_FUNCTION) return "function";
     if (tag == TAG_MAP) {
         Map* m = (Map*)as_index(val);
         for (size_t i = 0; i < m->len; i++) {
@@ -1997,6 +2064,7 @@ static void dk_ffi_trampoline(ffi_cif* cif, void* ret, void** args, void* userda
 // Callbacks are never freed (they are meant to live for the whole program).
 uint64_t donky_dll_callback(uint64_t ret_type_val, uint64_t arg_types_val, uint64_t func_val) {
     char msg[96];
+    func_val = dk_fn_raw(func_val);
     if (func_val == 0 || (func_val >> 48) != 0)
         return dk_ffi_err("dll_callback: third argument must be a function");
 
@@ -2559,7 +2627,7 @@ uint64_t donky_spawn(uint64_t func_val, uint64_t arg1) {
 
     ThreadArgs* t = (ThreadArgs*)malloc(sizeof(ThreadArgs));
     if (!t) return make_number(-1.0);
-    t->func_ptr = func_val;
+    t->func_ptr = dk_fn_raw(func_val);
     t->arg1 = arg1;
     t->next = NULL;
 
@@ -3035,6 +3103,497 @@ uint64_t donky_mem_free(uint64_t ptr_val, uint64_t size_val) {
     if (sz) munmap(p, sz);
 #endif
     return 0;
+}
+
+// ---- POSIX process control: fork / exec / wait / pipe / dup2 / mmap / munmap ---------------
+// Windows has no equivalent of these (CreateProcessA & co. are reachable through dll_call_sig
+// on kernel32.dll), so every function below throws there. As elsewhere in this file: bad
+// ARGUMENTS and failed OS calls throw a Donky error (OS errors carry strerror(errno) text).
+#ifdef _WIN32
+static uint64_t dk_proc_unsupported(void) {
+    return dk_ffi_err("not supported on Windows; use dll_call_sig");
+}
+#else
+static uint64_t dk_proc_errno(const char* what, int e) {
+    char msg[320];
+    snprintf(msg, sizeof msg, "%s: %s", what, strerror(e));
+    return dk_ffi_err(msg);
+}
+
+// A whole number in [lo, hi] as an int (no UB on NaN / out-of-range doubles).
+static int dk_proc_int(uint64_t v, double lo, double hi, int* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (!(d >= lo && d <= hi) || d != floor(d)) return 0;
+    *out = (int)d;
+    return 1;
+}
+#endif
+
+// fork(): returns the child's pid in the parent and 0 in the child.
+// Only the calling thread exists in the child, so the thread pool must not be trusted there:
+//  - both locks are held across fork() so the child never inherits one that is locked by a
+//    thread that no longer exists;
+//  - in the child the (now thread-less) pool is reset: queued/running task counts go to 0
+//    (otherwise main() would wait forever on active_threads) and the next spawn() builds a
+//    fresh pool.
+// stdio is flushed first, otherwise buffered output would be written twice.
+// Call fork() from the main program, not from inside a spawn()ed task: in the child the task's
+// worker thread would be the only thread and would park in the pool loop instead of exiting.
+uint64_t donky_fork(void) {
+#ifdef _WIN32
+    return dk_proc_unsupported();
+#else
+    fflush(NULL);
+    int pooled = (dk_pool_state == 1);
+    if (pooled) { gc_init_lock(); EnterCriticalSection(&dk_pool_lock); EnterCriticalSection(&gc_lock); }
+    pid_t pid = fork();
+    int e = errno;
+    if (pid == 0 && pooled) {
+        dk_q_head = NULL; dk_q_tail = NULL; dk_q_len = 0;   // tasks queued in the parent are dropped (leaked)
+        active_threads = 0;
+        dk_pool_state = 0;
+    }
+    if (pooled) { LeaveCriticalSection(&gc_lock); LeaveCriticalSection(&dk_pool_lock); }
+    if (pid < 0) return dk_proc_errno("fork", e);
+    return make_number((double)pid);
+#endif
+}
+
+// exec(path, argv): execvp(). argv is an array of strings and includes argv[0]; null or an empty
+// array means [path]. PATH is searched when path has no '/'. On success it never returns; if it
+// returns, the call failed and a Donky error is thrown (in a forked child, handle it and exit).
+uint64_t donky_exec(uint64_t path_val, uint64_t args_val) {
+#ifdef _WIN32
+    (void)path_val; (void)args_val;
+    return dk_proc_unsupported();
+#else
+    if (!dk_is_str(path_val)) return dk_ffi_err("exec: path must be a string");
+    const char* path = dk_s(path_val);
+    Array* arr = NULL;
+    size_t argc = 0;
+    if (args_val != TAG_BASE) {
+        if (get_tag(args_val) != TAG_ARRAY) return dk_ffi_err("exec: args must be an array of strings (or null)");
+        arr = (Array*)as_index(args_val);
+        argc = arr->len;
+        for (size_t i = 0; i < argc; i++) {
+            if (!dk_is_str(arr->data[i])) {
+                char msg[64];
+                snprintf(msg, sizeof msg, "exec: arg %zu must be a string", i);
+                return dk_ffi_err(msg);
+            }
+        }
+    }
+    char** argv = (char**)malloc(((argc ? argc : 1) + 1) * sizeof(char*));
+    if (!argv) return dk_ffi_err("exec: out of memory");
+    if (argc == 0) { argv[0] = (char*)path; argv[1] = NULL; }
+    else {
+        for (size_t i = 0; i < argc; i++) argv[i] = (char*)dk_s(arr->data[i]);   // Donky strings are NUL-terminated
+        argv[argc] = NULL;
+    }
+    fflush(NULL);                       // exec discards unflushed stdio buffers
+    execvp(path, argv);
+    int e = errno;                      // only reached on failure
+    free(argv);
+    char msg[320];
+    snprintf(msg, sizeof msg, "exec: %s: %s", path, strerror(e));
+    return dk_ffi_err(msg);
+#endif
+}
+
+// wait(pid): waitpid(pid, &status, 0), retried on EINTR. pid must be >= 1 (a specific child).
+// Returns the exit code (0-255) of a child that exited, or -N if it was killed by signal N
+// (e.g. -9 for SIGKILL).
+uint64_t donky_wait(uint64_t pid_val) {
+#ifdef _WIN32
+    (void)pid_val;
+    return dk_proc_unsupported();
+#else
+    int pid;
+    if (!dk_proc_int(pid_val, 1.0, 2147483647.0, &pid)) return dk_ffi_err("wait: pid must be a positive whole number");
+    int status = 0;
+    pid_t r;
+    do { r = waitpid((pid_t)pid, &status, 0); } while (r < 0 && errno == EINTR);
+    if (r < 0) return dk_proc_errno("wait", errno);
+    if (WIFEXITED(status))   return make_number((double)WEXITSTATUS(status));
+    if (WIFSIGNALED(status)) return make_number(-(double)WTERMSIG(status));
+    return make_number((double)status);
+#endif
+}
+
+// pipe(): returns [read_fd, write_fd]. The fds are plain (inherited across fork/exec); close
+// the ends you do not use or the reader never sees EOF.
+uint64_t donky_pipe(void) {
+#ifdef _WIN32
+    return dk_proc_unsupported();
+#else
+    int fds[2];
+    if (pipe(fds) < 0) return dk_proc_errno("pipe", errno);
+    uint64_t arr = donky_alloc_array();
+    donky_array_push(arr, make_number((double)fds[0]));
+    donky_array_push(arr, make_number((double)fds[1]));
+    return arr;
+#endif
+}
+
+// dup2(old_fd, new_fd): makes new_fd a copy of old_fd (closing new_fd first). Returns 0.
+uint64_t donky_dup2(uint64_t old_fd, uint64_t new_fd) {
+#ifdef _WIN32
+    (void)old_fd; (void)new_fd;
+    return dk_proc_unsupported();
+#else
+    int a, b;
+    if (!dk_proc_int(old_fd, 0.0, 2147483647.0, &a)) return dk_ffi_err("dup2: old_fd must be a non-negative whole number");
+    if (!dk_proc_int(new_fd, 0.0, 2147483647.0, &b)) return dk_ffi_err("dup2: new_fd must be a non-negative whole number");
+    int r;
+    do { r = dup2(a, b); } while (r < 0 && errno == EINTR);
+    if (r < 0) return dk_proc_errno("dup2", errno);
+    return 0;
+#endif
+}
+
+// mmap(len, prot, flags): mmap(NULL, len, prot, flags, -1, 0). prot and flags are the raw
+// platform values (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4; MAP_SHARED=1, MAP_PRIVATE=2, and
+// MAP_ANONYMOUS = 0x20 on Linux / MAP_ANON = 0x1000 on macOS). The fd is always -1, so flags
+// must include the anonymous bit. MAP_SHARED|anonymous memory is shared with forked children.
+// Returns the address; release it with munmap(ptr, len).
+uint64_t donky_mmap(uint64_t len_val, uint64_t prot_val, uint64_t flags_val) {
+#ifdef _WIN32
+    (void)len_val; (void)prot_val; (void)flags_val;
+    return dk_proc_unsupported();
+#else
+    size_t len; int prot, flags;
+    if (!dk_mem_size(len_val, &len)) return dk_ffi_err("mmap: len must be a positive whole number");
+    if (!dk_proc_int(prot_val, 0.0, 2147483647.0, &prot)) return dk_ffi_err("mmap: prot must be a whole number (PROT_* bits)");
+    if (!dk_proc_int(flags_val, 0.0, 2147483647.0, &flags)) return dk_ffi_err("mmap: flags must be a whole number (MAP_* bits)");
+    void* p = mmap(NULL, len, prot, flags, -1, 0);
+    if (p == MAP_FAILED) return dk_proc_errno("mmap", errno);
+    return make_number((double)(uint64_t)(uintptr_t)p);
+#endif
+}
+
+// munmap(ptr, len): len must match the mapping. Returns 0.
+uint64_t donky_munmap(uint64_t ptr_val, uint64_t len_val) {
+#ifdef _WIN32
+    (void)ptr_val; (void)len_val;
+    return dk_proc_unsupported();
+#else
+    void* p; size_t len;
+    if (!dk_mem_ptr(ptr_val, &p))     return dk_ffi_err("munmap: ptr must be a non-null address from mmap");
+    if (!dk_mem_size(len_val, &len))  return dk_ffi_err("munmap: len must be a positive whole number");
+    if (munmap(p, len) != 0) return dk_proc_errno("munmap", errno);
+    return 0;
+#endif
+}
+
+// ---- POSIX security & OS configuration -------------------------------------------------------
+// setuid/setgid/seteuid/setegid, chroot, unshare, prctl, seccomp, getpwnam/getpwuid, uname,
+// getrlimit/setrlimit. Windows has no equivalent, so every function below throws "not supported on
+// Windows" there; unshare, prctl and seccomp are Linux-only and throw on macOS. As in the process
+// control section above, bad ARGUMENTS and failed OS calls throw a Donky error (OS errors carry
+// strerror(errno) text). Success returns the number 0 unless documented, or a map.
+#ifdef _WIN32
+static uint64_t dk_sec_unsupported(void) { return dk_ffi_err("not supported on Windows"); }
+#else
+// A uid/gid: a whole number in [0, 4294967294] (4294967295 is (uid_t)-1, the "leave unchanged" value).
+static int dk_sec_u32(uint64_t v, uint32_t* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (!(d >= 0.0 && d <= 4294967294.0) || d != floor(d)) return 0;
+    *out = (uint32_t)d;
+    return 1;
+}
+
+#ifdef __linux__
+// A raw unsigned-long argument: a whole number in [-2^63, 2^64). Negatives wrap (-1 -> ~0).
+static int dk_sec_u64(uint64_t v, uint64_t* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (!(d == d) || d != floor(d)) return 0;                 // NaN or fraction
+    if (d >= 0.0) {
+        if (d >= 18446744073709551616.0) return 0;
+        *out = (uint64_t)d;
+        return 1;
+    }
+    if (d < -9223372036854775808.0) return 0;
+    *out = (uint64_t)(int64_t)d;
+    return 1;
+}
+#endif
+
+// which: 0 setuid, 1 setgid, 2 seteuid, 3 setegid
+static uint64_t dk_sec_setid(const char* what, uint64_t v, int which) {
+    uint32_t id;
+    if (!dk_sec_u32(v, &id)) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "%s: id must be a whole number in [0, 4294967294]", what);
+        return dk_ffi_err(msg);
+    }
+    int r;
+    switch (which) {
+        case 0:  r = setuid((uid_t)id); break;
+        case 1:  r = setgid((gid_t)id); break;
+        case 2:  r = seteuid((uid_t)id); break;
+        default: r = setegid((gid_t)id); break;
+    }
+    if (r < 0) return dk_proc_errno(what, errno);
+    return make_number(0.0);
+}
+#endif
+
+// Drop privileges in this order: setgid first, then setuid (once the uid is gone the process can
+// no longer change its gid). Returns 0.
+uint64_t donky_setuid(uint64_t id) {
+#ifdef _WIN32
+    (void)id; return dk_sec_unsupported();
+#else
+    return dk_sec_setid("setuid", id, 0);
+#endif
+}
+uint64_t donky_setgid(uint64_t id) {
+#ifdef _WIN32
+    (void)id; return dk_sec_unsupported();
+#else
+    return dk_sec_setid("setgid", id, 1);
+#endif
+}
+uint64_t donky_seteuid(uint64_t id) {
+#ifdef _WIN32
+    (void)id; return dk_sec_unsupported();
+#else
+    return dk_sec_setid("seteuid", id, 2);
+#endif
+}
+uint64_t donky_setegid(uint64_t id) {
+#ifdef _WIN32
+    (void)id; return dk_sec_unsupported();
+#else
+    return dk_sec_setid("setegid", id, 3);
+#endif
+}
+
+// chroot(path): needs root (CAP_SYS_CHROOT). It does NOT change the working directory, so follow it
+// with sys_chdir("/") or the process can still reach the old tree through a relative path. Returns 0.
+uint64_t donky_chroot(uint64_t path_val) {
+#ifdef _WIN32
+    (void)path_val; return dk_sec_unsupported();
+#else
+    if (!dk_is_str(path_val)) return dk_ffi_err("chroot: path must be a string");
+    if (chroot(dk_s(path_val)) < 0) return dk_proc_errno("chroot", errno);
+    return make_number(0.0);
+#endif
+}
+
+// unshare(flags): Linux only. flags is the raw CLONE_NEW* bit mask, e.g. CLONE_NEWNS 0x20000,
+// CLONE_NEWUTS 0x4000000, CLONE_NEWIPC 0x8000000, CLONE_NEWUSER 0x10000000, CLONE_NEWPID
+// 0x20000000, CLONE_NEWNET 0x40000000. CLONE_NEWUSER fails with EINVAL once the process has more
+// than one thread (after spawn()); CLONE_NEWPID only affects children created afterwards. Returns 0.
+uint64_t donky_unshare(uint64_t flags_val) {
+#ifdef _WIN32
+    (void)flags_val; return dk_sec_unsupported();
+#elif defined(__linux__)
+    int flags;
+    if (!dk_proc_int(flags_val, 0.0, 2147483647.0, &flags))
+        return dk_ffi_err("unshare: flags must be a non-negative whole number");
+    if (unshare(flags) < 0) return dk_proc_errno("unshare", errno);
+    return make_number(0.0);
+#else
+    (void)flags_val;
+    return dk_ffi_err("unshare: not supported on this platform (Linux only)");
+#endif
+}
+
+// prctl(option, a2, a3, a4, a5): Linux only. All five are numbers (raw values; pass 0 for unused
+// ones; a pointer is a number from mem_alloc/ffi_alloc). Returns prctl()'s result: 0 for most
+// options, the queried value for PR_GET_* options (e.g. PR_GET_DUMPABLE = 3).
+uint64_t donky_prctl(uint64_t option, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+#ifdef _WIN32
+    (void)option; (void)a2; (void)a3; (void)a4; (void)a5;
+    return dk_sec_unsupported();
+#elif defined(__linux__)
+    int opt;
+    if (!dk_proc_int(option, 0.0, 2147483647.0, &opt))
+        return dk_ffi_err("prctl: option must be a non-negative whole number");
+    uint64_t in[4] = { a2, a3, a4, a5 };
+    uint64_t a[4];
+    for (int i = 0; i < 4; i++) {
+        if (!dk_sec_u64(in[i], &a[i])) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "prctl: arg %d must be a whole number", i + 2);
+            return dk_ffi_err(msg);
+        }
+    }
+    int r = prctl(opt, (unsigned long)a[0], (unsigned long)a[1], (unsigned long)a[2], (unsigned long)a[3]);
+    if (r < 0) return dk_proc_errno("prctl", errno);
+    return make_number((double)r);
+#else
+    (void)option; (void)a2; (void)a3; (void)a4; (void)a5;
+    return dk_ffi_err("prctl: not supported on this platform (Linux only)");
+#endif
+}
+
+// seccomp(op, flags, args): Linux only; the raw seccomp(2) syscall. op: 0 SET_MODE_STRICT,
+// 1 SET_MODE_FILTER, 2 GET_ACTION_AVAIL, 3 GET_NOTIF_SIZES. args is the address of the kernel
+// structure (e.g. a struct sock_fprog built in mem_alloc memory) or null for strict mode. A bad
+// address is the kernel's EFAULT, not a crash. Installing a filter needs no_new_privs first:
+// prctl(38, 1, 0, 0, 0) (PR_SET_NO_NEW_PRIVS) unless the process has CAP_SYS_ADMIN. Returns the
+// syscall result (0, or e.g. a notification fd with SECCOMP_FILTER_FLAG_NEW_LISTENER).
+uint64_t donky_seccomp(uint64_t op_val, uint64_t flags_val, uint64_t args_val) {
+#ifdef _WIN32
+    (void)op_val; (void)flags_val; (void)args_val;
+    return dk_sec_unsupported();
+#elif defined(__linux__) && defined(SYS_seccomp)
+    int op; uint32_t flags; uint64_t ptr = 0;
+    if (!dk_proc_int(op_val, 0.0, 2147483647.0, &op))
+        return dk_ffi_err("seccomp: operation must be a non-negative whole number");
+    if (!dk_sec_u32(flags_val, &flags))
+        return dk_ffi_err("seccomp: flags must be a whole number in [0, 4294967294]");
+    if (args_val != TAG_BASE && !dk_sec_u64(args_val, &ptr))
+        return dk_ffi_err("seccomp: args must be an address (number) or null");
+    long r = syscall(SYS_seccomp, (long)op, (unsigned long)flags, (void*)(uintptr_t)ptr);
+    if (r < 0) return dk_proc_errno("seccomp", errno);
+    return make_number((double)r);
+#else
+    (void)op_val; (void)flags_val; (void)args_val;
+    return dk_ffi_err("seccomp: not supported on this platform (Linux only)");
+#endif
+}
+
+#ifndef _WIN32
+static uint64_t dk_sec_pw_map(const struct passwd* pw) {
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("name"),  donky_alloc_string(pw->pw_name  ? pw->pw_name  : ""));
+    donky_map_set(m, donky_alloc_string("uid"),   make_number((double)pw->pw_uid));
+    donky_map_set(m, donky_alloc_string("gid"),   make_number((double)pw->pw_gid));
+    donky_map_set(m, donky_alloc_string("dir"),   donky_alloc_string(pw->pw_dir   ? pw->pw_dir   : ""));
+    donky_map_set(m, donky_alloc_string("shell"), donky_alloc_string(pw->pw_shell ? pw->pw_shell : ""));
+    return m;
+}
+
+// getpwnam_r / getpwuid_r with a buffer that grows on ERANGE. "Not found" is null (SEMANTICS 6.5);
+// POSIX lets implementations report it as ENOENT/ESRCH/EBADF/EPERM, so those are null too.
+static uint64_t dk_sec_pw_lookup(const char* what, const char* name, uid_t uid) {
+    long sz = sysconf(_SC_GETPW_R_SIZE_MAX);
+    size_t cap = sz > 0 ? (size_t)sz : 1024;
+    for (;;) {
+        char* buf = (char*)malloc(cap);
+        if (!buf) return dk_ffi_err("getpw: out of memory");
+        struct passwd pwd, *res = NULL;
+        int rc = name ? getpwnam_r(name, &pwd, buf, cap, &res) : getpwuid_r(uid, &pwd, buf, cap, &res);
+        if (rc == ERANGE && cap < ((size_t)1 << 20)) { free(buf); cap *= 2; continue; }
+        uint64_t out;
+        if (rc != 0 && rc != ENOENT && rc != ESRCH && rc != EBADF && rc != EPERM) out = dk_proc_errno(what, rc);
+        else if (!res) out = TAG_BASE;
+        else out = dk_sec_pw_map(res);
+        free(buf);
+        return out;
+    }
+}
+#endif
+
+// getpwnam(name) / getpwuid(uid): map {name, uid, gid, dir, shell}, or null if no such user.
+uint64_t donky_getpwnam(uint64_t name_val) {
+#ifdef _WIN32
+    (void)name_val; return dk_sec_unsupported();
+#else
+    if (!dk_is_str(name_val)) return dk_ffi_err("getpwnam: name must be a string");
+    return dk_sec_pw_lookup("getpwnam", dk_s(name_val), 0);
+#endif
+}
+uint64_t donky_getpwuid(uint64_t uid_val) {
+#ifdef _WIN32
+    (void)uid_val; return dk_sec_unsupported();
+#else
+    uint32_t id;
+    if (!dk_sec_u32(uid_val, &id)) return dk_ffi_err("getpwuid: uid must be a whole number in [0, 4294967294]");
+    return dk_sec_pw_lookup("getpwuid", NULL, (uid_t)id);
+#endif
+}
+
+// uname(): map {sysname, nodename, release, version, machine}.
+uint64_t donky_uname(void) {
+#ifdef _WIN32
+    return dk_sec_unsupported();
+#else
+    struct utsname u;
+    if (uname(&u) < 0) return dk_proc_errno("uname", errno);
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("sysname"),  donky_alloc_string(u.sysname));
+    donky_map_set(m, donky_alloc_string("nodename"), donky_alloc_string(u.nodename));
+    donky_map_set(m, donky_alloc_string("release"),  donky_alloc_string(u.release));
+    donky_map_set(m, donky_alloc_string("version"),  donky_alloc_string(u.version));
+    donky_map_set(m, donky_alloc_string("machine"),  donky_alloc_string(u.machine));
+    return m;
+#endif
+}
+
+#ifndef _WIN32
+// resource: a portable name ("cpu" "fsize" "data" "stack" "core" "rss" "nproc" "nofile" "memlock" "as")
+// or the raw platform RLIMIT_* number (the numbers differ between Linux and macOS; names do not).
+static int dk_sec_rlimit_res(uint64_t v, int* out) {
+    if (is_number(v)) return dk_proc_int(v, 0.0, 2147483647.0, out);
+    if (!dk_is_str(v)) return 0;
+    static const struct { const char* n; int r; } tab[] = {
+        { "cpu", RLIMIT_CPU },     { "fsize", RLIMIT_FSIZE }, { "data", RLIMIT_DATA },
+        { "stack", RLIMIT_STACK }, { "core", RLIMIT_CORE },   { "rss", RLIMIT_RSS },
+        { "nproc", RLIMIT_NPROC }, { "nofile", RLIMIT_NOFILE }, { "memlock", RLIMIT_MEMLOCK },
+        { "as", RLIMIT_AS },
+    };
+    const char* s = dk_s(v);
+    for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++)
+        if (strcmp(s, tab[i].n) == 0) { *out = tab[i].r; return 1; }
+    return 0;
+}
+
+// RLIM_INFINITY is the number inf; on input -1 is accepted as "unlimited" too.
+static double dk_sec_rlim_to_num(rlim_t v) { return v == RLIM_INFINITY ? INFINITY : (double)v; }
+static int dk_sec_num_to_rlim(uint64_t v, rlim_t* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (d == INFINITY || d == -1.0) { *out = RLIM_INFINITY; return 1; }
+    if (!(d >= 0.0) || d != floor(d) || d >= 18446744073709551616.0) return 0;
+    *out = (rlim_t)d;
+    return 1;
+}
+#endif
+
+// getrlimit(resource): map {soft, hard}; unlimited is inf (values above 2^53 lose precision).
+uint64_t donky_getrlimit(uint64_t res_val) {
+#ifdef _WIN32
+    (void)res_val; return dk_sec_unsupported();
+#else
+    int res;
+    if (!dk_sec_rlimit_res(res_val, &res))
+        return dk_ffi_err("getrlimit: resource must be a name (cpu fsize data stack core rss nproc nofile memlock as) or a raw RLIMIT_* number");
+    struct rlimit rl;
+    if (getrlimit(res, &rl) < 0) return dk_proc_errno("getrlimit", errno);
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("soft"), make_number(dk_sec_rlim_to_num(rl.rlim_cur)));
+    donky_map_set(m, donky_alloc_string("hard"), make_number(dk_sec_rlim_to_num(rl.rlim_max)));
+    return m;
+#endif
+}
+
+// setrlimit(resource, soft, hard): soft/hard are whole numbers, inf or -1 (unlimited), or null to
+// keep the current value (setrlimit("nofile", 4096, null)). Pass BOTH numbers: a missing argument
+// is padded with 0.0 by the compiler and would lower that limit to 0. Lowering a hard limit cannot
+// be undone without privilege. Returns 0.
+uint64_t donky_setrlimit(uint64_t res_val, uint64_t soft_val, uint64_t hard_val) {
+#ifdef _WIN32
+    (void)res_val; (void)soft_val; (void)hard_val; return dk_sec_unsupported();
+#else
+    int res;
+    if (!dk_sec_rlimit_res(res_val, &res))
+        return dk_ffi_err("setrlimit: resource must be a name (cpu fsize data stack core rss nproc nofile memlock as) or a raw RLIMIT_* number");
+    struct rlimit rl;
+    if (getrlimit(res, &rl) < 0) return dk_proc_errno("setrlimit", errno);
+    if (soft_val != TAG_BASE && !dk_sec_num_to_rlim(soft_val, &rl.rlim_cur))
+        return dk_ffi_err("setrlimit: soft must be a whole number, inf, -1 or null");
+    if (hard_val != TAG_BASE && !dk_sec_num_to_rlim(hard_val, &rl.rlim_max))
+        return dk_ffi_err("setrlimit: hard must be a whole number, inf, -1 or null");
+    if (setrlimit(res, &rl) < 0) return dk_proc_errno("setrlimit", errno);
+    return make_number(0.0);
+#endif
 }
 
 // ---- raw memory for FFI (caller must ffi_free what it ffi_alloc'd) ----

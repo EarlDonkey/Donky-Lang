@@ -49,8 +49,8 @@ impl Value {
     const TAG_STRING: u64 = 2;
     const TAG_ARRAY: u64 = 3;
     const TAG_MAP: u64 = 4;
-    const TAG_STRUCT: u64 = 5;
     const TAG_FUNCTION: u64 = 6;
+    const TAG_STRUCT: u64 = 5;
     const TAG_CLOSURE: u64 = 7;
 
     #[inline] pub fn null() -> Self { Value(Self::TAG_BASE) }
