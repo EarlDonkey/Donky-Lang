@@ -1,0 +1,22 @@
+// examples/defender/run.donk — desktop entrypoint for Donky Defender.
+//
+// Startup order:
+//   1. setup_server() binds 8083 on the main thread (so the webview can't
+//      race an unbound port).
+//   2. spawn(start_server, srv) — accept loop on a worker.
+//   3. sleep(500) — let the accept loop start and the OS settle.
+//   4. gui_webview("http://localhost:8083") — blocks the main thread.
+//
+// defender.donk's scans run on the HTTP worker thread inside /api/scan. They
+// are synchronous; the button will spin for ~1-3s. That's expected.
+//
+// Import note: this file imports server.donk, which imports defender.donk.
+// defender.donk does NOT auto-run main() (see cli.donk), so importing it for
+// the desktop path only pulls in the scan functions — no CLI output leaks
+// into the webview process.
+
+import "server.donk";
+let srv = setup_server();
+spawn(start_server, srv);
+sleep(500);
+gui_webview("http://localhost:8083");

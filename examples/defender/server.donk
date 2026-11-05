@@ -1,0 +1,161 @@
+// examples/defender/server.donk — HTTP server for Donky Defender (port 8083).
+//
+// Pattern mirrors examples/sentinel/sentinel.donk:
+//   - setup_server() binds 8083 and returns the listening socket.
+//   - start_server(handle) is the accept loop (run on a spawn worker).
+//   - handle_client(conn) parses the request, dispatches, responds, closes.
+//   - read_request / request_path / request_method are copied verbatim from
+//     sentinel.donk (semantics identical; keep them in sync if you change one).
+//
+// Routes:
+//   GET /            -> examples/defender/index.html
+//   GET /api/scan    -> JSON { processes: [...], startup: [...],
+//                              process_count: N, startup_count: M }
+//
+// The scan runs SYNCHRONOUSLY on the request thread. A full process walk is
+// ~1-3s on a loaded box; that's acceptable for a "Run Scan" button. Do not
+// add caching at v1 — the whole point is a fresh read each click.
+//
+// GLOBAL CACHE: index.html is read once at top level into HTML_CACHE (the
+// documented top-level-let escape hatch, SEMANTICS §11.3). handle_client
+// reads it via global_get("HTML_CACHE").
+
+import "defender.donk";
+
+let HTML_CACHE = read_file("examples/defender/index.html");
+if HTML_CACHE == null {
+    HTML_CACHE = "<!doctype html><title>Defender</title><p>index.html not found.</p>";
+}
+
+// ---------------------------------------------------------------------------
+// read_request(client) -> string. Reads until "\r\n\r\n" or peer close.
+// ---------------------------------------------------------------------------
+fn read_request(client) {
+    let buf = "";
+    while len(buf) < 8192 {
+        let chunk = tcp_read(client, 4096);
+        if len(chunk) == 0 { return ""; }
+        buf = buf + chunk;
+        if contains(buf, "\r\n\r\n") { return buf; }
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// request_path(raw) -> "/..." or "/".
+// ---------------------------------------------------------------------------
+fn request_path(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return "/"; }
+    let parts = split(lines[0], " ");
+    if len(parts) < 2 { return "/"; }
+    return parts[1];
+}
+
+fn request_method(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return ""; }
+    let parts = split(lines[0], " ");
+    if len(parts) == 0 { return ""; }
+    return parts[0];
+}
+
+// ---------------------------------------------------------------------------
+// respond(client, status_line, mime, body) -> null. One write, one close.
+// ---------------------------------------------------------------------------
+fn respond(client, status_line, mime, body) {
+    let resp = "HTTP/1.1 " + status_line + "\r\n"
+             + "Content-Type: " + mime + "\r\n"
+             + "Content-Length: " + str(len(body)) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Access-Control-Allow-Origin: *\r\n"
+             + "Connection: close\r\n"
+             + "\r\n"
+             + body;
+    tcp_write(client, resp);
+    tcp_close(client);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// handle_client(conn_id) -> null.
+// ---------------------------------------------------------------------------
+fn handle_client(conn_id) {
+    let raw = read_request(conn_id);
+    if len(raw) == 0 {
+        tcp_close(conn_id);
+        return null;
+    }
+    let path = request_path(raw);
+    let method = request_method(raw);
+
+    if method != "GET" && method != "HEAD" {
+        respond(conn_id, "405 Method Not Allowed", "text/plain; charset=utf-8", "use GET");
+        return null;
+    }
+
+    if path == "/" || path == "/index.html" {
+        let html = global_get("HTML_CACHE");
+        if html == null {
+            html = "<!doctype html><title>Defender</title><p>index.html not found.</p>";
+        }
+        respond(conn_id, "200 OK", "text/html; charset=utf-8", html);
+        return null;
+    }
+
+    if path == "/api/scan" {
+        let result = null;
+        try {
+            result = run_scans();
+        } catch e {
+            respond(conn_id, "500 Internal Server Error", "text/plain; charset=utf-8",
+                    "scan failed: " + str(e));
+            return null;
+        }
+        let json = json_encode(result);
+        // json_encode returns 0.0 on error (§6.1 / §8); detect via json_error.
+        if json_error() != "" {
+            respond(conn_id, "500 Internal Server Error", "text/plain; charset=utf-8",
+                    "json_encode failed: " + json_error());
+            return null;
+        }
+        respond(conn_id, "200 OK", "application/json", json);
+        return null;
+    }
+
+    respond(conn_id, "404 Not Found", "text/plain; charset=utf-8", "not found: " + path);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// setup_server() -> server handle (int) or null.
+// ---------------------------------------------------------------------------
+fn setup_server() {
+    let port = 8083;
+    let server = tcp_listen(port);
+    if server == null || server < 0 {
+        print("defender: tcp_listen(" + str(port) + ") failed");
+        return null;
+    }
+    print("defender: listening on http://localhost:" + str(port) + "/");
+    return server;
+}
+
+// ---------------------------------------------------------------------------
+// start_server(server_handle) -> null (never returns). Accept loop.
+// ---------------------------------------------------------------------------
+fn start_server(server_handle) {
+    if server_handle == null || server_handle < 0 {
+        print("defender: start_server called with invalid handle");
+        return null;
+    }
+    while true {
+        let conn = tcp_accept(server_handle);
+        if conn == null || conn < 0 {
+            sleep(50);
+        } else {
+            spawn(handle_client, conn);
+        }
+    }
+    return null;
+}

@@ -15,6 +15,8 @@
 #ifdef _WIN32
 #include <conio.h>
 
+#define _WIN32_WINNT 0x0602
+
 #define WIN32_LEAN_AND_MEAN
 
 #include <winsock2.h>
@@ -1036,7 +1038,8 @@ uint64_t donky_sub(uint64_t a, uint64_t b) {
 uint64_t donky_fdiv(uint64_t a, uint64_t b) {
     if (!is_number(a) || !is_number(b)) { dk_throw_binop("divide", a, b); return TAG_BASE; }
     double db = as_number(b);
-    if (db == 0.0) return make_number(a > 0 ? 1.0/0.0 : (a < 0 ? -1.0/0.0 : 0.0/0.0)); // IEEE inf/nan
+    double da = as_number(a);
+    if (db == 0.0) return make_number(da > 0.0 ? 1.0/0.0 : (da < 0.0 ? -1.0/0.0 : 0.0/0.0)); // IEEE inf/nan
     return make_number(as_number(a) / db);
 }
 
@@ -2909,6 +2912,33 @@ uint64_t donky_gui_webview(uint64_t url_val) {
 // ===================== Standard library builtins =====================
 static inline int dk_is_str(uint64_t v) { return !is_number(v) && get_tag(v) == TAG_STRING; }
 static inline const char* dk_s(uint64_t v) { return (const char*)as_index(v); }
+
+// sys_write_binary(path, bytes): binary-safe write. bytes is an array of numbers; each is
+// truncated to one byte (value & 0xFF, NaN -> 0). Unlike write_file, 0x00 bytes are written.
+// The array is checked before the file is opened, so a bad array does not truncate an existing
+// file. Returns true on success, false on any failure (bad argument, open, write or close error).
+uint64_t donky_sys_write_binary(uint64_t path_val, uint64_t array_val) {
+    if (!dk_is_str(path_val)) return BOOL_FALSE_BITS;
+    if (is_number(array_val) || get_tag(array_val) != TAG_ARRAY) return BOOL_FALSE_BITS;
+    Array* arr = (Array*)as_index(array_val);
+    for (size_t i = 0; i < arr->len; i++)
+        if (!is_number(arr->data[i])) return BOOL_FALSE_BITS;
+    FILE* f = fopen((const char*)as_index(path_val), "wb");
+    if (!f) return BOOL_FALSE_BITS;
+    int ok = 1;
+    for (size_t i = 0; i < arr->len; i++) {
+        double d = as_number(arr->data[i]);
+        uint8_t b = 0;
+        if (d == d) {                                   // NaN stays 0
+            if (d >= 9.0e18)       b = 0xFF;            // huge: avoid UB in the cast
+            else if (d <= -9.0e18) b = 0;
+            else                   b = (uint8_t)((int64_t)d & 0xFF);
+        }
+        if (fputc(b, f) == EOF) { ok = 0; break; }
+    }
+    if (fclose(f) != 0) ok = 0;
+    return ok ? BOOL_TRUE_BITS : BOOL_FALSE_BITS;
+}
 
 // ---- globals (shared state for libs) ----
 uint64_t donky_global_set(uint64_t k, uint64_t v) {

@@ -1,6 +1,6 @@
 [package]
 name = "donky-native"
-version = "2.3.0"
+version = "3.0.1"
 edition = "2021"
 
 [dependencies]

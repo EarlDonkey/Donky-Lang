@@ -1,0 +1,450 @@
+// examples/defender/defender.donk — Donky Defender v1.0 (Windows).
+//
+// A read-only defensive scanner. It does not modify the system; it only opens
+// registry keys with KEY_READ and queries process image paths with
+// PROCESS_QUERY_LIMITED_INFORMATION. Every handle / buffer it allocates is
+// freed on every path.
+//
+// READS THIS FILE FIRST (per task brief):
+//   lib/winreg.donk  — registry FFI pattern (wr_fn cache, reg_open_key, ffi_peek)
+//   lib/proc.donk    — kernel32 FFI pattern (pr_fn, pid validation)
+//   SEMANTICS.md §14.5 — dll_call_sig type letters: v i u l L f d s p
+//
+// v2.3 caveats that shape this file:
+//   - No auto-GC (§11.22). Anything we alloc is freed explicitly with the
+//     size we allocated it at: mem_free(ptr, size).
+//   - Top-level `let` is not visible inside fns (§11.3); helpers use
+//     global_get/global_set for symbol caches, matching lib/winreg.donk.
+//   - dll_call_sig truncates "u" args, so PIDs and buffer sizes must be
+//     validated as whole numbers before they cross the FFI boundary.
+//   - `mem_alloc` is not guaranteed zeroed; we ffi_poke(…, 0) where it matters.
+//   - Donky strings are byte sequences (§4); paths are ASCII on Windows, so
+//     byte-by-byte substring checks (contains) are correct.
+//   - get_processes() is an AOT builtin (dispatch "get_processes"), NOT a
+//     lib/ function. It returns [{pid, name}, ...] directly. The
+//     CreateToolhelp32Snapshot fallback below is kept as a defensive
+//     alternative but is only reached if the builtin returns null.
+//   - Any pointer that is allocated inside a `try` and freed after it MUST be
+//     hoisted above the `try` — Donky v2.3 has no `finally`, and a `let` in a
+//     `try` body is out of scope at the post-`try` free site.
+
+import "lib/winreg.donk";
+import "lib/proc.donk";
+
+// ===========================================================================
+// FFI helpers
+// ===========================================================================
+
+// Resolve a kernel32 export once and cache the address in the global slot
+// "defender:k32:<name>". Mirrors lib/winreg.donk's wr_fn; lib/proc.donk
+// deliberately re-resolves because it runs on spawn()ed HTTP workers. The
+// scanner is single-threaded, so the cache is safe here.
+fn k32_fn(name) {
+    let key = "defender:k32:" + name;
+    let cached = global_get(key);
+    if cached != null { return cached; }
+    let lib = dll_load("kernel32.dll");
+    if lib == 0 { throw "defender: could not load kernel32.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "defender: kernel32.dll has no export " + name; }
+    global_set(key, p);
+    return p;
+}
+
+// Resolve an advapi32 export once and cache it. (lib/winreg.donk's wr_fn is
+// file-scoped; we need our own for RegEnumValueA, which that file doesn't
+// expose.)
+fn adv_fn(name) {
+    let key = "defender:adv:" + name;
+    let cached = global_get(key);
+    if cached != null { return cached; }
+    let lib = dll_load("advapi32.dll");
+    if lib == 0 { throw "defender: could not load advapi32.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "defender: advapi32.dll has no export " + name; }
+    global_set(key, p);
+    return p;
+}
+
+// ===========================================================================
+// 1. Process path verification
+// ===========================================================================
+
+// get_process_path(pid) -> string (full image path) or null.
+//
+//   HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+//   DWORD  size = 512;
+//   char   buf[512];
+//   BOOL ok = QueryFullProcessImageNameA(h, 0, buf, &size);
+//
+// PROCESS_QUERY_LIMITED_INFORMATION = 0x1000 = 4096. It is the minimum right
+// needed for QueryFullProcessImageNameA and works on other-user processes
+// that have not blocked it (Protected Process Light still fails — we return
+// null, which the caller treats as "no path", not "suspicious").
+//
+// SCOPE NOTE: h, buf, size_ptr are declared BEFORE the try so the frees after
+// it are in scope. Only the *values* are assigned inside the try.
+fn get_process_path(pid) {
+    // pid sanity: dll_call_sig's "u" truncates 12.7 -> 12.
+    if pid < 1 || pid > 4294967295 { return null; }
+    if pid % 1 != 0 { return null; }
+
+    let path = null;
+    let h = 0;
+    let buf = 0;
+    let size_ptr = 0;
+
+    try {
+        h = dll_call_sig(k32_fn("OpenProcess"), "p", "uiu", [4096, 0, pid]);
+        if h != 0 {
+            buf = mem_alloc(512);
+            // mem_alloc is not guaranteed zeroed; QueryFullProcessImageNameA
+            // writes a NUL-terminated string, but zero the tail anyway so
+            // ffi_cstr() cannot read past a short write.
+            let z = 0;
+            while z < 512 {
+                ffi_poke(buf + z, 1, 0);
+                z = z + 1;
+            }
+            size_ptr = mem_alloc(4);
+            ffi_poke(size_ptr, 4, 512);   // in: capacity in TCHARs
+
+            // BOOL QueryFullProcessImageNameA(HANDLE, DWORD, LPSTR, LPDWORD)
+            //   type letters: i u p p   (arg types: p u p p)
+            let ok = dll_call_sig(k32_fn("QueryFullProcessImageNameA"), "i", "pupp",
+                                   [h, 0, buf, size_ptr]);
+            if ok != 0 {
+                path = ffi_cstr(buf);
+            }
+        }
+    } catch e {
+        // A missing export or alloc failure must not abort the scan.
+        print("defender: get_process_path(" + str(pid) + "): " + str(e));
+    }
+    // Always release, in reverse order. Sizes MUST match the mem_alloc calls.
+    if size_ptr != 0 { mem_free(size_ptr, 4); }
+    if buf != 0 { mem_free(buf, 512); }
+    if h != 0 {
+        try { dll_call_sig(k32_fn("CloseHandle"), "i", "p", [h]); }
+        catch e2 { /* nothing useful to do */ }
+    }
+    return path;
+}
+
+// ===========================================================================
+// 2. Scanner heuristics
+// ===========================================================================
+
+fn starts_with(s, prefix) {
+    if len(s) < len(prefix) { return false; }
+    return substr(s, 0, len(prefix)) == prefix;
+}
+
+// scan_processes(findings) -> number of processes examined.
+//
+// Appends one human-readable string per suspicious process to `findings`
+// (caller-owned array). Returns the count of processes examined so the
+// caller can print "Checked N processes" or put it in a JSON response.
+//
+// The CLI `main()` below prints `findings` after the call; the HTTP route in
+// server.donk returns `findings` as JSON. Same scan, two renderings.
+//
+// Primary source is the AOT builtin get_processes() (dispatch key
+// "get_processes"), which returns [{pid, name}, ...]. The
+// CreateToolhelp32Snapshot fallback is only reached if that builtin returns
+// null (e.g. a future runtime without it, or a hardened build).
+fn scan_processes(findings) {
+    let procs = null;
+    try {
+        procs = get_processes();
+    } catch e {
+        push(findings, "[WARN] get_processes() threw: " + str(e));
+        procs = null;
+    }
+    if procs == null {
+        procs = snapshot_processes();
+    }
+    if procs == null {
+        push(findings, "[WARN] could not enumerate processes; process scan skipped");
+        return 0;
+    }
+
+    let i = 0;
+    let n = len(procs);
+    while i < n {
+        let p = procs[i];
+        let pid = p["pid"];
+        let name = p["name"];
+        if pid != null && name != null {
+            let path = get_process_path(pid);
+            if path != null {
+                // H1: svchost.exe must live in System32. Anything else is a
+                // classic masquerade (Sirefef/ZeroAccess and many RATs).
+                if lower(name) == "svchost.exe" {
+                    if !contains(lower(path), "c:\\windows\\system32\\") {
+                        push(findings, "svchost.exe running from " + path);
+                    }
+                }
+                // H2: executables staged in %LOCALAPPDATA%\Temp are a common
+                // malware drop location. Case-insensitive to match Windows.
+                if contains(lower(path), "\\appdata\\local\\temp\\") {
+                    push(findings, "Executable running from Temp: " + path);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback process enumerator: CreateToolhelp32Snapshot + Process32First/Next.
+//
+// PROCESSENTRY32 layout (ANSI, 64-bit; total 568 bytes):
+//   +0   dwSize            4
+//   +4   cntUsage          4
+//   +8   th32ProcessID     4
+//   +12  th32DefaultHeapID 8   (ULONG_PTR)
+//   +20  th32ModuleID      4
+//   +24  cntThreads        4
+//   +28  th32ParentProcessID 4
+//   +32  pcPriClassBase    4   (LONG)
+//   +36  dwFlags           4
+//   +40  szExeFile[260]    260
+//   => 300, padded by the x64 ABI to 568. The API only reads dwSize (first 4
+//   bytes) as the "in" size and writes at most sizeof(PROCESSENTRY32). 568 is
+//   the x64 sizeof — safe upper bound.
+//
+// TH32CS_SNAPPROCESS = 0x2 = 2. INVALID_HANDLE_VALUE = -1 (as uint64
+// 0xFFFFFFFFFFFFFFFF; we compare against 0 and the signed -1 pattern).
+// ---------------------------------------------------------------------------
+fn snapshot_processes() {
+    let result = [];
+    let snap = 0;
+    let pe = 0;
+    try {
+        snap = dll_call_sig(k32_fn("CreateToolhelp32Snapshot"), "p", "uu", [2, 0]);
+        // Compare against both 0 and the all-ones sentinel. dll_call_sig
+        // returns a number; a HANDLE of -1 comes back as 18446744073709551615
+        // (2^64-1) on some builds and -1 on others.
+        if snap == 0 || snap == -1 || snap == 18446744073709551615 {
+            print("[WARN] CreateToolhelp32Snapshot failed");
+            return null;
+        }
+        pe = mem_alloc(568);
+        // Zero the whole struct so szExeFile is NUL-terminated even if the API
+        // writes a short name into a stale buffer.
+        let z = 0;
+        while z + 8 <= 568 { ffi_poke(pe + z, 8, 0); z = z + 8; }
+        while z < 568 { ffi_poke(pe + z, 1, 0); z = z + 1; }
+        ffi_poke(pe + 0, 4, 568);   // dwSize
+
+        // Process32First(HANDLE, LPPROCESSENTRY32) -> BOOL
+        let more = dll_call_sig(k32_fn("Process32First"), "i", "pp", [snap, pe]);
+        while more != 0 {
+            let pid = ffi_peek(pe + 8, 4);          // th32ProcessID
+            // szExeFile is a 260-byte NUL-terminated buffer at +40.
+            let name = ffi_cstr(pe + 40);
+            let entry = {};
+            entry["pid"] = pid;
+            entry["name"] = name;
+            push(result, entry);
+            more = dll_call_sig(k32_fn("Process32Next"), "i", "pp", [snap, pe]);
+        }
+    } catch e {
+        print("[WARN] process snapshot failed: " + str(e));
+    }
+    if pe != 0 { mem_free(pe, 568); }
+    if snap != 0 && snap != -1 && snap != 18446744073709551615 {
+        try { dll_call_sig(k32_fn("CloseHandle"), "i", "p", [snap]); }
+        catch e2 { /* ignore */ }
+    }
+    return result;
+}
+
+// ===========================================================================
+// 3. Startup key audit
+// ===========================================================================
+//
+// HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+//
+// We don't use lib/winreg.donk's reg_open_key directly for the *value* enum,
+// because that file only exposes reg_enum_key (subkeys). We open the key with
+// the same RegOpenKeyExA call lib/winreg.donk uses, then enumerate values with
+// RegEnumValueA.
+//
+// HKCU = 0x80000001 = 2147483649.
+// KEY_READ = 0x20019 = 131097.
+//
+// RegEnumValueA(HKEY, DWORD dwIndex, LPSTR lpValueName, LPDWORD lpcchValueName,
+//               LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
+//   arg letters: p u p p p p p p     ret: u
+//
+// ERROR_NO_MORE_ITEMS = 259.
+//
+// scan_startup(findings) -> number of Run values enumerated.
+//
+// Appends one human-readable string per suspicious Run value to `findings`.
+// Returns the count of values examined (0 if the key is absent/denied — a
+// caller can distinguish "key missing" from "key present but clean" by
+// checking whether the return is 0).
+//
+// SCOPE NOTE: the `out` handle-pointer is declared before the try so it can be
+// freed on the catch path too. The five reusable buffers are allocated after
+// the successful open, and freed before the close — one path in, one path out.
+fn scan_startup(findings) {
+    let hk = null;
+    let out = 0;
+
+    try {
+        out = mem_alloc(8);
+        ffi_poke(out, 8, 0);
+        let rc = dll_call_sig(adv_fn("RegOpenKeyExA"), "u", "psuup",
+                              [2147483649, "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                               0, 131097, out]);
+        if rc == 0 {
+            let h = ffi_peek(out, 8);
+            if h != 0 { hk = h; }
+        }
+    } catch e {
+        push(findings, "[WARN] could not open HKCU Run: " + str(e));
+    }
+    // Always free the out-pointer, whether the open threw or succeeded.
+    if out != 0 { mem_free(out, 8); }
+
+    if hk == null {
+        push(findings, "[WARN] HKCU Run not present or access denied");
+        return 0;
+    }
+
+    // Buffers reused across iterations. Allocated once, freed once, on every
+    // path (including the "no values" path).
+    let name_buf = mem_alloc(512);
+    let data_buf = mem_alloc(4096);
+    let name_len_ptr = mem_alloc(4);
+    let data_len_ptr = mem_alloc(4);
+    let type_ptr = mem_alloc(4);
+
+    let i = 0;
+    let found = 0;
+    while true {
+        // Reset "in" sizes and zero the buffers so a short read can't leak
+        // bytes from a previous iteration.
+        ffi_poke(name_len_ptr, 4, 512);
+        ffi_poke(data_len_ptr, 4, 4096);
+        ffi_poke(type_ptr, 4, 0);
+        ffi_poke(name_buf, 1, 0);
+        ffi_poke(data_buf, 1, 0);
+
+        // RegEnumValueA returns 0 on success, 259 (ERROR_NO_MORE_ITEMS) at end.
+        let rc = dll_call_sig(adv_fn("RegEnumValueA"), "u", "pupppppp",
+            [hk, i, name_buf, name_len_ptr, 0, type_ptr, data_buf, data_len_ptr]);
+        if rc != 0 {
+            break;
+        }
+        let vname = ffi_cstr(name_buf);
+        let vtype = ffi_peek(type_ptr, 4);
+        // 1 = REG_SZ, 2 = REG_EXPAND_SZ. Other types (REG_BINARY, REG_DWORD)
+        // are rendered as "<type N>" so the heuristic below never sees a
+        // non-string.
+        let vdata = "";
+        if vtype == 1 || vtype == 2 {
+            vdata = ffi_cstr(data_buf);
+        } else {
+            vdata = "<type " + str(vtype) + ">";
+        }
+        // Heuristic: a Run value that points into a user-writable staging
+        // area (%LOCALAPPDATA%\Temp, %USERPROFILE%\Downloads) is a classic
+        // persistence vector.
+        let vlow = lower(vdata);
+        if contains(vlow, "\\appdata\\local\\temp\\") || contains(vlow, "\\downloads\\") {
+            push(findings, "Startup entry points to dangerous location: " + vname);
+        }
+        found = found + 1;
+        i = i + 1;
+    }
+
+    mem_free(name_buf, 512);
+    mem_free(data_buf, 4096);
+    mem_free(name_len_ptr, 4);
+    mem_free(data_len_ptr, 4);
+    mem_free(type_ptr, 4);
+
+    try { dll_call_sig(adv_fn("RegCloseKey"), "u", "p", [hk]); }
+    catch e3 { /* ignore */ }
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// run_scans() -> map { "processes": [...], "startup": [...],
+//                      "process_count": N, "startup_count": M }.
+//
+// Shared by the CLI main() below and server.donk's /api/scan route. Both
+// callers want the same data; only the rendering differs (print vs JSON).
+// Putting the aggregation here means the two entry points can't drift.
+// ---------------------------------------------------------------------------
+fn run_scans() {
+    let proc_findings = [];
+    let startup_findings = [];
+    let pc = 0;
+    let sc = 0;
+    try { pc = scan_processes(proc_findings); }
+    catch e { push(proc_findings, "[ERROR] process scan: " + str(e)); }
+    try { sc = scan_startup(startup_findings); }
+    catch e { push(startup_findings, "[ERROR] startup scan: " + str(e)); }
+
+    let result = {};
+    result["processes"] = proc_findings;
+    result["startup"] = startup_findings;
+    result["process_count"] = pc;
+    result["startup_count"] = sc;
+    return result;
+}
+
+// ===========================================================================
+// 4. Entry point
+// ===========================================================================
+
+fn main() {
+    print("Donky Defender v1.0");
+    print("");
+    let r = run_scans();
+
+    print("== Process scan ==");
+    let pf = r["processes"];
+    let i = 0;
+    while i < len(pf) {
+        print("[SUSPICIOUS] " + pf[i]);
+        i = i + 1;
+    }
+    if len(pf) == 0 {
+        print("Checked " + str(r["process_count"]) + " processes. No obvious masquerading detected.");
+    } else {
+        print("Checked " + str(r["process_count"]) + " processes. " + str(len(pf)) + " suspicious.");
+    }
+
+    print("");
+    print("== Startup (HKCU Run) ==");
+    let sf = r["startup"];
+    let j = 0;
+    while j < len(sf) {
+        print("[SUSPICIOUS] " + sf[j]);
+        j = j + 1;
+    }
+    if len(sf) == 0 {
+        print("Checked " + str(r["startup_count"]) + " startup entries. No obvious persistence detected.");
+    } else {
+        print("Checked " + str(r["startup_count"]) + " startup entries. " + str(len(sf)) + " suspicious.");
+    }
+
+    print("");
+    print("Scan complete.");
+    return null;
+}
+
+// Guard: only auto-run main() when this file is the entrypoint, not when it
+// is imported by server.donk. At v2.3 there is no `__name__`, so run.donk
+// (the desktop entrypoint) does NOT import defender.donk's main by name and
+// instead calls run_scans() directly. The bare `main();` at the bottom is
+// kept for the CLI build (`build-exe examples/defender/defender.donk`).
+//main();

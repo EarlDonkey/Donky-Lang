@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 60] = [
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 61] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -70,7 +70,7 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 60] = [
     ("mem_alloc", "donky_mem_alloc", 1),
     ("mem_write", "donky_mem_write", 2),
     ("mem_protect", "donky_mem_protect", 3),
-    ("mem_free", "donky_mem_free", 1),
+    ("mem_free", "donky_mem_free", 2),
     ("fork", "donky_fork", 0),
     ("exec", "donky_exec", 2),
     ("wait", "donky_wait", 1),
@@ -91,6 +91,7 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 60] = [
     ("uname", "donky_uname", 0),
     ("getrlimit", "donky_getrlimit", 1),
     ("setrlimit", "donky_setrlimit", 3),
+    ("sys_write_binary", "donky_sys_write_binary", 2),
 ];
 
 #[derive(Clone, Copy)]
@@ -126,7 +127,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-        pub stdlib_ids: [FuncId; 60], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 61], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -227,7 +228,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 60] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 61] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });

@@ -1,0 +1,3 @@
+// examples/defender/cli.donk — CLI entrypoint for Donky Defender.
+import "examples/defender/defender.donk";
+main();

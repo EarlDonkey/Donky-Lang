@@ -1,0 +1,211 @@
+// examples/shell/donky_shell.donk — Donky Shell v1.0 (Windows).
+//
+// A command-line interpreter written in pure Donky. Windows has no fork()/exec(),
+// so we drive kernel32.dll's CreateProcessA directly via dll_call_sig (§14.5).
+//
+// STRUCTS:
+//   STARTUPINFOA        — 104 bytes. We only set cb (offset 0) = 104; the rest is
+//                          zeroed by mem_alloc? NO — mem_alloc does not zero, so we
+//                          zero the whole struct explicitly with ffi_poke.
+//   PROCESS_INFORMATION —  24 bytes. Zeroed. Layout (64-bit):
+//                            +0  hProcess    (HANDLE, 8 bytes)
+//                            +8  hThread     (HANDLE, 8 bytes)
+//                            +16 dwProcessId (DWORD, 4 bytes)
+//                            +20 dwThreadId  (DWORD, 4 bytes)
+//
+// FFI type letters (§14.5):
+//   p pointer / HANDLE, i int32 (BOOL), u uint32 (DWORD), s char*, L uint64, v void
+//
+// CreateProcessA signature (ANSI, 10 args):
+//   BOOL CreateProcessA(
+//     LPCSTR                lpApplicationName,        s
+//     LPSTR                 lpCommandLine,            s
+//     LPSECURITY_ATTRIBUTES lpProcessAttributes,      p
+//     LPSECURITY_ATTRIBUTES lpThreadAttributes,       p
+//     BOOL                  bInheritHandles,          i
+//     DWORD                 dwCreationFlags,          u
+//     LPVOID                lpEnvironment,            p
+//     LPCSTR                lpCurrentDirectory,       p  (NULL ok; we pass 0)
+//     LPSTARTUPINFOA        lpStartupInfo,            p
+//     LPPROCESS_INFORMATION  lpProcessInformation     p
+//   ) -> i
+//
+// WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) -> DWORD  : "u" "pu"
+//   We pass 0xFFFFFFFF (INFINITE) as a plain decimal number.
+//
+// CloseHandle(HANDLE) -> BOOL                                        : "i" "p"
+//
+// Notes:
+//   - kernel32 is already mapped into every Windows process, so dll_load is cheap
+//     and thread-safe; we resolve symbols once at the top of execute_windows_cmd.
+//     (See lib/proc.donk's note on why we avoid a global_set cache here.)
+//   - We don't try/catch inside execute_windows_cmd: a throw there propagates up
+//     to main()'s try, which prints it and keeps the shell alive.
+//   - Command-line building: we copy `cmd` into a NUL-terminated heap buffer so
+//     CreateProcessA can mutate it (its lpCommandLine is LPSTR, not LPCSTR, and
+//     the API is documented to write into it). We don't bother with quoting
+//     rules — pass-through of the user's line is what a shell does.
+//
+// Known v2.3 caveats that affect this file:
+//   - There is no auto-GC (§11.22). A long-lived shell leaks one cmd-line buffer
+//     and two structs per invocation unless mem_free/ffi_free are called. We free
+//     everything we alloc on every path, so the leak is bounded.
+//   - Strings from `input()` are Donky strings (tagged). ffi_poke needs a raw
+//     pointer, so we use ffi_alloc + ffi_poke byte-by-byte. There is no
+//     "pin a Donky string" builtin at v2.3.
+
+import "lib/winreg.donk";   // imported for parity with the rest of the tools;
+import "lib/proc.donk";     // not used by the shell itself.
+
+// ---------------------------------------------------------------------------
+// Zero `size` bytes at `p` using 8-byte ffi_poke where possible, then a tail
+// of single bytes. ffi_poke(addr, size, value) writes `size` bytes of `value`
+// at `addr` (LE), so the natural unit is 8.
+// ---------------------------------------------------------------------------
+fn zero_bytes(p, size) {
+    let i = 0;
+    while i + 8 <= size {
+        ffi_poke(p + i, 8, 0);
+        i = i + 8;
+    }
+    while i < size {
+        ffi_poke(p + i, 1, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Copy a Donky string into a freshly allocated NUL-terminated C buffer.
+// Returns the pointer. Caller owns it and must ffi_free it.
+//
+// We walk bytes with substr(s, i, i+1) and ffi_poke each one. This is O(n)
+// calls; a shell line is typically < 200 bytes, which is fine.
+// ---------------------------------------------------------------------------
+fn cstr_dup(s) {
+    let n = len(s);
+    let p = ffi_alloc(n + 1);
+    if p == 0 {
+        throw "donky_shell: ffi_alloc failed";
+    }
+    let i = 0;
+    while i < n {
+        let ch = substr(s, i, i + 1);
+        // char_code returns the byte value of the first byte of ch, or 0 for "".
+        ffi_poke(p + i, 1, char_code(ch));
+        i = i + 1;
+    }
+    ffi_poke(p + n, 1, 0);   // NUL terminator
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// Resolve a kernel32 export. No global cache: lib/proc.donk's rationale
+// (thread safety under spawn) applies if the shell ever grows a background
+// worker, and resolve-on-each-call is cheap for an already-loaded module.
+// ---------------------------------------------------------------------------
+fn k32_fn(name) {
+    let lib = dll_load("kernel32.dll");
+    if lib == 0 { throw "donky_shell: could not load kernel32.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "donky_shell: kernel32.dll has no export " + name; }
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// execute_windows_cmd(cmd_line) -> exit-code-ish (we don't get the real code
+// without GetExitCodeProcess; we just return 0 on a clean wait).
+//
+// Flow:
+//   1. Resolve CreateProcessA / WaitForSingleObject / CloseHandle.
+//   2. Allocate + zero STARTUPINFOA (104) and PROCESS_INFORMATION (24).
+//   3. Set si.cb = 104 at offset 0.
+//   4. Copy cmd_line into a NUL-terminated C buffer.
+//   5. CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi).
+//   6. On success: WaitForSingleObject(pi.hProcess, INFINITE), then
+//      CloseHandle(pi.hProcess), CloseHandle(pi.hThread).
+//   7. mem_free both structs, ffi_free the cmd buffer.
+// ---------------------------------------------------------------------------
+fn execute_windows_cmd(cmd_line) {
+    let p_create   = k32_fn("CreateProcessA");
+    let p_wait     = k32_fn("WaitForSingleObject");
+    let p_close    = k32_fn("CloseHandle");
+
+    // Wrap in cmd.exe /c to support built-in shell commands like dir, echo, etc.
+    let wrapped_cmd = "cmd.exe /c " + cmd_line;
+
+    // STARTUPINFOA: 104 bytes, zeroed, then cb = 104 at offset 0 (DWORD).
+    let si = mem_alloc(104);
+    zero_bytes(si, 104);
+    ffi_poke(si + 0, 4, 104);
+
+    // PROCESS_INFORMATION: 24 bytes, zeroed.
+    let pi = mem_alloc(24);
+    zero_bytes(pi, 24);
+
+    // Command line buffer (CreateProcessA writes into it).
+    let cmd_c = cstr_dup(wrapped_cmd);
+
+    // BOOL CreateProcessA(s, s, p, p, i, u, p, p, p, p) -> i
+    let ok = dll_call_sig(p_create, "i", "ppppiupppp",
+        [
+            null,       // lpApplicationName  (NULL — infer from cmd line)
+            cmd_c,      // lpCommandLine
+            0,          // lpProcessAttributes (NULL)
+            0,          // lpThreadAttributes (NULL)
+            1,          // bInheritHandles = TRUE  -> child writes to our console
+            0,          // dwCreationFlags = 0
+            0,          // lpEnvironment (NULL -> inherit)
+            0,          // lpCurrentDirectory (NULL -> inherit)
+            si,         // lpStartupInfo
+            pi          // lpProcessInformation (out)
+        ]);
+
+    if ok != 0 {
+        // pi layout: hProcess @ +0 (8 bytes), hThread @ +8 (8 bytes).
+        let h_process = ffi_peek(pi + 0, 8);
+        let h_thread  = ffi_peek(pi + 8, 8);
+
+        if h_process != 0 {
+            // INFINITE = 0xFFFFFFFF = 4294967295. Pass as a DWORD ("u").
+            dll_call_sig(p_wait, "u", "pu", [h_process, 4294967295]);
+        }
+        if h_process != 0 { dll_call_sig(p_close, "i", "p", [h_process]); }
+        if h_thread  != 0 { dll_call_sig(p_close, "i", "p", [h_thread]);  }
+    } else {
+        // CreateProcessA returns 0 on failure; GetLastError() would give the
+        // reason, but we don't import it — a plain message is enough for v1.
+        print("donky_shell: CreateProcessA failed for: " + cmd_line);
+    }
+
+    mem_free(si, 104);
+    mem_free(pi, 24);
+    ffi_free(cmd_c);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// main() -> null. Banner, then read-eval-execute until `exit` or EOF (empty
+// line). `input(prompt)` returns the line without the trailing newline, and
+// returns "" on EOF (per §6.3 for read_file-style builtins; input() follows
+// the same convention).
+// ---------------------------------------------------------------------------
+fn main() {
+    print("Donky Shell v1.0 (Windows)");
+    while true {
+        let line = input("donky> ");
+        if line == null || line == "exit" || line == "" {
+            break;
+        }
+        try {
+            execute_windows_cmd(line);
+        } catch e {
+            // A throw inside execute_windows_cmd (dll_load/dll_sym/ffi_alloc)
+            // must not kill the shell. Print and continue.
+            print("donky_shell: " + str(e));
+        }
+    }
+    return null;
+}
+
+main();
