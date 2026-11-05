@@ -1,0 +1,56 @@
+// lib/proc.donk — Windows process control over kernel32.dll (pure Donky, typed FFI).
+//
+// Public API:
+//   kill_proc(pid) -> true if the process was terminated, false otherwise
+//
+// Notes:
+//   - Windows only. Off Windows kernel32.dll cannot be loaded; kill_proc prints the error and
+//     returns false instead of throwing.
+//   - kill_proc runs on spawn()ed HTTP handler threads, possibly several at once, so it keeps
+//     no global_set cache: kernel32 symbols are resolved on every call (LoadLibraryA and
+//     GetProcAddress are thread-safe and cheap for an already-loaded module).
+//   - Top-level `let` is not visible inside functions, so there are no file-level constants;
+//     numeric constants are written in decimal.
+//   - dll_call_sig type letters: p pointer / HANDLE, u uint32 (DWORD, UINT), i int32 (BOOL).
+//   - Success means TerminateProcess accepted the request. The process disappears a moment
+//     later; this does not wait for it. Protected, elevated or other-user processes fail at
+//     OpenProcess (access denied) unless the caller is elevated -> false.
+
+// Address of a kernel32 export.
+fn pr_fn(name) {
+    let lib = dll_load("kernel32.dll");
+    if lib == 0 { throw "proc: could not load kernel32.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "proc: kernel32.dll has no export " + name; }
+    return p;
+}
+
+// A whole number in [1, 4294967295]. Anything else must be rejected here: dll_call_sig converts
+// a "u" argument by truncation, so 12.7 would silently become pid 12 and 4294967297 pid 1.
+// (NaN fails the last test; a non-number makes `%` throw, which kill_proc catches.)
+fn pr_valid_pid(pid) {
+    if pid < 1 { return false; }
+    if pid > 4294967295 { return false; }
+    if pid % 1 != 0 { return false; }
+    return true;
+}
+
+fn kill_proc(pid) {
+    let ok = false;
+    try {
+        if pr_valid_pid(pid) {
+            // OpenProcess(PROCESS_TERMINATE = 1 (0x0001), bInheritHandle = FALSE, dwProcessId)
+            let h = dll_call_sig(pr_fn("OpenProcess"), "p", "uiu", [1, 0, pid]);
+            if h != 0 {
+                // TerminateProcess(hProcess, uExitCode = 1) -> BOOL, nonzero on success
+                let r = dll_call_sig(pr_fn("TerminateProcess"), "i", "pu", [h, 1]);
+                // CloseHandle(hProcess): always, whether or not the kill worked
+                dll_call_sig(pr_fn("CloseHandle"), "i", "p", [h]);
+                if r != 0 { ok = true; }
+            }
+        }
+    } catch e {
+        print("kill_proc: " + str(e));
+    }
+    return ok;
+}

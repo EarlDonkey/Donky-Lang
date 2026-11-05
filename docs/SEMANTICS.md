@@ -31,8 +31,8 @@ Every Donky value is a 64-bit word.
 | 3 | array | Payload is a pointer to a GC-managed `Array { data, len, cap }`. |
 | 4 | map | Payload is a pointer to a GC-managed `Map { keys, vals, ... }`. |
 | 5 | struct | **Unused at v2.3.** Structs are maps with a `__type__` entry (§7). |
-| 6 | function | **Unused at v2.3.** Function values are raw code addresses (§9). |
-| 7 | closure | **Unused at v2.3.** Closures are not first-class. |
+| 6 | function | Payload is a pointer to a GC-managed code address (§9). |
+| 7 | closure | **Unused at v2.3.** Closures capture environments (future). |
 
 **Canonical word forms:**
 - `null` = `0x7FF8_0000_0000_0000`
@@ -76,11 +76,7 @@ throw is pending:
   caller's `has_exception` check until a `try` catches it or `main` reports
   it at exit with `Uncaught Exception: <value>` and exit code 1).
 
-**`throw 0` and `throw null` are no-ops.** The exception slot uses `0` as the
-"no exception" sentinel. `throw null` throws the word `0x7FF8_0000_0000_0000`,
-which is non-zero and therefore a real throw; `throw 0` throws the word
-`0x0000_0000_0000_0000`, which equals the sentinel and is silently ignored.
-This is a known limitation and is listed in §11.
+**Any value can be thrown.** The exception slot uses `UINT64_MAX` as the "no exception" sentinel. `throw 0`, `throw null`, and `throw false` all work correctly and are caught by `try/catch`.
 
 ### 0.4 Number rendering
 
@@ -124,12 +120,7 @@ to be human-readable for top-level strings and unambiguous inside containers.
 
 ### 1.2 `-`, `*`, `/` (operators) and `donky_sub`, `donky_mul`, `donky_div`
 
-- `-` and `*` are inline `fsub`/`fmul` on raw `f64` bits, followed by
-  `donky_make_number`. **They do not throw on type mismatch** — `"a" - 1`
-  produces the bit pattern of `fsub(bits("a"), bits(1))`, which is a NaN
-  canonicalized to `0xFFF8_0000_0000_0000`. This is a known wart; it is
-  listed in §11. `donky_sub`/`donky_mul` (the builtins) **do** throw on type
-  mismatch; the operators do not use them.
+- `-`, `*`, and `/` throw on type mismatch (via `donky_sub`, `donky_mul`, `donky_fdiv`). When both operands are statically known numeric, they inline `fsub`/`fmul`/`fdiv` + `donky_make_number` for speed.
 - `/` is inline `fdiv` on raw `f64` bits. `x / 0` yields `±inf` or `NaN`
   (IEEE-754), never throws. This is the "raw IEEE" path.
 - **`donky_div` (the builtin, and the `div` operator, §1.3) is different.**
@@ -487,10 +478,12 @@ another function, an `if`, or a block is **silently discarded** at v2.3.
 
 ### 9.2 Function values (`Expr::Function`)
 
-`let g = fn(x) { x + 1 }` is parsed, and `g(2)` compiles to an **indirect
-call through the raw function address**. But the value stored in `g` is the
-raw code pointer as a raw bit pattern — it reads as a **denormal number**, not
-as a tagged function value.
+Functions are first-class values tagged with `TAG_FUNCTION` (6). 
+- `let g = fn(x) { x + 1 }` stores a tagged function object in `g`.
+- `type(g)` returns `"function"`.
+- You can pass functions as arguments (e.g. `map(arr, double)`).
+- When you call a variable as a function `g(2)`, the compiler packs the arguments into an array and calls `donky_call_function(g, args)`.
+- Passing a function to `spawn` or `dll_callback` automatically unwraps the raw code address.
 
 Consequences:
 - `type(g)` returns `"number"` (not `"function"`).
@@ -563,34 +556,8 @@ These are v2.3 facts. Each is a candidate for a future change; none of them
 are bugs (the current behavior is intentional and documented) unless marked
 **bug**.
 
-1. **`throw 0` is a no-op.** The exception slot uses `0` as "no exception."
-   `throw null` works (`null` is non-zero). To throw a falsy value, use
-   `throw str(0)` or `throw false`.
-2. **`throw null` does not exist as a distinct exception value from the
-   canonical `null` — if you `throw null` and catch it, `e == null` is
-   tagged `true`.** Fine, but note the `throw 0` asymmetry.
-3. **`let` at top level is not visible inside functions.** This is the
-   `db` warning. A future fix will compile top-level `let` into a
-   `donky_global_set` call. Currently: `let x = 1; fn f() { print x; }`
-   prints `null`, with a warning at compile time.
-4. **Named functions nested inside blocks are discarded.** Only top-level
-   `fn` declarations work.
-5. **Function values are not first-class.** `type(f) == "number"`,
-   `spawn(non_function)` segfaults. Fix: add a real `TAG_FUNCTION` and store
-   closures as heap objects.
-6. **Arity is not checked.** Missing arguments are padded with `0.0`,
+1. **Arity is not checked.** Missing arguments are padded with `0.0`,
    extras are truncated.
-7. **Struct field names and types are not checked.** `struct Point { x: int }`
-   at top level is a no-op.
-8. **Struct methods are not implemented** in the AOT.
-9. **`for x in map` iterates `map[0], map[1], ...`** — that is, numeric
-   key lookups, not entry iteration. Almost certainly not what the user
-   wants.
-10. **String comparison `<`, `<=`, `>`, `>=` compares raw words**, which is
-    meaningless. `==` and `!=` on strings work correctly (via `donky_eq`).
-11. **`-`, `*`, `/` on non-numbers do not throw.** They compute on raw bits
-    and return a canonicalized NaN. `sub()`, `mul()`, `div()` (the builtins)
-    **do** throw; the operators do not.
 12. **`null[i]` and `null.f` return the number `0.0`, not `null`.**
 13. **`donky_div` truncates**, matching the interpreter's `div`. `7 div 2`
     is `3.0`, not `3.5`. This is intentional (decision A2).
@@ -638,6 +605,31 @@ are bugs (the current behavior is intentional and documented) unless marked
     A cleanup pass renames these to `math_*` — see the file's header.
 
 ---
+
+## 14. Native Interop & System Programming
+
+Donky is a C-parity systems language. The runtime exposes raw memory, typed FFI, process control, and POSIX security.
+
+### 14.1 Executable memory and JIT
+`mem_alloc(size)` allocates read/write memory. `mem_write(ptr, bytes)` copies bytes. `mem_protect(ptr, size, prot)` changes protection (1=RW, 2=RX, 3=RWX). You can write x86 machine code and execute it via `dll_call_sig`.
+
+### 14.2 Raw syscalls
+`syscall(nr, args)` invokes a raw OS syscall (POSIX only). `args` is an array of up to 6 numbers or strings. Returns the raw signed result or `-1`.
+
+### 14.3 Process Control
+`fork()`, `exec(path, args)`, `wait(pid)`, `pipe()`, `dup2(old, new)`, `mmap(len, prot, flags)`, `munmap(ptr, len)`. POSIX only. On Windows, use `dll_call_sig` with `CreateProcessA`.
+
+### 14.4 Security and Privilege (POSIX)
+`setuid(uid)`, `setgid(gid)`, `seteuid(uid)`, `setegid(gid)`, `chroot(path)`, `unshare(flags)`, `prctl(...)`, `seccomp(op, flags, arg)`. Windows stubs throw an error.
+
+### 14.5 Typed FFI (libffi)
+`dll_call_sig(fn, ret_sig, arg_sig, args)` calls any C function with exact types.
+- Type letters: `v` void, `i` int32, `u` uint32, `l` int64, `L` uint64, `f` float, `d` double, `s` char*, `p` void*.
+- `dll_callback(ret_sig, arg_sig, func)` creates a C function pointer that calls a Donky function.
+- `dll_load` / `dll_sym` locate the library and function address.
+
+### 14.6 OS Identity (POSIX)
+`getpwnam(name)` / `getpwuid(uid)` return `{name, uid, gid, dir, shell}`. `uname()` returns OS info. `getrlimit` / `setrlimit` manage process resources.
 
 ## 12. Divergences from the frozen engines
 
@@ -689,42 +681,20 @@ shipped path. Do not use it as a reference.
 
 ## 13. Versioning
 
-This document describes **Donky v2.3, semantics-pass-revision-1**. Any change
+This document describes **Donky v2.3, semantics-pass-revision-4**. Any change
 to the observable behavior of a builtin, operator, or language construct
 requires bumping the revision and updating §11.
 
 **Changelog:**
 
-- **v2.3 semantics-pass-revision-1** (current):
-  - `a[99]` → null, `m["missing"]` → null, `s[99]` → null
-  - `1 + "a"` → throws (was: number `0`)
-  - `x div 0` → throws (was: number `0`)
-  - `7 div 2` → `3.0` (was: number `0`, and was a compiler crash)
-  - `x % 0` → throws (was: number `0`)
-  - `!5` → tagged `false` (was: number `0`)
-  - Comparisons, `!`, `&&`, `||` → tagged booleans (was: number `1.0`/`0.0`)
-  - `print(1 < 2)` → `true` (was: `1`)
-  - `str([1, "a"])` → `[1, "a"]` (was: `"[array]"`)
-  - `join` on non-string → throws (was: silently skipped)
-  - `contains` on unsupported haystack → throws (was: number `0.0`)
-  - `type(Point{x:1})` → `"Point"` (was: `"map"`)
-  - `null` is falsy (was: truthy)
-  - `null` is `TAG_BASE` (was: number `0.0`, indistinguishable from zero)
-  - `sys_getenv` unset → `null` (was: number `0.0`)
-  - `global_get` never set → `null` (was: number `0.0`)
-  - `json_decode("null")` → `null` (was: number `0.0`)
-  - Boolean builtins → tagged booleans (was: number `1.0`/`0.0`)
-  - NaN is canonicalized to `0xFFF8_0000_0000_0000` (was: raw IEEE NaN,
-    which could collide with `TAG_BASE` on aarch64)
-  - `donky_cls` declared with the wrong ABI return type (was: `None`,
-    now `Some(I64)` — cosmetic, but was an ABI mismatch)
-  - DCE bug: `let g = double; g(2)` (was: `g` dropped, call fails) → fixed
-  - **v2.3 semantics-pass-revision-3** (current):
+- **v2.3 semantics-pass-revision-4** (current):
+  - Added First-Class Functions (`TAG_FUNCTION`). Functions can be passed as arguments and called indirectly.
+  - Added Typed FFI (`libffi`): `dll_call_sig` and `dll_callback`.
+  - Added Executable Memory: `mem_alloc`, `mem_write`, `mem_protect`, `mem_free`.
+  - Added Process Control: `fork`, `exec`, `wait`, `pipe`, `dup2`, `mmap`.
+  - Added Security/OS Config: `setuid`, `chroot`, `seccomp`, `uname`, `getpwnam`, etc.
+  - Fixed `throw 0` (sentinel is now `UINT64_MAX`).
+  - Fixed silent NaN on `-`, `*`, `/` (now throw on type mismatch via `donky_sub`, `donky_mul`, `donky_fdiv`).
+- **v2.3 semantics-pass-revision-3**:
   - Added math builtins `pow`, `exp`, `log`, `tanh`, `max`, `min`, `abs`
-    (§6.1.1). Composed `lib/micrograd.donk` (a working autograd engine) and
-    `tests/micrograd_test.donk` (XOR training, all checks pass) on top of
-    them.
-  - Documented import resolution (silent on failure, cwd-relative, §11.20),
-    `donky test` running the VM not the AOT (§11.21), manual GC (§11.22),
-    verified Ternary/MethodCall compile (§11.23), and `lib/math.donk`
-    shadowing (§11.24).
+...

@@ -49,6 +49,89 @@ fn request_path(raw) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/kill helpers.
+//   request_method(raw)      -> "GET" / "POST" / ... ("" if unparseable).
+//   header_value(raw, name)  -> first token of that header's value, or null. `name` is
+//                               lower-case with the colon, e.g. "origin:". Header names have no
+//                               spaces, so splitting each line on " " is enough.
+//   request_body(raw)        -> text after the blank line, IF it arrived in the same read as the
+//                               headers. split() drops empty tokens, so the body is the last
+//                               token, and the only one without a ':' (every header has one).
+//   read_kill_body(conn, raw)-> the body, reading once more if it came in its own TCP segment
+//                               (some clients send headers and body separately). It only reads
+//                               when Content-Length promises bytes, so it cannot block on a
+//                               request that has no body.
+//   origin_refused(raw)      -> true for a browser request from any page other than Sentinel's
+//                               own (blocks drive-by POSTs from other websites). Requests with no
+//                               Origin header (curl, scripts) pass. Port must match serve().
+//   is_pid_text(s)           -> true for 1-10 ASCII digits.
+// ---------------------------------------------------------------------------
+fn request_method(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return ""; }
+    let parts = split(lines[0], " ");
+    if len(parts) == 0 { return ""; }
+    return parts[0];
+}
+
+fn header_value(raw, name) {
+    let lines = split(raw, "\r\n");
+    let i = 1;
+    while i < len(lines) {
+        let parts = split(lines[i], " ");
+        if len(parts) >= 2 {
+            if lower(parts[0]) == name { return parts[1]; }
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn request_body(raw) {
+    let lines = split(raw, "\r\n");
+    let n = len(lines);
+    if n < 2 { return ""; }
+    let last = lines[n - 1];
+    if contains(last, ":") { return ""; }
+    return last;
+}
+
+fn read_kill_body(conn_id, raw) {
+    let cl = header_value(raw, "content-length:");
+    if cl == null { return ""; }
+    let want = num(cl);
+    if want < 1 || want > 32 { return ""; }
+    let body = request_body(raw);
+    if len(body) < want {
+        body = body + tcp_read(conn_id, 64);
+    }
+    return body;
+}
+
+fn origin_refused(raw) {
+    let o = header_value(raw, "origin:");
+    if o == null { return false; }
+    let v = lower(o);
+    if v == "http://localhost:8082" { return false; }
+    if v == "http://127.0.0.1:8082" { return false; }
+    return true;
+}
+
+fn is_pid_text(s) {
+    let n = len(s);
+    if n < 1 || n > 10 { return false; }
+    let i = 0;
+    while i < n {
+        if contains("0123456789", substr(s, i, i + 1)) {
+            i = i + 1;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // respond(client, status_line, mime, body) -> null. One write, one close.
 // ---------------------------------------------------------------------------
 fn respond(client, status_line, mime, body) {
@@ -106,16 +189,54 @@ fn handle_client(conn_id) {
         return null;
     }
 
+    if path == "/api/software" {
+        respond(conn_id, "200 OK", "application/json", json_encode(global_get("sentinel_software")));
+        return null;
+    }
+
+    if path == "/api/kill" {
+        if request_method(raw) != "POST" {
+            respond(conn_id, "405 Method Not Allowed", "text/plain; charset=utf-8", "use POST");
+            return null;
+        }
+        if origin_refused(raw) {
+            respond(conn_id, "403 Forbidden", "text/plain; charset=utf-8", "cross-origin request refused");
+            return null;
+        }
+        // Body is the PID as text, e.g. 1234. num() is atof-based and never fails ("abc" -> 0,
+        // "12abc" -> 12), so the text is validated as digits before it is parsed.
+        let toks = split(read_kill_body(conn_id, raw), " \r\n");
+        let text = "";
+        if len(toks) == 1 { text = toks[0]; }
+        if is_pid_text(text) {
+            let pid = num(text);
+            if pid < 1 || pid > 4294967295 {
+                respond(conn_id, "400 Bad Request", "text/plain; charset=utf-8", "bad pid");
+                return null;
+            }
+            if kill_proc(pid) {
+                respond(conn_id, "200 OK", "text/plain; charset=utf-8", "ok");
+            } else {
+                respond(conn_id, "500 Internal Server Error", "text/plain; charset=utf-8", "kill failed");
+            }
+            return null;
+        }
+        respond(conn_id, "400 Bad Request", "text/plain; charset=utf-8", "bad pid");
+        return null;
+    }
+
     // Unknown route.
-    let body = "not found: " + path;
-    respond(conn_id, "404 Not Found", "text/plain; charset=utf-8", body);
+    let body = "not found: " + path;    respond(conn_id, "404 Not Found", "text/plain; charset=utf-8", body);
     return null;
 }
 
 // ---------------------------------------------------------------------------
-// serve() -> null (never returns). Accept loop on the main thread.
+// setup_server() -> server handle (int) or null. Binds 8082 and returns the
+// listening socket. Split out of the old serve() so that run.donk can bind
+// *before* handing off to a spawned accept loop (and so gui_webview has a
+// live port to point at on the main thread). Does NOT block.
 // ---------------------------------------------------------------------------
-fn serve() {
+fn setup_server() {
     let port = 8082;
     let server = tcp_listen(port);
     if server == null || server < 0 {
@@ -123,8 +244,25 @@ fn serve() {
         return null;
     }
     print("sentinel: listening on http://localhost:" + str(port) + "/");
+    return server;
+}
+
+// ---------------------------------------------------------------------------
+// start_server(server_handle) -> null (never returns). Accept loop. Intended
+// to be run on a spawn worker (SEMANTICS §11.5), not the main thread — the
+// main thread blocks in gui_webview().
+//
+// If server_handle is null/invalid (setup_server failed), sleep briefly and
+// return so we don't hot-spin a bad accept. run.donk will already have
+// printed the bind failure.
+// ---------------------------------------------------------------------------
+fn start_server(server_handle) {
+    if server_handle == null || server_handle < 0 {
+        print("sentinel: start_server called with invalid handle");
+        return null;
+    }
     while true {
-        let conn = tcp_accept(server);
+        let conn = tcp_accept(server_handle);
         if conn == null || conn < 0 {
             // Accept failed (rare). Avoid a hot spin.
             sleep(50);

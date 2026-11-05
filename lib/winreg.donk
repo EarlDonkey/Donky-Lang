@@ -1,0 +1,147 @@
+// lib/winreg.donk — read-only Windows Registry wrapper over advapi32.dll (pure Donky, typed FFI).
+//
+// Public API:
+//   reg_open_key(hkey, subkey)      -> handle (number) or null
+//   reg_close_key(handle)           -> 0
+//   reg_read_string(handle, name)   -> string or null   (REG_SZ / REG_EXPAND_SZ only, < 1024 bytes)
+//   reg_enum_key(handle, index)     -> subkey name or null (null at ERROR_NO_MORE_ITEMS or on any error)
+//   get_installed_programs()        -> [ {name, version, publisher}, ... ]  (HKLM ...\Uninstall)
+//   get_installed_programs_all()    -> same, plus the 32-bit (WOW6432Node) view
+//
+// Notes:
+//   - Windows only. Programs that import this file must be built on Windows.
+//   - Numeric constants are written in decimal (hex shown in comments).
+//   - Top-level `let` is not visible inside functions (SEMANTICS §11.3), so there are no
+//     file-level constants. Helpers cache resolved advapi32 symbols with global_get/global_set,
+//     under keys prefixed "winreg:".
+//   - dll_call_sig type letters: p pointer, s char*, u uint32. HKEYs and out-pointers are "p".
+//   - Registry status codes are LONG; they are declared "u" and only compared against 0 and 259.
+
+// ---------------------------------------------------------------- internals
+
+// Address of an advapi32 export, resolved once and cached.
+fn wr_fn(name) {
+    let key = "winreg:" + name;
+    let cached = global_get(key);
+    if cached != null { return cached; }
+    let lib = dll_load("advapi32.dll");
+    if lib == 0 { throw "winreg: could not load advapi32.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "winreg: advapi32.dll has no export " + name; }
+    global_set(key, p);
+    return p;
+}
+
+// ---------------------------------------------------------------- basic helpers
+
+// RegOpenKeyExA(hKey, lpSubKey, ulOptions=0, samDesired=KEY_READ, phkResult)
+fn reg_open_key(hkey, subkey) {
+    let out = mem_alloc(8);                       // PHKEY: receives a 64-bit handle
+    ffi_poke(out, 8, 0);
+    let rc = dll_call_sig(wr_fn("RegOpenKeyExA"), "u", "psuup",
+                          [hkey, subkey, 0, 131097, out]);   // 131097 = 0x20019 = KEY_READ
+    let handle = null;
+    if rc == 0 {
+        let h = ffi_peek(out, 8);
+        if h != 0 { handle = h; }
+    }
+    mem_free(out);
+    return handle;
+}
+
+// RegCloseKey(hKey)
+fn reg_close_key(handle) {
+    if handle != null {
+        dll_call_sig(wr_fn("RegCloseKey"), "u", "p", [handle]);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- string reading
+
+// RegQueryValueExA(hKey, lpValueName, lpReserved=NULL, lpType, lpData, lpcbData)
+fn reg_read_string(handle, value_name) {
+    let buf = mem_alloc(1024);
+    let ptype = mem_alloc(4);
+    let plen = mem_alloc(4);
+    ffi_poke(ptype, 4, 0);
+    ffi_poke(plen, 4, 1023);                      // capacity in; leaves byte 1023 free for the NUL
+    ffi_poke(buf, 1, 0);
+    ffi_poke(buf + 1023, 1, 0);
+
+    let rc = dll_call_sig(wr_fn("RegQueryValueExA"), "u", "pspppp",
+                          [handle, value_name, 0, ptype, buf, plen]);
+
+    let result = null;
+    if rc == 0 {
+        let t = ffi_peek(ptype, 4);
+        // 1 = REG_SZ, 2 = REG_EXPAND_SZ. Other types (DWORD, BINARY, ...) are not text.
+        if t == 1 || t == 2 { result = ffi_cstr(buf); }
+    }
+
+    mem_free(buf);
+    mem_free(ptype);
+    mem_free(plen);
+    return result;
+}
+
+// ---------------------------------------------------------------- enumeration
+
+// RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass, lpftLastWriteTime)
+fn reg_enum_key(handle, index) {
+    let buf = mem_alloc(256);
+    let plen = mem_alloc(4);
+    ffi_poke(buf, 1, 0);
+    ffi_poke(plen, 4, 256);                       // in: buffer size in chars, including the NUL
+
+    let rc = dll_call_sig(wr_fn("RegEnumKeyExA"), "u", "pupppppp",
+                          [handle, index, buf, plen, 0, 0, 0, 0]);
+
+    let result = null;
+    if rc == 0 { result = ffi_cstr(buf); }        // rc 259 = ERROR_NO_MORE_ITEMS -> null
+
+    mem_free(buf);
+    mem_free(plen);
+    return result;
+}
+
+// ---------------------------------------------------------------- high-level API
+
+// Appends one {name, version, publisher} map per Uninstall subkey that has a DisplayName.
+fn wr_scan_uninstall(view_path, out) {
+    let hk = reg_open_key(2147483650, view_path);   // 2147483650 = 0x80000002 = HKEY_LOCAL_MACHINE
+    if hk == null { return out; }
+    let i = 0;
+    while true {
+        let sub = reg_enum_key(hk, i);
+        if sub == null { break; }
+        i = i + 1;
+        let sk = reg_open_key(hk, sub);
+        if sk == null { continue; }
+        let dn = reg_read_string(sk, "DisplayName");
+        if dn != null {
+            let entry = {};
+            entry["name"] = dn;
+            entry["version"] = reg_read_string(sk, "DisplayVersion");
+            entry["publisher"] = reg_read_string(sk, "Publisher");
+            push(out, entry);
+        }
+        reg_close_key(sk);
+    }
+    reg_close_key(hk);
+    return out;
+}
+
+fn get_installed_programs() {
+    let result = [];
+    wr_scan_uninstall("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", result);
+    return result;
+}
+
+// 64-bit view plus the 32-bit (WOW6432Node) view.
+fn get_installed_programs_all() {
+    let result = [];
+    wr_scan_uninstall("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", result);
+    wr_scan_uninstall("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall", result);
+    return result;
+}

@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel V2</title>
+<style>
+  :root {
+    --bg: #0a0a0c;
+    --surface: #141416;
+    --raised: #1b1b1e;
+    --line: #2a2a2e;
+    --line-soft: #1f1f23;
+    --text: #d8cfc5;
+    --muted: #8d857b;
+    --dim: #5f5952;
+    --copper: #e08e4a;
+    --amber: #f2b872;
+    --copper-glow: rgba(224,142,74,.14);
+    --ok: #9bb58a;
+    --warn: #f2b872;
+    --crit: #cf6a55;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, Menlo, monospace;
+    --sans: Inter, "Segoe UI", -apple-system, Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  ::selection { background: rgba(224,142,74,.35); color: #f4e9dc; }
+  :focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #2c2c30; border-radius: 6px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: #3a3a3f; }
+
+  /* ---------- top bar ---------- */
+  header {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(10,10,12,.9); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .bar { max-width: 1200px; margin: 0 auto; padding: 0 20px; height: 58px; display: flex; align-items: center; gap: 28px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .02em; color: var(--amber); font-size: 16px; }
+  .brand i { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(140deg, var(--amber), #b4682c); box-shadow: 0 0 18px var(--copper-glow); }
+  .brand small { font-weight: 500; color: var(--dim); font-size: 12px; letter-spacing: .06em; }
+  nav[role=tablist] { display: flex; gap: 4px; height: 100%; }
+  .tab {
+    appearance: none; background: none; border: 0; color: var(--muted); font: inherit; font-weight: 600;
+    padding: 0 16px; height: 100%; cursor: pointer; position: relative; transition: color .15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab[aria-selected=true] { color: var(--amber); }
+  .tab[aria-selected=true]::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; background: var(--copper); border-radius: 2px; }
+  .live { margin-left: auto; display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px rgba(155,181,138,.5); animation: pulse 2s infinite; }
+  .dot.err { background: var(--crit); }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 20px 60px; }
+  section[hidden] { display: none; }
+
+  /* ---------- cards ---------- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; position: relative; overflow: hidden; }
+  .card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: linear-gradient(90deg, var(--copper), transparent 70%); opacity: .55; }
+  .card h3 { margin: 0; font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .big { font-family: var(--mono); font-size: 34px; font-weight: 600; color: var(--amber); margin: 6px 0 2px; line-height: 1.1; }
+  .big small { font-size: 16px; color: var(--muted); margin-left: 3px; font-weight: 500; }
+  .sub { font-family: var(--mono); font-size: 12px; color: var(--muted); min-height: 18px; }
+  .meter { height: 6px; background: #0e0e10; border: 1px solid var(--line-soft); border-radius: 4px; margin-top: 14px; overflow: hidden; }
+  .meter b { display: block; height: 100%; width: 0; background: var(--copper); border-radius: 4px; transition: width .5s ease, background .3s; }
+  .meter b.warn { background: var(--warn); }
+  .meter b.crit { background: var(--crit); }
+
+  /* ---------- panels & tables ---------- */
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .panel-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .panel-head h2 { margin: 0; font-size: 15px; color: var(--amber); font-weight: 600; }
+  .count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .spacer { flex: 1; }
+  .scroll { max-height: calc(100vh - 360px); min-height: 280px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { position: sticky; top: 0; z-index: 1; background: var(--raised); border-bottom: 1px solid var(--line); text-align: left; padding: 0; }
+  th button {
+    appearance: none; background: none; border: 0; width: 100%; text-align: inherit; font: inherit; cursor: pointer;
+    padding: 10px 18px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    display: flex; align-items: center; gap: 6px; transition: color .15s;
+  }
+  th button:hover { color: var(--text); }
+  th[aria-sort=ascending] button, th[aria-sort=descending] button { color: var(--amber); }
+  th[aria-sort=ascending] button::after { content: "▲"; font-size: 9px; }
+  th[aria-sort=descending] button::after { content: "▼"; font-size: 9px; }
+  th.num button { justify-content: flex-end; }
+  td { padding: 8px 18px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+  td.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.mono { font-family: var(--mono); color: var(--muted); }
+  td.empty { color: var(--dim); }
+  tbody tr:hover td { background: #18181b; }
+  tbody tr:hover td:first-child { box-shadow: inset 2px 0 0 var(--copper); }
+  .hot { color: var(--amber); }
+  th.act-h { width: 1%; padding: 10px 18px; text-align: right; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+  td.act { text-align: right; width: 1%; }
+  .kill {
+    appearance: none; background: transparent; color: #a8584a; border: 1px solid #4a2a26; border-radius: 6px;
+    padding: 2px 10px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .kill:hover { color: #ff5a47; border-color: #ff5a47; background: rgba(255,90,71,.1); }
+  .kill:disabled { opacity: .4; cursor: wait; }
+  .state { padding: 48px 20px; text-align: center; color: var(--muted); }
+  .state.err { color: var(--crit); }
+  .state button { margin-top: 12px; }
+
+  /* ---------- controls ---------- */
+  .search { position: relative; flex: 1 1 280px; max-width: 460px; }
+  .search input {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 36px 9px 36px; font: inherit; transition: border-color .15s, box-shadow .15s;
+  }
+  .search input::placeholder { color: var(--dim); }
+  .search input:focus { outline: none; border-color: var(--copper); box-shadow: 0 0 0 3px var(--copper-glow); }
+  .search svg { position: absolute; left: 11px; top: 50%; transform: translate(0,-50%); width: 15px; height: 15px; stroke: var(--dim); fill: none; stroke-width: 2; }
+  .search kbd { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-family: var(--mono); font-size: 11px; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+  .search input:focus ~ kbd, .search input:not(:placeholder-shown) ~ kbd { display: none; }
+  .btn {
+    appearance: none; background: var(--raised); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  .btn:hover { border-color: var(--copper); color: var(--amber); }
+  .btn:disabled { opacity: .5; cursor: wait; }
+
+  @media (max-width: 640px) {
+    .bar { gap: 12px; padding: 0 12px; }
+    .brand small, .live span { display: none; }
+    .tab { padding: 0 10px; }
+    main { padding: 16px 12px 40px; }
+    td, th button { padding-left: 12px; padding-right: 12px; }
+    .scroll { max-height: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <div class="brand"><i></i>Sentinel <small>V2</small></div>
+    <nav role="tablist" aria-label="Views">
+      <button class="tab" role="tab" id="tab-processes" aria-controls="view-processes" aria-selected="true" data-view="processes">Processes</button>
+      <button class="tab" role="tab" id="tab-software" aria-controls="view-software" aria-selected="false" data-view="software" tabindex="-1">Installed Software</button>
+    </nav>
+    <div class="live" title="Polls /api/snapshot every 2 seconds"><span id="live-text">connecting</span><i class="dot" id="live-dot"></i></div>
+  </div>
+</header>
+
+<main>
+  <!-- ================= Processes ================= -->
+  <section id="view-processes" role="tabpanel" aria-labelledby="tab-processes">
+    <div class="cards">
+      <div class="card">
+        <h3>CPU</h3>
+        <div class="big" id="cpu-val">—<small>%</small></div>
+        <div class="sub" id="cpu-sub">&nbsp;</div>
+        <div class="meter"><b id="cpu-bar"></b></div>
+      </div>
+      <div class="card">
+        <h3>Memory</h3>
+        <div class="big" id="mem-val">—<small>%</small></div>
+        <div class="sub" id="mem-sub">&nbsp;</div>
+        <div class="meter"><b id="mem-bar"></b></div>
+      </div>
+      <div class="card">
+        <h3>Disk</h3>
+        <div class="big" id="disk-val">—<small>%</small></div>
+        <div class="sub" id="disk-sub">&nbsp;</div>
+        <div class="meter"><b id="disk-bar"></b></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Processes</h2>
+        <span class="count" id="proc-count">0</span>
+      </div>
+      <div class="scroll">
+        <table id="proc-table">
+          <thead><tr>
+            <th class="num" data-key="pid"><button type="button">PID</button></th>
+            <th data-key="name"><button type="button">Name</button></th>
+            <th class="num" data-key="threads"><button type="button">Threads</button></th>
+            <th class="num" data-key="mem"><button type="button">Memory (MB)</button></th>
+            <th class="act-h">Action</th>
+          </tr></thead>
+          <tbody id="proc-body"><tr><td colspan="5" class="state">Waiting for first snapshot…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Installed Software ================= -->
+  <section id="view-software" role="tabpanel" aria-labelledby="tab-software" hidden>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Installed Software</h2>
+        <span class="count" id="sw-count"></span>
+        <div class="spacer"></div>
+        <div class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="sw-search" type="search" placeholder="Filter by name, version or publisher" autocomplete="off" spellcheck="false" aria-label="Filter installed software">
+          <kbd>/</kbd>
+        </div>
+        <button class="btn" id="sw-refresh" type="button">Refresh</button>
+      </div>
+      <div class="scroll">
+        <table id="sw-table">
+          <thead><tr>
+            <th data-key="name"><button type="button">Name</button></th>
+            <th data-key="version"><button type="button">Version</button></th>
+            <th data-key="publisher"><button type="button">Publisher</button></th>
+          </tr></thead>
+          <tbody id="sw-body"></tbody>
+        </table>
+        <div class="state" id="sw-state" hidden></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- helpers ---------- */
+  var $ = function (id) { return document.getElementById(id); };
+  var POLL_MS = 2000;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function num(v) { var n = typeof v === "number" ? v : parseFloat(v); return isFinite(n) ? n : null; }
+  function pick(o) {                         // first defined property among the given names
+    for (var i = 1; i < arguments.length; i++) if (o && o[arguments[i]] != null) return o[arguments[i]];
+    return null;
+  }
+  function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : Math.round(mb) + " MB"; }
+  function level(p) { return p >= 90 ? "crit" : p >= 75 ? "warn" : ""; }
+
+  /* ---------- generic sortable table state ---------- */
+  function makeSorter(table, def, onChange) {
+    var st = { key: def.key, dir: def.dir };
+    var ths = table.querySelectorAll("thead th[data-key]");
+    function paint() {
+      ths.forEach(function (th) {
+        th.setAttribute("aria-sort", th.dataset.key === st.key ? (st.dir > 0 ? "ascending" : "descending") : "none");
+      });
+    }
+    ths.forEach(function (th) {
+      th.querySelector("button").addEventListener("click", function () {
+        var k = th.dataset.key;
+        if (st.key === k) st.dir = -st.dir; else { st.key = k; st.dir = th.classList.contains("num") ? -1 : 1; }
+        paint(); onChange();
+      });
+    });
+    paint();
+    return st;
+  }
+  function cmp(a, b, key, dir) {
+    var x = a[key], y = b[key];
+    var xn = x == null || x === "", yn = y == null || y === "";
+    if (xn || yn) return xn && yn ? 0 : xn ? 1 : -1;       // blanks always last
+    if (typeof x === "number" && typeof y === "number") return (x - y) * dir;
+    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: "base" }) * dir;
+  }
+
+  /* ============================================================
+     Tab switching
+     ============================================================ */
+  var views = { processes: $("view-processes"), software: $("view-software") };
+  var tabs = document.querySelectorAll(".tab");
+  var current = "processes";
+
+  function show(name, focusTab) {
+    if (!views[name]) name = "processes";
+    current = name;
+    tabs.forEach(function (t) {
+      var on = t.dataset.view === name;
+      t.setAttribute("aria-selected", on);
+      t.tabIndex = on ? 0 : -1;
+      if (on && focusTab) t.focus();
+    });
+    Object.keys(views).forEach(function (k) { views[k].hidden = k !== name; });
+    try { history.replaceState(null, "", name === "processes" ? location.pathname + location.search : "#" + name); } catch (e) {}
+    if (name === "software") { if (!sw.loaded && !sw.loading) loadSoftware(); }
+    else pollNow();
+    syncPolling();
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener("click", function () { show(t.dataset.view); });
+    t.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        show(tabs[(i + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length].dataset.view, true);
+      }
+    });
+  });
+
+  /* ============================================================
+     Tab 1: live snapshot + process table
+     ============================================================ */
+  var procs = [];
+  var procSort = makeSorter($("proc-table"), { key: "mem", dir: -1 }, renderProcs);
+
+  function renderProcs() {
+    var rows = procs.slice().sort(function (a, b) {
+      return cmp(a, b, procSort.key, procSort.dir) || cmp(a, b, "pid", 1);
+    });
+    $("proc-count").textContent = rows.length + " running";
+    if (!rows.length) { $("proc-body").innerHTML = '<tr><td colspan="5" class="state">No process data.</td></tr>'; return; }
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var p = rows[i];
+      out.push('<tr><td class="num mono">' + esc(p.pid == null ? "" : p.pid) + '</td>' +
+        '<td title="' + esc(p.name || "") + '">' + esc(p.name || "") + '</td>' +
+        '<td class="num">' + esc(p.threads == null ? "" : p.threads) + '</td>' +
+        '<td class="num' + (p.mem >= 500 ? " hot" : "") + '">' + (p.mem == null ? "" : esc(Math.round(p.mem).toLocaleString())) + '</td>' +
+        '<td class="act">' + (p.pid == null ? "" :
+          '<button type="button" class="kill" data-pid="' + esc(p.pid) + '" title="Terminate PID ' + esc(p.pid) + '" aria-label="Kill process ' + esc(p.pid) + '">Kill</button>') + '</td></tr>');
+    }
+    $("proc-body").innerHTML = out.join("");
+  }
+
+  // Event delegation: the tbody is rebuilt on every poll, so listen on it rather than on each button.
+  $("proc-body").addEventListener("click", function (e) {
+    var btn = e.target.closest("button.kill");
+    if (!btn) return;
+    var pid = btn.dataset.pid;
+    if (!confirm("Are you sure you want to terminate PID " + pid + "?")) return;
+    btn.disabled = true;
+    fetch("/api/kill", { method: "POST", body: pid })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); })
+      .catch(function (err) { alert("Could not terminate PID " + pid + " (" + err.message + ")."); });
+    // No manual row removal: the next 2-second poll refreshes the table.
+  });
+
+  function setCard(id, pct, sub) {
+    var v = $(id + "-val"), b = $(id + "-bar");
+    if (pct == null) { v.innerHTML = "—<small>%</small>"; b.style.width = "0"; b.className = ""; }
+    else {
+      var p = Math.max(0, Math.min(100, pct));
+      v.innerHTML = Math.round(p) + "<small>%</small>";
+      b.style.width = p + "%"; b.className = level(p);
+    }
+    $(id + "-sub").textContent = sub || " ";
+  }
+
+  // Tolerant of the exact snapshot layout. Expected: { cpu, mem_total, mem_used, disk:{total_gb,used_gb,free_gb},
+  // cores?, uptime?, processes:[{pid,name,threads,mem}] } plus a few common aliases.
+    function applySnapshot(buf) {
+    // The backend returns an array of samples (a ring buffer). We want the latest one.
+    if (Array.isArray(buf)) {
+      if (buf.length === 0) return;
+      buf = buf[buf.length - 1]; // grab the most recent sample
+    }
+    
+    // If the object is still not a valid sample, bail out.
+    if (!buf || typeof buf !== "object") return;
+
+    var cpu = num(pick(buf, "cpu", "cpu_usage"));
+    var cores = num(pick(buf, "cores", "cpu_cores"));
+    setCard("cpu", cpu, cores ? cores + " logical cores" : "");
+
+    var mt = num(pick(buf, "mem_total"));
+    var mu = num(pick(buf, "mem_used"));
+    setCard("mem", mt && mu != null ? mu / mt * 100 : null, mt && mu != null ? fmtMB(mu) + " of " + fmtMB(mt) : "");
+
+    var dt = num(pick(buf, "disk_total"));
+    var du = num(pick(buf, "disk_used"));
+    setCard("disk", dt && du != null ? du / dt * 100 : null,
+      dt && du != null ? du.toFixed(1) + " of " + dt.toFixed(1) + " GB used" : "");
+
+    var list = pick(buf, "procs", "processes");
+    procs = (list || []).map(function (p) {
+      return { pid: num(p.pid), name: p.name == null ? "" : String(p.name), threads: num(p.threads), mem: num(pick(p, "mem", "mem_mb", "memory")) };
+    });
+    renderProcs();
+  }
+
+  var live = { busy: false, timer: null };
+  function setLive(state, text) { $("live-dot").className = "dot " + state; $("live-text").textContent = text; }
+
+  function pollNow() {
+    if (live.busy) return;
+    live.busy = true;
+    fetch("/api/snapshot", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (s) { applySnapshot(s); setLive("on", "live · " + new Date().toLocaleTimeString()); })
+      .catch(function (e) { setLive("err", "offline"); })
+      .then(function () { live.busy = false; });
+  }
+  function syncPolling() {
+    var want = current === "processes" && !document.hidden;
+    if (want && !live.timer) live.timer = setInterval(pollNow, POLL_MS);
+    if (!want && live.timer) { clearInterval(live.timer); live.timer = null; }
+  }
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && current === "processes") pollNow(); syncPolling(); });
+
+  /* ============================================================
+     Tab 2: installed software (fetch once, filter + sort client-side)
+     ============================================================ */
+  var sw = { all: [], loaded: false, loading: false, query: "" };
+  var swSort = makeSorter($("sw-table"), { key: "name", dir: 1 }, renderSoftware);
+
+  function setSwState(msg, isErr, retry) {
+    var el = $("sw-state");
+    if (!msg) { el.hidden = true; el.textContent = ""; return; }
+    el.hidden = false; el.className = "state" + (isErr ? " err" : "");
+    el.textContent = msg;
+    if (retry) {
+      var b = document.createElement("button");
+      b.className = "btn"; b.type = "button"; b.textContent = "Retry";
+      b.addEventListener("click", loadSoftware);
+      el.appendChild(document.createElement("br")); el.appendChild(b);
+    }
+  }
+
+  function renderSoftware() {
+    var terms = sw.query.toLowerCase().split(/\s+/).filter(Boolean);
+    var rows = sw.all.filter(function (r) {
+      for (var i = 0; i < terms.length; i++) if (r._hay.indexOf(terms[i]) < 0) return false;
+      return true;
+    });
+    rows.sort(function (a, b) { return cmp(a, b, swSort.key, swSort.dir) || cmp(a, b, "name", 1); });
+    $("sw-count").textContent = sw.loaded
+      ? (terms.length ? rows.length + " of " + sw.all.length : sw.all.length) + " programs" : "";
+
+    var out = [], dash = '<td class="empty">—</td>';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      out.push("<tr><td title=\"" + esc(r.name) + "\">" + esc(r.name) + "</td>" +
+        (r.version ? '<td class="mono">' + esc(r.version) + "</td>" : dash) +
+        (r.publisher ? "<td title=\"" + esc(r.publisher) + "\">" + esc(r.publisher) + "</td>" : dash) + "</tr>");
+    }
+    $("sw-body").innerHTML = out.join("");
+    if (sw.loaded) setSwState(rows.length ? "" : (sw.all.length ? "No programs match “" + sw.query.trim() + "”." : "No installed software reported."), false);
+  }
+
+  function loadSoftware() {
+    if (sw.loading) return;
+    sw.loading = true;
+    $("sw-refresh").disabled = true;
+    $("sw-body").innerHTML = "";
+    setSwState("Reading the registry…", false);
+    fetch("/api/software", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        var list = Array.isArray(data) ? data : pick(data, "software", "programs", "items") || [];
+        sw.all = list.filter(function (p) { return p && p.name; }).map(function (p) {
+          var name = String(p.name), version = p.version == null ? "" : String(p.version), publisher = p.publisher == null ? "" : String(p.publisher);
+          return { name: name, version: version, publisher: publisher, _hay: (name + " " + version + " " + publisher).toLowerCase() };
+        });
+        sw.loaded = true;
+        renderSoftware();
+      })
+      .catch(function (e) { sw.loaded = false; $("sw-count").textContent = ""; setSwState("Could not load /api/software (" + e.message + ").", true, true); })
+      .then(function () { sw.loading = false; $("sw-refresh").disabled = false; });
+  }
+
+  $("sw-refresh").addEventListener("click", loadSoftware);
+  $("sw-search").addEventListener("input", function (e) { sw.query = e.target.value; renderSoftware(); });
+  $("sw-search").addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && e.target.value) { e.target.value = ""; sw.query = ""; renderSoftware(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "/" && current === "software" && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+      e.preventDefault(); $("sw-search").focus();
+    }
+  });
+
+  /* ---------- boot ---------- */
+  show(location.hash === "#software" ? "software" : "processes");
+})();
+</script>
+</body>
+</html>

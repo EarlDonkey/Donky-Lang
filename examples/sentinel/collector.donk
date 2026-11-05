@@ -143,6 +143,17 @@ fn collector_loop(_ignored) {
     // null on startup.
     let buf = global_get("sentinel_buffer");
     if buf == null { buf = []; }
+
+    // One-time software inventory (Sentinel V2). 
+    // Wrapped in try/catch so a registry failure doesn't kill the process monitor.
+    let apps = [];
+    try {
+        apps = get_installed_programs_all();
+    } catch e {
+        print("Failed to scan registry: " + str(e));
+    }
+    global_set("sentinel_software", apps);
+
     while true {
         let sample = collect_once();
         buf = push_sample(buf, sample);

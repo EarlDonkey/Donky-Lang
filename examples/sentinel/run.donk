@@ -1,34 +1,63 @@
-// examples/sentinel/run.donk — entrypoint for Sentinel.
+// examples/sentinel/run.donk — entrypoint for Sentinel (desktop app).
 //
-// PROCESS MODEL: Option B from the brief.
+// PROCESS MODEL: Option B from the brief, adapted for a native window.
 //   * Collector on a spawn worker (thread pool, 16 workers, SEMANTICS §11.5).
-//   * HTTP accept loop on the main thread.
-//   * Shared ring buffer via global_set/global_get (see header comment in
-//     collector.donk for the concurrency argument).
+//   * HTTP accept loop on a spawn worker.
+//   * Main thread blocks in gui_webview() pointing at the local server.
 //
 // Startup order matters:
 //   1. cpu_usage() is called once to prime the C-side delta baseline, then
 //      we sleep(1000). Without this the first recorded sample has cpu == 0.
-//   2. spawn(collector_loop, 0).
-//   3. serve() — blocks forever on the main thread.
+//   2. setup_server() binds 8082 on the main thread *before* any spawn, so
+//      the port is live before the webview loads. If bind fails we still
+//      fall through (gui_webview will show a connection error, which is
+//      more useful than a silent exit).
+//   3. spawn(collector_loop, 0).
+//   4. spawn(start_server, srv) — accept loop hands off per-connection
+//      spawn(handle_client, conn) workers exactly as before.
+//   5. sleep(500) so the collector takes at least its first sample and the
+//      accept loop is scheduled before the window opens.
+//   6. gui_webview("http://localhost:8082") — blocks the main thread.
 //
 // spawn(func, arg) takes a top-level function by name and a single argument
-// (SEMANTICS §11.5). We pass 0 because collector_loop ignores its argument.
-// Do NOT spawn a closure: the AOT stores a raw code address, not a tagged
-// function value, and non-function arguments segfault the process.
+// (SEMANTICS §11.5). We pass 0 where the function ignores its argument, and
+// the server handle for start_server. Do NOT spawn a closure: the AOT stores
+// a raw code address, not a tagged function value, and non-function
+// arguments segfault the process.
 
+import "lib/winreg.donk";
+import "lib/proc.donk";
 import "examples/sentinel/collector.donk";
 import "examples/sentinel/sentinel.donk";
 
+// Top-level let: written via donky_global_set by the AOT (SEMANTICS §11.3),
+// read inside handle_client via global_get("HTML_CACHE"). See the header
+// comment in sentinel.donk.
 let HTML_CACHE = read_file("examples/sentinel/index.html");
 if HTML_CACHE == null {
     HTML_CACHE = "<!doctype html><title>Sentinel</title><p>index.html not found.</p>";
 }
 
-// Prime cpu_usage(). The runtime keeps prev_idle/prev_kernel/prev_user in
-// static storage per process; two calls >=1s apart yield a real delta.
+// 1. Prime cpu_usage(). The runtime keeps prev_idle/prev_kernel/prev_user in
+//    static storage per process; two calls >=1s apart yield a real delta.
 let _prime = cpu_usage();
 sleep(1000);
 
+// 2. Bind 8082 on the main thread so the port is live before the webview.
+let srv = setup_server();
+
+// 3. Collector worker.
 spawn(collector_loop, 0);
-serve();
+
+// 4. HTTP accept-loop worker. start_server validates srv and exits cleanly
+//    if setup_server() failed above (it will already have printed the error).
+spawn(start_server, srv);
+
+// 5. Let the collector take its first sample and the accept loop start
+//    before we open the window (avoids a flash of "null" / connection-
+//    refused on the first paint).
+sleep(500);
+
+// 6. Native window. Blocks the main thread until the user closes it; the
+//    spawned workers keep serving/collecting behind it.
+gui_webview("http://localhost:8082");

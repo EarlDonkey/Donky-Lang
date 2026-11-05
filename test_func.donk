@@ -1,8 +1,0 @@
-import "lib/functional.donk";
-
-fn double(x) { return x * 2; }
-
-let arr = [1, 2, 3];
-let doubled = map(arr, double);
-
-print(doubled); // Should print [2, 4, 6]
