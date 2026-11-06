@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 61] = [    
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 70] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -92,6 +92,15 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 61] = [
     ("getrlimit", "donky_getrlimit", 1),
     ("setrlimit", "donky_setrlimit", 3),
     ("sys_write_binary", "donky_sys_write_binary", 2),
+    ("is_valid_handle", "donky_is_valid_handle", 1),
+    ("is_null_handle", "donky_is_null_handle", 1),
+    ("dll_call_var_sig", "donky_dll_call_var_sig", 6),
+    ("tensor_add", "donky_tensor_add", 2),
+    ("tensor_mul", "donky_tensor_mul", 2),
+    ("tensor_matmul", "donky_tensor_matmul", 5),
+    ("tensor_relu", "donky_tensor_relu", 1),
+    ("tensor_softmax", "donky_tensor_softmax", 1),
+    ("tensor_sgd_step", "donky_tensor_sgd_step", 3),
 ];
 
 #[derive(Clone, Copy)]
@@ -127,7 +136,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 61], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 70], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -228,7 +237,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 61] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 70] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });
@@ -963,8 +972,7 @@ impl AotCompiler {
             }
             Expr::Number(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
             Expr::Bool(b) => {
-                let tag_base: u64 = 0x7FF8_0000_0000_0000;
-                let val = tag_base | (1 << 48) | (if *b { 1 } else { 0 });
+                let val = TAG_BASE | (TAG_BOOL_VAL << 48) | (if *b { 1 } else { 0 });
                 builder.ins().iconst(types::I64, val as i64)
             }
             Expr::String(s) => {

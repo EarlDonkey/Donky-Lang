@@ -14,3 +14,207 @@ fn json_stringify(v) {
     if len(e) > 0 { throw e; }
     return r;
 }
+// ---------------------------------------------------------------------------------
+// v3.1: array-buffer encoder, tensors
+//
+// NOTE: the native json_encode / json_pretty / json_stringify are already O(n) (the C encoder
+// grows one buffer geometrically), so nothing here fixes a quadratic path in them. These pure-Donky
+// functions follow the same discipline for code that builds JSON itself: collect pieces with
+// push(buf, piece) and join(buf, "") once at the end, never s = s + piece in a loop.
+// Numbers print via str(), so values >= 1e15 appear as plain integers rather than 1e+15
+// (same value, still valid JSON); NaN/inf become null, like the native encoder.
+// ---------------------------------------------------------------------------------
+
+fn json_escape_byte(c) {
+    if c == 34 { return bytes_to_str([92, 34]); }   // \"
+    if c == 92 { return bytes_to_str([92, 92]); }   // \\
+    if c == 10 { return bytes_to_str([92, 110]); }  // \n
+    if c == 13 { return bytes_to_str([92, 114]); }  // \r
+    if c == 9  { return bytes_to_str([92, 116]); }  // \t
+    if c == 8  { return bytes_to_str([92, 98]); }   // \b
+    if c == 12 { return bytes_to_str([92, 102]); }  // \f
+    let hex = "0123456789abcdef";
+    return bytes_to_str([92, 117, 48, 48, byte_at(hex, floor(c / 16)), byte_at(hex, c % 16)]);   // \u00xx
+}
+
+// Appends the quoted, escaped form of s to buf. Safe runs are copied as one piece (O(n)).
+fn json_quote_into(buf, s) {
+    let n = len(s);
+    push(buf, bytes_to_str([34]));
+    let run = 0;
+    let i = 0;
+    while i < n {
+        let c = byte_at(s, i);
+        if c >= 32 && c != 34 && c != 92 {
+            i = i + 1;
+            continue;
+        }
+        if i > run { push(buf, byte_substr(s, run, i)); }
+        push(buf, json_escape_byte(c));
+        run = i + 1;
+        i = i + 1;
+    }
+    if n > run { push(buf, byte_substr(s, run, n)); }
+    push(buf, bytes_to_str([34]));
+    return null;
+}
+
+fn json_quote(s) {
+    let buf = [];
+    json_quote_into(buf, str(s));
+    return join(buf, "");
+}
+
+fn json_num(x) {
+    let t = str(x);
+    if t == "nan" || t == "inf" || t == "-inf" { return "null"; }
+    return t;
+}
+
+fn json_write(buf, v, depth) {
+    if depth > 512 { throw "json_encode_buf: nesting too deep (or cyclic structure)"; }
+    let t = type(v);
+    let n = 0;
+    let i = 0;
+    if t == "number" { push(buf, json_num(v)); return null; }
+    if t == "string" { json_quote_into(buf, v); return null; }
+    if t == "bool" {
+        if v { push(buf, "true"); } else { push(buf, "false"); }
+        return null;
+    }
+    if t == "null" || t == "function" { push(buf, "null"); return null; }
+    if t == "array" {
+        n = len(v);
+        push(buf, "[");
+        while i < n {
+            if i > 0 { push(buf, ","); }
+            json_write(buf, v[i], depth + 1);
+            i = i + 1;
+        }
+        push(buf, "]");
+        return null;
+    }
+    // map, or a struct (a map tagged with __type__, whose type() is its name)
+    let ks = keys(v);
+    let kn = len(ks);
+    let j = 0;
+    push(buf, "{");
+    while j < kn {
+        let k = ks[j];
+        if j > 0 { push(buf, ","); }
+        if type(k) == "string" { json_quote_into(buf, k); }
+        else if type(k) == "number" { json_quote_into(buf, json_num(k)); }
+        else { json_quote_into(buf, "null"); }
+        push(buf, ":");
+        json_write(buf, v[k], depth + 1);
+        j = j + 1;
+    }
+    push(buf, "}");
+    return null;
+}
+
+// Pure-Donky encoder over one array buffer. Throws on cycles / depth > 512.
+fn json_encode_buf(v) {
+    let buf = [];
+    json_write(buf, v, 0);
+    return join(buf, "");
+}
+
+// ---------------------------------------------------------------- tensors
+// Wire format: {"rows":R,"cols":C,"data":[...R*C numbers, row-major...]}
+// In memory:   a map { "rows", "cols", "data" } with data a FLAT array (what lib/micrograd-style
+//              code wants). tensor_to_json also accepts nested rows [[..],[..]] for `arr`, and
+//              tensor_from_json also accepts a bare [[..],[..]] or a flat [..] (read as 1 x n).
+// NaN/inf are written as null and read back as NaN.
+
+fn tensor_dim(x, name, who) {
+    if type(x) != "number" || floor(x) != x || x < 0 {
+        throw who + ": " + name + " must be a non-negative integer";
+    }
+    return x;
+}
+
+fn tensor_cell(v, who, idx, allow_null) {
+    let t = type(v);
+    if t == "number" { return v; }
+    if t == "null" && allow_null {
+        let z = 0.0;
+        return z / z;
+    }
+    throw who + ": element " + str(idx) + " is not a number";
+}
+
+// Validated copy of data as a flat array of rows*cols numbers.
+fn tensor_flat(data, rows, cols, who, allow_null) {
+    if type(data) != "array" { throw who + ": data must be an array"; }
+    let out = [];
+    let n = len(data);
+    let nested = false;
+    if n > 0 && type(data[0]) == "array" { nested = true; }
+    if nested {
+        if n != rows { throw who + ": expected " + str(rows) + " rows, got " + str(n); }
+        let r = 0;
+        while r < n {
+            let row = data[r];
+            if type(row) != "array" || len(row) != cols {
+                throw who + ": row " + str(r) + " must be an array of " + str(cols) + " numbers";
+            }
+            let c = 0;
+            while c < cols {
+                push(out, tensor_cell(row[c], who, r * cols + c, allow_null));
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+    } else {
+        if n != rows * cols { throw who + ": expected " + str(rows * cols) + " elements (" + str(rows) + "x" + str(cols) + "), got " + str(n); }
+        let i = 0;
+        while i < n {
+            push(out, tensor_cell(data[i], who, i, allow_null));
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn tensor_to_json(arr, rows, cols) {
+    tensor_dim(rows, "rows", "tensor_to_json");
+    tensor_dim(cols, "cols", "tensor_to_json");
+    let m = {};
+    m["rows"] = rows;
+    m["cols"] = cols;
+    m["data"] = tensor_flat(arr, rows, cols, "tensor_to_json", false);
+    let s = json_encode(m);
+    let e = json_error();
+    if len(e) > 0 { throw "tensor_to_json: " + e; }
+    return s;
+}
+
+fn tensor_from_json(s) {
+    let v = json_decode(s);
+    let err = json_error();
+    if len(err) > 0 { throw "tensor_from_json: " + err; }
+    let t = type(v);
+    let rows = 0;
+    let cols = 0;
+    let data = null;
+    if t == "map" {
+        rows = v["rows"];
+        cols = v["cols"];
+        data = v["data"];
+    } else if t == "array" {
+        data = v;
+        if len(v) == 0 { rows = 0; cols = 0; }
+        else if type(v[0]) == "array" { rows = len(v); cols = len(v[0]); }
+        else { rows = 1; cols = len(v); }
+    } else {
+        throw "tensor_from_json: expected an object {rows, cols, data} or an array";
+    }
+    tensor_dim(rows, "rows", "tensor_from_json");
+    tensor_dim(cols, "cols", "tensor_from_json");
+    let out = {};
+    out["rows"] = rows;
+    out["cols"] = cols;
+    out["data"] = tensor_flat(data, rows, cols, "tensor_from_json", true);
+    return out;
+}

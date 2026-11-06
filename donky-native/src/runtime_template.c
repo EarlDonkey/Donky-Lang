@@ -1180,6 +1180,38 @@ uint64_t donky_write_file(uint64_t path_val, uint64_t content_val) {
     return BOOL_TRUE_BITS;
 }
 
+// A handle is a Donky number (dll_call_sig 'p' returns pointers/HANDLEs as numbers), so compare its
+// integer value, not the raw NaN-box word: INVALID_HANDLE_VALUE (-1 / 0xFFFFFFFFFFFFFFFF) arrives
+// as -1 or 2^64 and the old bit test (word == ~0) never matched it. Fractions, NaN and
+// non-numbers are not handles.
+static int dk_handle_bits(uint64_t v, uint64_t* out) {
+    if (!is_number(v)) return 0;
+    double d = as_number(v);
+    if (d != d || d != floor(d)) return 0;
+    if (d >= 18446744073709551615.0)       *out = UINT64_MAX;               // 2^64: an all-ones pointer
+    else if (d >= 9223372036854775808.0)   *out = (uint64_t)d;
+    else if (d <= -9223372036854775808.0)  *out = (uint64_t)INT64_MIN;
+    else                                   *out = (uint64_t)(int64_t)d;     // negatives wrap: -1 -> ~0
+    return 1;
+}
+
+// true for null and for the number 0 (a NULL pointer / NULL handle); everything else is false.
+uint64_t donky_is_null_handle(uint64_t handle_val) {
+    uint64_t bits;
+    if (handle_val == TAG_BASE) return BOOL_TRUE_BITS;
+    if (dk_handle_bits(handle_val, &bits) && bits == 0) return BOOL_TRUE_BITS;
+    return BOOL_FALSE_BITS;
+}
+
+// true for a number that is neither 0 (NULL) nor -1 / 0xFFFFFFFFFFFFFFFF (INVALID_HANDLE_VALUE).
+uint64_t donky_is_valid_handle(uint64_t handle_val) {
+        uint64_t bits;
+    if (!dk_handle_bits(handle_val, &bits) || bits == UINT64_MAX || bits == 0) {
+        return BOOL_FALSE_BITS; 
+    }
+    return BOOL_TRUE_BITS; 
+}
+
 uint64_t donky_file_exists(uint64_t path_val) {
     if (get_tag(path_val) != TAG_STRING) return BOOL_FALSE_BITS;
     FILE* f = fopen((char*)as_index(path_val), "r");
@@ -1917,34 +1949,41 @@ static void* dk_ffi_to_ptr(uint64_t v) {
     return NULL;
 }
 
-uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg_types_val, uint64_t args_val) {
+// Formats "<who>: ..." into a 256-byte buffer and throws it (used by the FFI entry points).
+#define DK_FFI_FAIL(...) do { char dk_fail[256]; snprintf(dk_fail, sizeof dk_fail, __VA_ARGS__); return dk_ffi_err(dk_fail); } while (0)
+
+// Shared by dll_call_sig (nfixed < 0) and dll_call_var_sig (nfixed = number of named parameters of
+// the variadic callee; arg_types / args then hold the fixed arguments followed by the variadic ones).
+// `who` prefixes every error. Errors name the types involved ("arg 0 expects string, got number").
+static uint64_t dk_ffi_call_core(const char* who, int nfixed, uint64_t fn_val, uint64_t ret_type_val, uint64_t arg_types_val, uint64_t args_val) {
     // Keep the args array (and the strings it owns) visible to the conservative GC stack scan
     // for the whole call: a callback may allocate, and the compiler could otherwise drop args_val.
     volatile uint64_t gc_keep = args_val;
     char msg[96];
 
-    if (!is_number(fn_val)) return dk_ffi_err("dll_call_sig: function must be a pointer from dll_sym or dll_callback");
+    if (!is_number(fn_val)) DK_FFI_FAIL("%s: function must be a pointer from dll_sym or dll_callback, got %s", who, dk_type_name(fn_val));
     uintptr_t fnaddr = (uintptr_t)dk_ffi_to_u64(fn_val);
-    if (!fnaddr) return dk_ffi_err("dll_call_sig: null function pointer");
+    if (!fnaddr) DK_FFI_FAIL("%s: null function pointer", who);
 
     if (get_tag(ret_type_val) != TAG_STRING || strlen((const char*)as_index(ret_type_val)) != 1)
-        return dk_ffi_err("dll_call_sig: return type must be a 1-char string (v i u l L f d s p)");
+        DK_FFI_FAIL("%s: return type must be a 1-char string (v i u l L f d s p), got %s", who,
+                    get_tag(ret_type_val) == TAG_STRING ? "a string of another length" : dk_type_name(ret_type_val));
     char rt = ((const char*)as_index(ret_type_val))[0];
     ffi_type* rtype = dk_ffi_type_of(rt);
-    if (!rtype) { snprintf(msg, sizeof msg, "dll_call_sig: bad return type '%c'", rt); return dk_ffi_err(msg); }
+    if (!rtype) DK_FFI_FAIL("%s: bad return type '%c'", who, rt);
 
     const char* at = "";                                   // null arg-type string = no arguments
     if (get_tag(arg_types_val) == TAG_STRING) at = (const char*)as_index(arg_types_val);
-    else if (arg_types_val != TAG_BASE) return dk_ffi_err("dll_call_sig: arg types must be a string (or null for none)");
+    else if (arg_types_val != TAG_BASE) DK_FFI_FAIL("%s: arg types must be a string (or null for none), got %s", who, dk_type_name(arg_types_val));
     size_t n = strlen(at);
-    if (n > DK_FFI_MAX_ARGS) return dk_ffi_err("dll_call_sig: too many arguments (max 32)");
+    if (n > DK_FFI_MAX_ARGS) DK_FFI_FAIL("%s: too many arguments (max 32)", who);
 
     Array* arr = NULL;
     size_t have = 0;
     if (get_tag(args_val) == TAG_ARRAY) { arr = (Array*)as_index(args_val); have = arr->len; }
-    else if (n != 0) return dk_ffi_err("dll_call_sig: args must be an array");
+    else if (n != 0) DK_FFI_FAIL("%s: args must be an array, got %s", who, dk_type_name(args_val));
     if (have != n) {
-        snprintf(msg, sizeof msg, "dll_call_sig: signature has %zu args but %zu were given", n, have);
+        snprintf(msg, sizeof msg, "%s: signature has %zu args but %zu were given", who, n, have);
         return dk_ffi_err(msg);
     }
 
@@ -1956,11 +1995,13 @@ uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg
         uint64_t v = arr->data[i];
         memset(&slots[i], 0, sizeof slots[i]);
         atypes[i] = (t == 'v') ? NULL : dk_ffi_type_of(t);
-        if (!atypes[i]) { snprintf(msg, sizeof msg, "dll_call_sig: bad arg type '%c' at position %zu", t, i); return dk_ffi_err(msg); }
+        if (!atypes[i]) DK_FFI_FAIL("%s: bad arg type '%c' at position %zu", who, t, i);
+        if (nfixed >= 0 && i >= (size_t)nfixed && t == 'f')
+            DK_FFI_FAIL("%s: arg %zu: 'f' is not allowed in the variadic part (C promotes float to double); use 'd'", who, i);
         switch (t) {
             case 'i': case 'u': case 'l': case 'L': case 'f': case 'd':
                 if (!dk_ffi_is_numeric(v)) {
-                    snprintf(msg, sizeof msg, "dll_call_sig: arg %zu ('%c') must be a number", i, t);
+                    snprintf(msg, sizeof msg, "%s: arg %zu expects number, got %s", who, i, dk_type_name(v));
                     return dk_ffi_err(msg);
                 }
                 if      (t == 'i') slots[i].i = (int32_t)dk_ffi_to_i64(v);
@@ -1974,7 +2015,7 @@ uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg
                 if (get_tag(v) == TAG_STRING) slots[i].p = (void*)(uintptr_t)as_index(v);
                 else if (v == TAG_BASE)       slots[i].p = NULL;
                 else {
-                    snprintf(msg, sizeof msg, "dll_call_sig: arg %zu ('s') must be a string or null", i);
+                    snprintf(msg, sizeof msg, "%s: arg %zu expects string, got %s", who, i, dk_type_name(v));
                     return dk_ffi_err(msg);
                 }
                 break;
@@ -1986,8 +2027,9 @@ uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg
     }
 
     ffi_cif cif;
-    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, rtype, atypes) != FFI_OK)
-        return dk_ffi_err("dll_call_sig: ffi_prep_cif failed");
+    if ((nfixed < 0 ? ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)n, rtype, atypes)
+                    : ffi_prep_cif_var(&cif, FFI_DEFAULT_ABI, (unsigned)nfixed, (unsigned)n, rtype, atypes)) != FFI_OK)
+        return dk_ffi_err(nfixed < 0 ? "dll_call_sig: ffi_prep_cif failed" : "dll_call_var_sig: ffi_prep_cif_var failed");
 
     DkFfiSlot rv;
     memset(&rv, 0, sizeof rv);
@@ -2007,6 +2049,52 @@ uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg
     }
     return TAG_BASE;
 }
+
+uint64_t donky_dll_call_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t arg_types_val, uint64_t args_val) {
+    return dk_ffi_call_core("dll_call_sig", -1, fn_val, ret_type_val, arg_types_val, args_val);
+}
+
+// dll_call_var_sig(fn, ret, fixed_types, var_types, fixed_args, var_args): call a C variadic function
+// (printf, snprintf, open, ioctl, ...) through ffi_prep_cif_var, which the plain dll_call_sig cannot do
+// correctly (variadic calls use a different ABI on x86-64 SysV and on Apple arm64).
+//   fixed_types / fixed_args  the named parameters, e.g. "pLs" and [buf, size, fmt]
+//   var_types   / var_args    the "..." part, e.g. "isd" and [42, "hi", 3.5]
+// Type chars are the dll_call_sig ones, except 'f' is rejected in the variadic part (C passes float
+// as double there: use 'd'). A null types string / null args means none. Error positions count the
+// fixed arguments first (the first variadic argument is arg <number of fixed args>).
+uint64_t donky_dll_call_var_sig(uint64_t fn_val, uint64_t ret_type_val, uint64_t fixed_types_val,
+                                uint64_t var_types_val, uint64_t fixed_args_val, uint64_t var_args_val) {
+    volatile uint64_t gc_keep[2] = { fixed_args_val, var_args_val };   // keep both arrays visible to the GC scan
+    const char* ft = "";
+    const char* vt = "";
+    if (get_tag(fixed_types_val) == TAG_STRING) ft = (const char*)as_index(fixed_types_val);
+    else if (fixed_types_val != TAG_BASE) DK_FFI_FAIL("dll_call_var_sig: fixed types must be a string (or null for none), got %s", dk_type_name(fixed_types_val));
+    if (get_tag(var_types_val) == TAG_STRING) vt = (const char*)as_index(var_types_val);
+    else if (var_types_val != TAG_BASE) DK_FFI_FAIL("dll_call_var_sig: variadic types must be a string (or null for none), got %s", dk_type_name(var_types_val));
+    size_t nf = strlen(ft), nv = strlen(vt);
+    if (nf + nv > DK_FFI_MAX_ARGS) DK_FFI_FAIL("dll_call_var_sig: too many arguments (max 32)");
+
+    Array* fa = NULL; Array* va = NULL;
+    size_t nfa = 0, nva = 0;
+    if (get_tag(fixed_args_val) == TAG_ARRAY) { fa = (Array*)as_index(fixed_args_val); nfa = fa->len; }
+    else if (fixed_args_val != TAG_BASE) DK_FFI_FAIL("dll_call_var_sig: fixed args must be an array (or null), got %s", dk_type_name(fixed_args_val));
+    if (get_tag(var_args_val) == TAG_ARRAY) { va = (Array*)as_index(var_args_val); nva = va->len; }
+    else if (var_args_val != TAG_BASE) DK_FFI_FAIL("dll_call_var_sig: variadic args must be an array (or null), got %s", dk_type_name(var_args_val));
+    if (nfa != nf) DK_FFI_FAIL("dll_call_var_sig: fixed signature has %zu args but %zu were given", nf, nfa);
+    if (nva != nv) DK_FFI_FAIL("dll_call_var_sig: variadic signature has %zu args but %zu were given", nv, nva);
+
+    char types[DK_FFI_MAX_ARGS + 1];
+    memcpy(types, ft, nf);
+    memcpy(types + nf, vt, nv);
+    types[nf + nv] = 0;
+    uint64_t all = donky_alloc_array();
+    for (size_t i = 0; i < nfa; i++) donky_array_push(all, fa->data[i]);
+    for (size_t i = 0; i < nva; i++) donky_array_push(all, va->data[i]);
+    uint64_t r = dk_ffi_call_core("dll_call_var_sig", (int)nf, fn_val, ret_type_val, donky_alloc_string(types), all);
+    (void)gc_keep;
+    return r;
+}
+#undef DK_FFI_FAIL
 
 // ---- callbacks: Donky function -> C function pointer ----
 typedef struct DkCallback {
@@ -3846,6 +3934,204 @@ uint64_t donky_sys_strftime(uint64_t ts_val, uint64_t fmt_val) {
 #undef APP
     out[o] = 0;
     return donky_alloc_string(out);
+}
+
+// ---- tensors: flat arrays of numbers -----------------------------------------------------------
+// A tensor is a plain Donky array of numbers in row-major order; a shape is passed explicitly where it
+// matters (matmul). Every function validates ALL its inputs before it allocates or mutates anything, so
+// a throw never leaves a half-written result or a half-updated weight array. Results are fresh arrays,
+// except sgd_step, which updates `weights` in place and returns it. Errors throw a string naming the
+// function, the argument (and element index) and the offending type.
+#define DK_TENSOR_MAX_DIM 2147483647.0
+
+// `v` must be an array whose every element is a number. On failure: throws, returns 0.
+static int dk_tensor_view(const char* who, const char* name, uint64_t v, Array** out) {
+    char msg[128];
+    if (is_number(v) || get_tag(v) != TAG_ARRAY) {
+        snprintf(msg, sizeof msg, "%s: %s must be an array of numbers, got %s", who, name, dk_type_name(v));
+        dk_ffi_err(msg);
+        return 0;
+    }
+    Array* a = (Array*)as_index(v);
+    for (size_t i = 0; i < a->len; i++) {
+        if (!is_number(a->data[i])) {
+            snprintf(msg, sizeof msg, "%s: %s[%zu] must be a number, got %s", who, name, i, dk_type_name(a->data[i]));
+            dk_ffi_err(msg);
+            return 0;
+        }
+    }
+    *out = a;
+    return 1;
+}
+
+// A whole number in [0, 2^31-1]. On failure: throws, returns 0.
+static int dk_tensor_dim(const char* who, const char* name, uint64_t v, size_t* out) {
+    char msg[96];
+    if (!is_number(v)) {
+        snprintf(msg, sizeof msg, "%s: %s must be a whole number, got %s", who, name, dk_type_name(v));
+        dk_ffi_err(msg);
+        return 0;
+    }
+    double d = as_number(v);
+    if (!(d >= 0.0 && d <= DK_TENSOR_MAX_DIM) || d != floor(d)) {
+        snprintf(msg, sizeof msg, "%s: %s must be a whole number in [0, 2147483647]", who, name);
+        dk_ffi_err(msg);
+        return 0;
+    }
+    *out = (size_t)d;
+    return 1;
+}
+
+// New array with exactly n slots and len == n; the caller must fill all n slots. Returns TAG_BASE
+// (with a pending throw) if the memory cannot be had.
+static uint64_t dk_tensor_alloc(const char* who, size_t n, uint64_t** data) {
+    uint64_t av = donky_alloc_array();
+    Array* arr = (Array*)as_index(av);
+    if (n) {
+        char msg[64];
+        if (n > SIZE_MAX / sizeof(uint64_t) || !(arr->data = (uint64_t*)malloc(n * sizeof(uint64_t)))) {
+            arr->data = NULL;
+            snprintf(msg, sizeof msg, "%s: out of memory", who);
+            return dk_ffi_err(msg);
+        }
+        arr->cap = n;
+        arr->len = n;
+    }
+    *data = arr->data;
+    return av;
+}
+
+// op 0: a + b, op 1: a * b (element-wise). Either operand may be a lone number (broadcast).
+static uint64_t dk_tensor_binop(const char* who, uint64_t a, uint64_t b, int op) {
+    Array* pa = NULL; Array* pb = NULL;
+    double sa = 0.0, sb = 0.0;
+    char msg[128];
+    if (is_number(a)) sa = as_number(a); else if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    if (is_number(b)) sb = as_number(b); else if (!dk_tensor_view(who, "b", b, &pb)) return TAG_BASE;
+    if (!pa && !pb) {
+        snprintf(msg, sizeof msg, "%s: at least one operand must be an array", who);
+        return dk_ffi_err(msg);
+    }
+    if (pa && pb && pa->len != pb->len) {
+        snprintf(msg, sizeof msg, "%s: shape mismatch: a has %zu elements, b has %zu", who, pa->len, pb->len);
+        return dk_ffi_err(msg);
+    }
+    size_t n = pa ? pa->len : pb->len;
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    for (size_t i = 0; i < n; i++) {
+        double x = pa ? as_number(pa->data[i]) : sa;
+        double y = pb ? as_number(pb->data[i]) : sb;
+        out[i] = make_number(op == 0 ? x + y : x * y);
+    }
+    return r;
+}
+
+// tensor_add(a, b): element-wise sum of two equal-length arrays (or an array and a number).
+uint64_t donky_tensor_add(uint64_t a, uint64_t b) { return dk_tensor_binop("tensor_add", a, b, 0); }
+
+// tensor_mul(a, b): element-wise (Hadamard) product; use tensor_matmul for the matrix product.
+uint64_t donky_tensor_mul(uint64_t a, uint64_t b) { return dk_tensor_binop("tensor_mul", a, b, 1); }
+
+// tensor_matmul(a, b, r_a, c_a, c_b): a is r_a x c_a, b is c_a x c_b (both row-major); returns the
+// r_a x c_b product as a flat array. c_a must be positive; the array lengths must match the dims.
+uint64_t donky_tensor_matmul(uint64_t a, uint64_t b, uint64_t r_a, uint64_t c_a, uint64_t c_b) {
+    const char* who = "tensor_matmul";
+    Array* pa; Array* pb;
+    size_t R, K, C;
+    char msg[160];
+    if (!dk_tensor_view(who, "a", a, &pa) || !dk_tensor_view(who, "b", b, &pb)) return TAG_BASE;
+    if (!dk_tensor_dim(who, "r_a", r_a, &R) || !dk_tensor_dim(who, "c_a", c_a, &K) || !dk_tensor_dim(who, "c_b", c_b, &C)) return TAG_BASE;
+    if (K == 0) { snprintf(msg, sizeof msg, "%s: c_a (the inner dimension) must be positive", who); return dk_ffi_err(msg); }
+    if (pa->len != R * K) {
+        snprintf(msg, sizeof msg, "%s: a has %zu elements but r_a * c_a = %zu * %zu = %zu", who, pa->len, R, K, R * K);
+        return dk_ffi_err(msg);
+    }
+    if (pb->len != K * C) {
+        snprintf(msg, sizeof msg, "%s: b has %zu elements but c_a * c_b = %zu * %zu = %zu", who, pb->len, K, C, K * C);
+        return dk_ffi_err(msg);
+    }
+    size_t n = R * C;                      // <= 2^62: cannot overflow
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    if (n) memset(out, 0, n * sizeof(uint64_t));          // all-zero bits == +0.0
+    for (size_t i = 0; i < R; i++) {
+        for (size_t k = 0; k < K; k++) {
+            double aik = as_number(pa->data[i * K + k]);
+            uint64_t* orow = out + i * C;
+            const uint64_t* brow = pb->data + k * C;
+            for (size_t j = 0; j < C; j++) {
+                double cur;
+                memcpy(&cur, &orow[j], sizeof cur);
+                cur += aik * as_number(brow[j]);
+                memcpy(&orow[j], &cur, sizeof cur);
+            }
+        }
+    }
+    for (size_t i = 0; i < n; i++) {                       // a NaN must not collide with the null tag
+        double d; memcpy(&d, &out[i], sizeof d);
+        out[i] = make_number(d);
+    }
+    return r;
+}
+
+// tensor_relu(a): max(x, 0) per element (NaN stays NaN).
+uint64_t donky_tensor_relu(uint64_t a) {
+    const char* who = "tensor_relu";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, pa->len, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    for (size_t i = 0; i < pa->len; i++) {
+        double x = as_number(pa->data[i]);
+        out[i] = make_number(x < 0.0 ? 0.0 : x);
+    }
+    return r;
+}
+
+// tensor_softmax(a): softmax over the whole array, computed as exp(x - max) / sum so large inputs
+// do not overflow. An empty array gives an empty array.
+uint64_t donky_tensor_softmax(uint64_t a) {
+    const char* who = "tensor_softmax";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t n = pa->len;
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE || n == 0) return r;
+    double m = -INFINITY;
+    for (size_t i = 0; i < n; i++) { double x = as_number(pa->data[i]); if (x > m) m = x; }
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double e = exp(as_number(pa->data[i]) - m);
+        out[i] = make_number(e);
+        sum += e;
+    }
+    for (size_t i = 0; i < n; i++) out[i] = make_number(as_number(out[i]) / sum);
+    return r;
+}
+
+// tensor_sgd_step(weights, grads, lr): weights[i] -= lr * grads[i], in place. Returns `weights`.
+uint64_t donky_tensor_sgd_step(uint64_t weights, uint64_t grads, uint64_t lr) {
+    const char* who = "tensor_sgd_step";
+    Array* pw; Array* pg;
+    char msg[128];
+    if (!dk_tensor_view(who, "weights", weights, &pw) || !dk_tensor_view(who, "grads", grads, &pg)) return TAG_BASE;
+    if (!is_number(lr)) {
+        snprintf(msg, sizeof msg, "%s: lr must be a number, got %s", who, dk_type_name(lr));
+        return dk_ffi_err(msg);
+    }
+    if (pw->len != pg->len) {
+        snprintf(msg, sizeof msg, "%s: shape mismatch: weights has %zu elements, grads has %zu", who, pw->len, pg->len);
+        return dk_ffi_err(msg);
+    }
+    double rate = as_number(lr);
+    for (size_t i = 0; i < pw->len; i++)
+        pw->data[i] = make_number(as_number(pw->data[i]) - rate * as_number(pg->data[i]));
+    return weights;
 }
 
 // ---- hashing ----

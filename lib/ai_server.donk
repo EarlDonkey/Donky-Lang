@@ -1,0 +1,230 @@
+// lib/ai_server.donk — HTTP inference layer on top of the Donky router.
+//
+// Public API:
+//   http_serve_model(router, path, model_weights, model_forward_fn)
+//       Registers POST <path>. The JSON body is parsed as an input tensor and passed to
+//       model_forward_fn(input, model_weights); the returned tensor goes back as JSON.
+//   tensor_batch(arr_of_tensors)  -> flat row-major array (n rows x d columns, n*d numbers)
+//   tensor_unbatch(flat, rows)    -> array of `rows` equal-length arrays (inverse of the above)
+//
+// A "tensor" here is a finite number, or a non-empty array nested to any depth whose leaves are
+// finite numbers. NaN and +-inf are rejected on the way in AND on the way out (json_encode would
+// otherwise silently turn them into null, SEMANTICS §8).
+//
+// ============================== ROUTER CONTRACT (ASSUMED) ==============================
+// Agent 4's router API was not available when this was written. Everything this file assumes
+// about it lives in the four ai_router_* / ai_req_* / ai_response functions in the ADAPTER block
+// below, and nowhere else. Assumed:
+//   router_post(router, path, handler)  registers handler for POST <path>
+//   handler(req)                        req is a map with "path" and "body" (both strings)
+//   handler returns a response map      {"status": number, "headers": map, "body": string}
+// If the real router differs, edit only that block. Import the router BEFORE this file
+// (import "lib/router.donk"; import "lib/ai_server.donk";) — an unresolved router function fails
+// the whole build with "unknown function" (SEMANTICS §11.20), including tensor_batch users.
+//
+// ============================== WHY IT LOOKS LIKE THIS =================================
+//   - No closures (SEMANTICS §9.2: TAG_CLOSURE unused), so a handler cannot capture the model.
+//     http_serve_model stores {weights, forward} in a global keyed by "ai_model:<path>", and one
+//     shared top-level handler (ai_model_handler) looks the model up by the request path.
+//     Consequences: register every model BEFORE the server starts taking requests (globals are
+//     not locked; concurrent handlers only read), and the router must hand the handler the same
+//     path string the model was registered under (exact match).
+//   - model_forward_fn is called as forward(input, weights). It may declare (input) or
+//     (input, weights). The spec'd signature is forward(input); weights is passed as a second
+//     argument because without closures it is the only way the function can see them.
+//   - Top-level `let` is not visible inside functions (§11.3): no file-level constants. Limits are
+//     returned by the small ai_max_* functions.
+//   - Public names are http_serve_model / tensor_*; helpers are ai_*. All names share one
+//     namespace across imports.
+//   - Memory: there is no automatic GC (§11.22) and the runtime does not collect while worker
+//     threads are active, so a long-running server grows with every request.
+
+// ---------------------------------------------------------------- limits
+
+fn ai_max_body() { return 8388608; }       // 8 MiB of request body
+
+// ---------------------------------------------------------------- ROUTER ADAPTER (edit here)
+
+fn ai_router_post(router, path, handler) {
+    router_post(router, path, handler);
+    return null;
+}
+
+fn ai_req_path(req) { return req["path"]; }
+
+fn ai_req_body(req) { return req["body"]; }
+
+fn ai_response(status, body) {
+    let headers = {};
+    headers["content-type"] = "application/json";
+    let resp = {};
+    resp["status"] = status;
+    resp["headers"] = headers;
+    resp["body"] = body;
+    return resp;
+}
+
+// ---------------------------------------------------------------- tensor helpers
+
+// Number of leaf values in a tensor, or -1 if it holds anything other than finite numbers and
+// non-empty arrays. Iterative (explicit stack) so JSON nested up to the parser's 2048-level cap
+// cannot overflow the native stack. The step budget stops a cyclic array returned by a buggy
+// model from looping forever.
+fn ai_tensor_leaves(t) {
+    let count = 0;
+    let steps = 0;
+    let stack = [t];
+    while len(stack) > 0 {
+        let node = pop(stack);
+        steps = steps + 1;
+        if steps > 16777216 { return -1; }
+        let ty = type(node);
+        if ty == "number" {
+            if !(node - node == 0.0) { return -1; }     // NaN or +-inf
+            count = count + 1;
+        } else {
+            if ty == "array" {
+                let n = len(node);
+                if n == 0 { return -1; }
+                let i = 0;
+                while i < n {
+                    push(stack, node[i]);
+                    i = i + 1;
+                }
+            } else {
+                return -1;
+            }
+        }
+    }
+    return count;
+}
+
+// Stack a list of equal-length 1D tensors into one 2D tensor stored flat, row-major:
+// [[1, 2, 3], [4, 5, 6]] -> [1, 2, 3, 4, 5, 6]. The shape is (len(tensors), len(tensors[0])).
+// Throws on an empty batch, empty rows, ragged rows, or non-number elements.
+fn tensor_batch(tensors) {
+    if type(tensors) != "array" { throw "tensor_batch: expected an array of 1D tensors"; }
+    let n = len(tensors);
+    if n == 0 { throw "tensor_batch: empty batch"; }
+    let first = tensors[0];
+    if type(first) != "array" { throw "tensor_batch: element 0 is not an array"; }
+    let d = len(first);
+    if d == 0 { throw "tensor_batch: tensors must not be empty"; }
+    let out = [];
+    let i = 0;
+    while i < n {
+        let t = tensors[i];
+        if type(t) != "array" { throw "tensor_batch: element " + str(i) + " is not an array"; }
+        if len(t) != d {
+            throw "tensor_batch: element " + str(i) + " has length " + str(len(t)) + ", expected " + str(d);
+        }
+        let j = 0;
+        while j < d {
+            let v = t[j];
+            if type(v) != "number" {
+                throw "tensor_batch: element " + str(i) + "[" + str(j) + "] is not a number";
+            }
+            push(out, v);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Inverse of tensor_batch: split a flat array into `rows` equal rows.
+// tensor_unbatch([1, 2, 3, 4, 5, 6], 2) -> [[1, 2, 3], [4, 5, 6]]
+fn tensor_unbatch(flat, rows) {
+    if type(flat) != "array" { throw "tensor_unbatch: expected a flat array"; }
+    if type(rows) != "number" { throw "tensor_unbatch: rows must be a number"; }
+    if rows < 1 || floor(rows) != rows { throw "tensor_unbatch: rows must be a positive whole number"; }
+    let n = len(flat);
+    if n == 0 || n % rows != 0 {
+        throw "tensor_unbatch: " + str(n) + " values do not split into " + str(rows) + " equal rows";
+    }
+    let d = n / rows;
+    let out = [];
+    let r = 0;
+    while r < rows {
+        let row = [];
+        let c = 0;
+        while c < d {
+            push(row, flat[r * d + c]);
+            c = c + 1;
+        }
+        push(out, row);
+        r = r + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- serving
+
+fn ai_error(status, message) {
+    let m = {};
+    m["error"] = message;
+    return ai_response(status, json_encode(m));
+}
+
+// The one handler shared by every model route (no closures, so it finds its model by path).
+fn ai_model_handler(req) {
+    let path = ai_req_path(req);
+    let model = global_get("ai_model:" + str(path));
+    if model == null { return ai_error(404, "no model registered for this path"); }
+
+    let body = ai_req_body(req);
+    if type(body) != "string" { return ai_error(400, "request body must be a JSON array of numbers"); }
+    if len(body) > ai_max_body() { return ai_error(413, "request body too large"); }
+
+    // json_decode returns null for BOTH a parse error and JSON null; json_error() tells them apart.
+    let input = json_decode(body);
+    if json_error() != "" { return ai_error(400, "invalid JSON: " + json_error()); }
+    if type(input) != "array" { return ai_error(400, "body must be a JSON array (a tensor)"); }
+    if ai_tensor_leaves(input) < 1 {
+        return ai_error(400, "tensor must be non-empty arrays of finite numbers");
+    }
+
+    let forward = model["forward"];
+    let weights = model["weights"];
+    let output = null;
+    let failed = false;
+    try {
+        output = forward(input, weights);
+    } catch e {
+        failed = true;
+        print("ai_server: forward failed for " + str(path) + ": " + str(e));
+    }
+    // Details stay in the server log; the client gets a generic message.
+    if failed { return ai_error(500, "inference failed"); }
+
+    if ai_tensor_leaves(output) < 1 {
+        print("ai_server: forward for " + str(path) + " returned a non-tensor or a non-finite value");
+        return ai_error(500, "model produced an invalid output");
+    }
+    let out_json = json_encode(output);
+    if json_error() != "" {
+        print("ai_server: could not encode output for " + str(path) + ": " + json_error());
+        return ai_error(500, "model produced an invalid output");
+    }
+    return ai_response(200, out_json);
+}
+
+// Serve a model at POST <path>.
+//   model_weights     any value; handed to model_forward_fn as its second argument
+//   model_forward_fn  fn(input) or fn(input, weights) -> tensor
+// Call once per model, at startup, before the server accepts requests. Registering the same path
+// again replaces the model, which is not safe while requests are being served.
+fn http_serve_model(router, path, model_weights, model_forward_fn) {
+    if type(path) != "string" || len(path) == 0 {
+        throw "http_serve_model: path must be a non-empty string";
+    }
+    if type(model_forward_fn) != "function" {
+        throw "http_serve_model: model_forward_fn must be a function";
+    }
+    let model = {};
+    model["weights"] = model_weights;
+    model["forward"] = model_forward_fn;
+    global_set("ai_model:" + path, model);
+    ai_router_post(router, path, ai_model_handler);
+    return null;
+}

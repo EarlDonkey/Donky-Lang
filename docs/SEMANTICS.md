@@ -631,6 +631,66 @@ Donky is a C-parity systems language. The runtime exposes raw memory, typed FFI,
 ### 14.6 OS Identity (POSIX)
 `getpwnam(name)` / `getpwuid(uid)` return `{name, uid, gid, dir, shell}`. `uname()` returns OS info. `getrlimit` / `setrlimit` manage process resources.
 
+## 15. Handles, variadic FFI, and tensors
+
+*Signatures and tensor representation below are assumed from the builtin names
+and arities; confirm against the runtime before release.*
+
+### 15.1 Handle checks
+
+| Function | Returns | Behavior |
+|---|---|---|
+| `is_valid_handle(h)` | bool | `true` if `h` is a number that is a plausible non-null handle or address (not `0`, not NaN). Does not prove the handle is live. |
+| `is_null_handle(h)` | bool | `true` if `h` is `0` or `null`. |
+
+Handles from `dll_load`, `dll_sym`, `mem_alloc`, `mmap` and `ffi_alloc` are
+numbers, and `0` means failure. Check them before use.
+
+### 15.2 `dll_call_var_sig(fn, ret_sig, fixed_sig, var_sig, fixed_args, var_args)`
+
+Calls a C variadic function such as `printf` or `snprintf`. Signature letters
+are those of §14.5 (`v i u l L f d s p`). Fixed and variadic parameters are
+described separately because the C ABI treats them differently (on x86-64 the
+callee needs to know the number of vector registers used). The Donky `float`
+type `f` is promoted to `double` in the variadic part, as in C.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `fn` | number | address from `dll_sym` |
+| `ret_sig` | string | one return letter |
+| `fixed_sig` | string | letters for the fixed parameters |
+| `var_sig` | string | letters for the variadic arguments (may be `""`) |
+| `fixed_args` | array | values for the fixed parameters |
+| `var_args` | array | values for the variadic arguments |
+
+Length mismatches between a signature and its array throw, as in
+`dll_call_sig`.
+
+```
+let libc = dll_load("libc.so.6");
+let printf = dll_sym(libc, "printf");
+dll_call_var_sig(printf, "i", "s", "id", ["%d items, %f total\n"], [3, 9.5]);
+```
+
+### 15.3 Tensors
+
+Tensors are flat arrays of numbers (row-major). A matrix is described by its
+dimensions where a function takes them. Functions throw on non-array arguments,
+non-number elements, or mismatched shapes. They return new arrays, except
+`tensor_sgd_step`, which updates in place.
+
+| Function | Returns | Behavior |
+|---|---|---|
+| `tensor_add(a, b)` | array | elementwise sum; lengths must match |
+| `tensor_mul(a, b)` | array | elementwise product; lengths must match |
+| `tensor_matmul(a, b, m, k, n)` | array | `a` is `m x k`, `b` is `k x n`; result is `m x n` |
+| `tensor_relu(a)` | array | `max(x, 0)` per element |
+| `tensor_softmax(a)` | array | softmax over the whole array |
+| `tensor_sgd_step(params, grads, lr)` | `null` | `params[i] -= lr * grads[i]` in place |
+
+Pass every argument: the compiler pads missing ones with `0.0`, which for
+`lr` means no update and for a dimension means an empty result.
+
 ## 12. Divergences from the frozen engines
 
 `interpreter.rs` and `vm.rs` are frozen and non-normative. Where they

@@ -1,4 +1,4 @@
-// lib/http.donk — thin HTTP helpers built on http_get
+// lib/http.donk — HTTP client helpers, URL helpers, and (v3.1) a router / static server / listener
 
 fn read_until(client, delim, max_bytes) {
     let buf = "";
@@ -29,6 +29,7 @@ fn get_path(raw_req) {
 }
 
 fn mime_for(path) {
+    if contains(path, ".json") { return "application/json"; }   // must precede ".js" (substring match)
     if contains(path, ".css") { return "text/css"; }
     if contains(path, ".js")  { return "text/javascript"; }
     if contains(path, ".png") { return "image/png"; }
@@ -55,7 +56,7 @@ fn http_send(method, url, body, headers) {
     return http_request(method, url, body, http_build_headers(headers));
 }
 
-fn http_post(url, body, headers) { return http_send("POST", url, body, headers); }
+// http_post(url, body, headers) lives below: it doubles as the router verb (see "Name note").
 fn http_put(url, body)           { return http_send("PUT", url, body, null); }
 fn http_delete(url)              { return http_send("DELETE", url, "", null); }
 
@@ -223,4 +224,673 @@ fn parse_url(url) {
     out["query"] = query;
     out["fragment"] = fragment;
     return out;
+}
+// =====================================================================================
+//  v3.1: router, static file server, listener
+// =====================================================================================
+//
+//   let r = http_router();
+//   http_get(r, "/", fn(req) { return "<h1>Hello</h1>"; });
+//   http_get(r, "/users/:id", fn(req) { return "user " + req["params"]["id"]; });
+//   http_get(r, "/files/*", fn(req) { return req["params"]["*"]; });
+//   http_post(r, "/echo", fn(req) { return req["body"]; });
+//   http_serve_static("public", r);          // GET fallback: files under ./public (text types only)
+//   http_listen(r, 8080);                    // never returns
+//
+// Handlers take ONE argument, the request map, and return:
+//   - a string                -> 200 (text/html if it starts with '<', else text/plain)
+//   - a response map          -> http_reply(status, type, body), http_json(v), http_redirect(url),
+//                                or any map with "status" / "type" / "body" / "headers"
+//   - null                    -> 204 No Content
+// A handler that throws produces a 500 (details go to stderr, not to the client).
+//
+// Request map: method, path (decoded), rawpath, query (map), headers (map, lower-case names),
+//              body, params (map: ":name" segments and the "*" wildcard), version.
+//
+// Handlers MUST be function values (type(h) == "function"): write fn(req) { ... }. A bare top-level
+// function name currently evaluates to a raw code address (type "number") and is rejected at
+// registration with a clear message; wrap it: fn(req) { return my_handler(req); }.
+//
+// Routing: literal paths are matched first (O(1)), then patterns in registration order. Empty
+// path segments are ignored ("/a//b" == "/a/b", trailing slash optional). HEAD falls back to GET.
+// A known path with the wrong method gets 405 + Allow; anything else gets 404.
+//
+// Name note: http_get / http_post are shared with the HTTP client. If the first argument is a
+// router they register a route; otherwise they behave exactly as the client calls always did
+// (http_get(url) -> body; http_post(url, body, headers) -> body). That keeps old callers working
+// even though a user-defined http_get shadows the builtin of the same name.
+//
+// Limits: text bodies only (strings are NUL-terminated, so binary files cannot be served),
+// Connection: close on every response, no chunked request bodies, 64 KiB headers, 1 MiB body.
+// tcp_read has no timeout, so an idle client holds one of the 16 pool workers until it closes.
+
+// ---------------------------------------------------------------- small helpers
+
+// First index of pat in s at or after from, or -1. Plain substring search.
+fn hr_find(s, pat, from) {
+    let n = len(s);
+    let m = len(pat);
+    let i = from;
+    if i < 0 { i = 0; }
+    if m == 0 { return i; }
+    let first = byte_at(pat, 0);
+    let last = n - m;
+    while i <= last {
+        if byte_at(s, i) == first {
+            let j = 1;
+            let ok = true;
+            while j < m {
+                if byte_at(s, i + j) != byte_at(pat, j) { ok = false; break; }
+                j = j + 1;
+            }
+            if ok { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn hr_trim(s) {
+    let a = 0;
+    let b = len(s);
+    while a < b && (byte_at(s, a) == 32 || byte_at(s, a) == 9) { a = a + 1; }
+    while b > a && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 13) { b = b - 1; }
+    return byte_substr(s, a, b);
+}
+
+fn hr_has_crlf(s) {
+    return contains(s, "\r") || contains(s, "\n");
+}
+
+fn hr_is_router(a) {
+    return type(a) == "map" && a["kind"] == "router";
+}
+
+fn hr_reason(code) {
+    if code == 200 { return "OK"; }
+    if code == 201 { return "Created"; }
+    if code == 202 { return "Accepted"; }
+    if code == 204 { return "No Content"; }
+    if code == 301 { return "Moved Permanently"; }
+    if code == 302 { return "Found"; }
+    if code == 303 { return "See Other"; }
+    if code == 304 { return "Not Modified"; }
+    if code == 307 { return "Temporary Redirect"; }
+    if code == 308 { return "Permanent Redirect"; }
+    if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
+    if code == 404 { return "Not Found"; }
+    if code == 405 { return "Method Not Allowed"; }
+    if code == 408 { return "Request Timeout"; }
+    if code == 409 { return "Conflict"; }
+    if code == 411 { return "Length Required"; }
+    if code == 413 { return "Payload Too Large"; }
+    if code == 415 { return "Unsupported Media Type"; }
+    if code == 422 { return "Unprocessable Entity"; }
+    if code == 429 { return "Too Many Requests"; }
+    if code == 431 { return "Request Header Fields Too Large"; }
+    if code == 500 { return "Internal Server Error"; }
+    if code == 501 { return "Not Implemented"; }
+    if code == 502 { return "Bad Gateway"; }
+    if code == 503 { return "Service Unavailable"; }
+    return "Status";
+}
+
+// ---------------------------------------------------------------- response helpers (public)
+
+// A response map. Return it from a handler. Add r["headers"] = {...} for extra headers.
+fn http_reply(status, ctype, body) {
+    let r = {};
+    r["status"] = status;
+    r["type"] = ctype;
+    r["body"] = body;
+    r["headers"] = null;
+    return r;
+}
+
+// 200 application/json from any Donky value (native encoder, O(n)).
+fn http_json(value) {
+    let s = json_encode(value);
+    let e = json_error();
+    if len(e) > 0 { throw "http_json: " + e; }
+    return http_reply(200, "application/json", s);
+}
+
+fn http_redirect(location) {
+    let r = http_reply(302, "text/plain; charset=utf-8", "");
+    let h = {};
+    h["Location"] = location;
+    r["headers"] = h;
+    return r;
+}
+
+// Parsed JSON body of a request; throws "invalid JSON body: ..." (-> 500 unless caught).
+fn http_json_body(req) {
+    let v = json_decode(req["body"]);
+    let e = json_error();
+    if len(e) > 0 { throw "invalid JSON body: " + e; }
+    return v;
+}
+
+// ---------------------------------------------------------------- wire format
+
+// Plain strings never carry CR/LF into the header block; Content-Length/Connection/etc. are ours.
+fn hr_wire(status, ctype, body, headers, head_only) {
+    let parts = [];
+    push(parts, "HTTP/1.1 " + str(status) + " " + hr_reason(status) + "\r\n");
+    let nobody = status == 204 || status == 304 || (status >= 100 && status < 200);
+    if !nobody {
+        push(parts, "Content-Type: " + ctype + "\r\n");
+        push(parts, "Content-Length: " + str(len(body)) + "\r\n");
+    }
+    if type(headers) == "map" {
+        for k in keys(headers) {
+            let ks = str(k);
+            let vs = str(headers[k]);
+            let lk = lower(ks);
+            if len(ks) > 0 && !hr_has_crlf(ks) && !hr_has_crlf(vs) && lk != "content-length" && lk != "content-type" && lk != "connection" && lk != "transfer-encoding" {
+                push(parts, ks + ": " + vs + "\r\n");
+            }
+        }
+    }
+    push(parts, "Connection: close\r\nServer: Donky\r\n\r\n");
+    if !nobody && !head_only { push(parts, body); }
+    return join(parts, "");
+}
+
+fn hr_sniff(body) {
+    let i = 0;
+    let n = len(body);
+    while i < n && (byte_at(body, i) == 32 || byte_at(body, i) == 9 || byte_at(body, i) == 10 || byte_at(body, i) == 13) { i = i + 1; }
+    if i < n && byte_at(body, i) == 60 { return "text/html; charset=utf-8"; }
+    return "text/plain; charset=utf-8";
+}
+
+// Handler return value -> response map {status, type, body, headers}.
+fn hr_normalize(v) {
+    let t = type(v);
+    if t == "null" { return http_reply(204, "text/plain; charset=utf-8", ""); }
+    if t == "string" { return http_reply(200, hr_sniff(v), v); }
+    if t == "map" && (v["status"] != null || v["body"] != null) {
+        let st = v["status"];
+        if st == null { st = 200; }
+        st = floor(num(st));
+        if !(st >= 100 && st <= 599) { st = 500; }
+        let b = v["body"];
+        if b == null { b = ""; }
+        if type(b) != "string" { b = str(b); }
+        let ty = v["type"];
+        if type(ty) != "string" { ty = hr_sniff(b); }
+        let r = http_reply(st, ty, b);
+        r["headers"] = v["headers"];
+        return r;
+    }
+    let s = str(v);
+    return http_reply(200, hr_sniff(s), s);
+}
+
+// ---------------------------------------------------------------- request parsing
+
+fn hr_fail(code, msg) {
+    let r = {};
+    r["err"] = code;
+    r["message"] = msg;
+    return r;
+}
+
+// Returns null when the peer sent nothing, a map with "err" != 0 on a protocol error,
+// otherwise the request map.
+fn hr_read_request(c) {
+    let raw = tcp_read(c, 65536);
+    if len(raw) == 0 { return null; }
+    let hend = hr_find(raw, "\r\n\r\n", 0);
+    while hend < 0 && len(raw) < 65536 {
+        let more = tcp_read(c, 65536);
+        if len(more) == 0 { break; }
+        let scan = len(raw) - 3;
+        if scan < 0 { scan = 0; }
+        raw = raw + more;
+        hend = hr_find(raw, "\r\n\r\n", scan);
+    }
+    if hend < 0 {
+        if len(raw) >= 65536 { return hr_fail(431, "Request header section too large"); }
+        return hr_fail(400, "Incomplete request");
+    }
+
+    let head = byte_substr(raw, 0, hend);
+    let eol = hr_find(head, "\r\n", 0);
+    let line = head;
+    if eol >= 0 { line = byte_substr(head, 0, eol); }
+    let sp1 = hr_find(line, " ", 0);
+    if sp1 < 1 { return hr_fail(400, "Malformed request line"); }
+    let sp2 = hr_find(line, " ", sp1 + 1);
+    if sp2 < 0 { return hr_fail(400, "Malformed request line"); }
+    let method = upper(byte_substr(line, 0, sp1));
+    let target = byte_substr(line, sp1 + 1, sp2);
+    let version = byte_substr(line, sp2 + 1, len(line));
+    if len(target) == 0 || byte_at(target, 0) != 47 { return hr_fail(400, "Bad request target"); }
+
+    let rawpath = target;
+    let qs = "";
+    let q = hr_find(target, "?", 0);
+    if q >= 0 {
+        rawpath = byte_substr(target, 0, q);
+        qs = byte_substr(target, q + 1, len(target));
+    }
+    if contains(lower(rawpath), "%00") { return hr_fail(400, "Bad path"); }
+
+    let headers = {};
+    if eol >= 0 {
+        let pos = eol + 2;
+        let hn = len(head);
+        while pos < hn {
+            let e2 = hr_find(head, "\r\n", pos);
+            if e2 < 0 { e2 = hn; }
+            let hl = byte_substr(head, pos, e2);
+            let colon = hr_find(hl, ":", 0);
+            if colon > 0 {
+                headers[lower(hr_trim(byte_substr(hl, 0, colon)))] = hr_trim(byte_substr(hl, colon + 1, len(hl)));
+            }
+            pos = e2 + 2;
+        }
+    }
+
+    if type(headers["transfer-encoding"]) == "string" {
+        return hr_fail(501, "Transfer-Encoding is not supported; send Content-Length");
+    }
+    let cl = 0;
+    let cls = headers["content-length"];
+    if type(cls) == "string" { cl = num(cls); }
+    if !(cl >= 0) { return hr_fail(400, "Bad Content-Length"); }
+    if cl > 1048576 { return hr_fail(413, "Request body too large (max 1 MiB)"); }
+
+    let body = byte_substr(raw, hend + 4, len(raw));
+    if len(body) < cl {
+        let ex = headers["expect"];
+        if type(ex) == "string" && lower(ex) == "100-continue" {
+            tcp_write(c, "HTTP/1.1 100 Continue\r\n\r\n");
+        }
+    }
+    while len(body) < cl {
+        let more2 = tcp_read(c, 65536);
+        if len(more2) == 0 { break; }
+        body = body + more2;
+    }
+    if len(body) < cl { return hr_fail(400, "Incomplete request body"); }
+    if len(body) > cl { body = byte_substr(body, 0, cl); }
+
+    let req = {};
+    req["err"] = 0;
+    req["method"] = method;
+    req["version"] = version;
+    req["rawpath"] = rawpath;
+    req["path"] = url_decode(rawpath);
+    req["query"] = url_parse_query(qs);
+    req["headers"] = headers;
+    req["body"] = body;
+    req["params"] = {};
+    return req;
+}
+
+// ---------------------------------------------------------------- routing
+
+fn http_router() {
+    let r = {};
+    r["kind"] = "router";
+    r["exact"] = {};       // "METHOD /literal/path" -> route
+    r["dyn"] = [];         // routes containing :params or a trailing *
+    r["methods"] = {};     // method -> true (for 405 Allow)
+    r["static"] = "";      // static root, "" = none
+    return r;
+}
+
+fn hr_norm(segs) {
+    return "/" + join(segs, "/");
+}
+
+// Path -> segments, each percent-decoded after splitting (so %2F stays inside one segment).
+fn hr_split_path(rawpath) {
+    let parts = split(rawpath, "/");
+    let segs = [];
+    for s in parts { push(segs, url_decode(s)); }
+    return segs;
+}
+
+fn http_route(router, method, path, handler) {
+    if !hr_is_router(router) { throw "http_route: first argument must be a router (http_router())"; }
+    if type(method) != "string" || len(method) == 0 { throw "http_route: method must be a non-empty string"; }
+    if type(path) != "string" || len(path) == 0 || byte_at(path, 0) != 47 {
+        throw "http_route: path must start with '/' (got " + str(path) + ")";
+    }
+    let m = upper(method);
+    if type(handler) != "function" {
+        throw "http_route: handler for " + m + " " + path + " must be a function value, got " + type(handler) + ". Write fn(req) { ... } (wrap a named function: fn(req) { return name(req); }).";
+    }
+
+    let segs = split(path, "/");
+    let n = len(segs);
+    let wild = false;
+    let dynamic = false;
+    let i = 0;
+    while i < n {
+        let sg = segs[i];
+        if sg == "*" {
+            if i != n - 1 { throw "http_route: '*' must be the last segment in " + path; }
+            wild = true;
+            dynamic = true;
+        } else if byte_at(sg, 0) == 58 {
+            if len(sg) < 2 { throw "http_route: empty parameter name in " + path; }
+            dynamic = true;
+        }
+        i = i + 1;
+    }
+
+    let route = {};
+    route["method"] = m;
+    route["path"] = path;
+    route["segs"] = segs;
+    route["wild"] = wild;
+    route["handler"] = handler;
+    router["methods"][m] = true;
+    if dynamic {
+        push(router["dyn"], route);
+    } else {
+        router["exact"][m + " " + hr_norm(segs)] = route;
+    }
+    return router;
+}
+
+fn router_get(router, path, handler)    { return http_route(router, "GET", path, handler); }
+fn router_post(router, path, handler)   { return http_route(router, "POST", path, handler); }
+fn router_put(router, path, handler)    { return http_route(router, "PUT", path, handler); }
+fn router_delete(router, path, handler) { return http_route(router, "DELETE", path, handler); }
+fn router_patch(router, path, handler)  { return http_route(router, "PATCH", path, handler); }
+
+// http_get(router, path, handler) registers a route; http_get(url) is the client GET.
+fn http_get(a, path, handler) {
+    if hr_is_router(a) { return http_route(a, "GET", path, handler); }
+    return http_request("GET", a, "", "");
+}
+
+// http_post(router, path, handler) registers a route; http_post(url, body, headers) is the client POST.
+fn http_post(a, b, c) {
+    if hr_is_router(a) { return http_route(a, "POST", b, c); }
+    return http_send("POST", a, b, c);
+}
+
+// Root directory for the static fallback (GET/HEAD requests no route matched).
+// Without a router it is process-wide and picked up by http_listen.
+fn http_serve_static(path, router) {
+    if type(path) != "string" || len(path) == 0 { throw "http_serve_static: path must be a non-empty string"; }
+    let root = path;
+    while len(root) > 1 && (byte_at(root, len(root) - 1) == 47 || byte_at(root, len(root) - 1) == 92) {
+        root = byte_substr(root, 0, len(root) - 1);
+    }
+    if hr_is_router(router) { router["static"] = root; } else { global_set("http:static", root); }
+    return root;
+}
+
+fn hr_match_route(route, segs) {
+    let pat = route["segs"];
+    let np = len(pat);
+    let ns = len(segs);
+    let wild = route["wild"];
+    if wild {
+        if ns < np - 1 { return null; }
+    } else {
+        if ns != np { return null; }
+    }
+    let params = {};
+    let i = 0;
+    while i < np {
+        let p = pat[i];
+        if wild && i == np - 1 {
+            let rest = [];
+            let j = i;
+            while j < ns { push(rest, segs[j]); j = j + 1; }
+            params["*"] = join(rest, "/");
+            return params;
+        }
+        if byte_at(p, 0) == 58 {
+            params[byte_substr(p, 1, len(p))] = segs[i];
+        } else if p != segs[i] {
+            return null;
+        }
+        i = i + 1;
+    }
+    return params;
+}
+
+// -> { route, params } or null
+fn hr_find_dyn(router, m, segs) {
+    let routes = router["dyn"];
+    let i = 0;
+    while i < len(routes) {
+        let route = routes[i];
+        if route["method"] == m {
+            let params = hr_match_route(route, segs);
+            if params != null {
+                let hit = {};
+                hit["route"] = route;
+                hit["params"] = params;
+                return hit;
+            }
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn hr_allowed(router, m, segs, norm) {
+    let out = [];
+    for other in keys(router["methods"]) {
+        if other != m {
+            let hit = router["exact"][other + " " + norm];
+            if hit == null { hit = hr_find_dyn(router, other, segs); }
+            if hit != null { push(out, other); }
+        }
+    }
+    return out;
+}
+
+fn hr_invoke(handler, req) {
+    let out = null;
+    let failed = false;
+    let why = "";
+    try {
+        out = handler(req);
+    } catch e {
+        failed = true;
+        why = str(e);
+    }
+    if failed {
+        sys_eputs("[http] handler error on " + req["method"] + " " + req["path"] + ": " + why + "\n");
+        return http_reply(500, "text/plain; charset=utf-8", "Internal Server Error");
+    }
+    return hr_normalize(out);
+}
+
+fn hr_dispatch(router, req) {
+    let m = req["method"];
+    if m == "HEAD" { m = "GET"; }
+    let segs = hr_split_path(req["rawpath"]);
+    let norm = hr_norm(segs);
+
+    let route = router["exact"][m + " " + norm];
+    let params = {};
+    if route == null {
+        let found = hr_find_dyn(router, m, segs);
+        if found != null {
+            route = found["route"];
+            params = found["params"];
+        }
+    }
+    if route != null {
+        req["params"] = params;
+        return hr_invoke(route["handler"], req);
+    }
+
+    if m == "GET" && len(router["static"]) > 0 {
+        let sres = hr_static(router, segs);
+        if sres != null { return sres; }
+    }
+
+    let allowed = hr_allowed(router, m, segs, norm);
+    if len(allowed) > 0 {
+        let r405 = http_reply(405, "text/plain; charset=utf-8", "Method Not Allowed");
+        let hd = {};
+        hd["Allow"] = join(allowed, ", ");
+        r405["headers"] = hd;
+        return r405;
+    }
+    return http_reply(404, "text/plain; charset=utf-8", "Not Found");
+}
+
+// ---------------------------------------------------------------- static files
+
+fn hr_ext(s) {
+    let i = len(s) - 1;
+    while i >= 0 {
+        let c = byte_at(s, i);
+        if c == 46 { return byte_substr(s, i + 1, len(s)); }
+        if c == 47 { return ""; }
+        i = i - 1;
+    }
+    return "";
+}
+
+// Text types only: file contents travel as NUL-terminated strings, so binary files would be cut off.
+fn hr_static_mime(ext) {
+    if ext == "html" || ext == "htm" { return "text/html; charset=utf-8"; }
+    if ext == "css" { return "text/css; charset=utf-8"; }
+    if ext == "js" || ext == "mjs" { return "text/javascript; charset=utf-8"; }
+    if ext == "json" || ext == "map" { return "application/json"; }
+    if ext == "txt" || ext == "md" || ext == "log" { return "text/plain; charset=utf-8"; }
+    if ext == "csv" { return "text/csv; charset=utf-8"; }
+    if ext == "xml" { return "application/xml"; }
+    if ext == "svg" { return "image/svg+xml"; }
+    if ext == "webmanifest" { return "application/manifest+json"; }
+    return "";
+}
+
+fn hr_reserved(seg) {
+    let dot = hr_find(seg, ".", 0);
+    let base = seg;
+    if dot >= 0 { base = byte_substr(seg, 0, dot); }
+    let u = upper(base);
+    if u == "CON" || u == "PRN" || u == "AUX" || u == "NUL" { return true; }
+    if len(u) == 4 {
+        let pre = byte_substr(u, 0, 3);
+        let d = byte_at(u, 3);
+        if (pre == "COM" || pre == "LPT") && d >= 49 && d <= 57 { return true; }
+    }
+    return false;
+}
+
+// Rejects: empty, dotfiles (also "." and ".."), trailing dot/space (Windows trims them),
+// control chars, / \ : * ? " < > |, and Windows device names.
+fn hr_bad_seg(s) {
+    let n = len(s);
+    if n == 0 { return true; }
+    if byte_at(s, 0) == 46 { return true; }
+    let last = byte_at(s, n - 1);
+    if last == 46 || last == 32 { return true; }
+    let i = 0;
+    while i < n {
+        let c = byte_at(s, i);
+        if c < 32 || c == 47 || c == 92 || c == 58 || c == 42 || c == 63 || c == 34 || c == 60 || c == 62 || c == 124 { return true; }
+        i = i + 1;
+    }
+    return hr_reserved(s);
+}
+
+// Response map, or null when there is no such file (caller falls through to 405/404).
+fn hr_static(router, segs) {
+    let root = router["static"];
+    let i = 0;
+    while i < len(segs) {
+        if hr_bad_seg(segs[i]) { return http_reply(403, "text/plain; charset=utf-8", "Forbidden"); }
+        i = i + 1;
+    }
+    let rel = join(segs, "/");
+    if len(segs) == 0 { rel = "index.html"; }
+    let ext = hr_ext(rel);
+    if len(ext) == 0 {
+        rel = rel + "/index.html";
+        ext = "html";
+    }
+    let full = root + "/" + rel;
+    if !file_exists(full) { return null; }
+    let mime = hr_static_mime(lower(ext));
+    if len(mime) == 0 { return http_reply(415, "text/plain; charset=utf-8", "Unsupported Media Type (text files only)"); }
+    let data = null;
+    try {
+        data = read_file(full);
+    } catch e {
+        data = null;
+    }
+    if data == null { return null; }
+    let res = http_reply(200, mime, data);
+    let hd = {};
+    hd["Cache-Control"] = "no-cache";
+    res["headers"] = hd;
+    return res;
+}
+
+// ---------------------------------------------------------------- server loop
+
+// Returns the full HTTP response text ("" if the peer sent nothing).
+fn hr_serve_conn(c, router) {
+    let req = hr_read_request(c);
+    if req == null { return ""; }
+    if req["err"] != 0 {
+        return hr_wire(req["err"], "text/plain; charset=utf-8", req["message"], null, false);
+    }
+    let res = hr_dispatch(router, req);
+    let head_only = req["method"] == "HEAD";
+    return hr_wire(res["status"], res["type"], res["body"], res["headers"], head_only);
+}
+
+// Runs on a pool thread. ctx = [client, router].
+fn hr_worker(ctx) {
+    let c = ctx[0];
+    let router = ctx[1];
+    let resp = "";
+    try {
+        resp = hr_serve_conn(c, router);
+    } catch e {
+        resp = hr_wire(500, "text/plain; charset=utf-8", "Internal Server Error", null, false);
+    }
+    if len(resp) > 0 { tcp_write(c, resp); }
+    tcp_close(c);
+    return null;
+}
+
+// Serves forever (does not return). port defaults to 8080.
+fn http_listen(router, port) {
+    if !hr_is_router(router) { throw "http_listen: first argument must be a router (http_router())"; }
+    let p = port;
+    if type(p) != "number" || p <= 0 { p = 8080; }
+    if len(router["static"]) == 0 {
+        let g = global_get("http:static");
+        if type(g) == "string" { router["static"] = g; }
+    }
+    let server = tcp_listen(p);
+    if server < 0 { throw "http_listen: could not listen on port " + str(p) + " (in use?)"; }
+    print("Donky HTTP server listening on http://localhost:" + str(p));
+    while true {
+        gc();                                   // refuses while workers are alive; collects when idle
+        let client = tcp_accept(server);
+        if client > 0 {
+            let ctx = [client, router];
+            if spawn(hr_worker, ctx) != 0 {
+                tcp_write(client, hr_wire(503, "text/plain; charset=utf-8", "Server busy", null, false));
+                tcp_close(client);
+            }
+        } else {
+            sleep(20);
+        }
+    }
+    return null;
 }
