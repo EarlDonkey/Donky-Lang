@@ -1,0 +1,832 @@
+import "transformer.donk";
+// lib/llm.donk — LLM runner: GGUF metadata -> layer loop -> transformer block -> sampling.
+//
+// Depends on (all in STDLIB_BUILTINS, runtime_template.c):
+//   mmap_model(path)                          -> {addr, size}; mmap the file
+//   read_gguf_metadata(addr)                  -> {arch, layers, d_model, n_heads,
+//                                                 n_heads_kv, ffn, tensor_data_offset}
+//   ffi_peek(ptr, size)                       -> number (1, 2, 4 or 8 bytes)
+//   ffi_peek_f32(ptr, n)                      -> array of n f64 values
+//   ffi_peek_str(ptr, n)                      -> string of n bytes
+//   ffi_peek_q4_row(ptr, row, c)              -> array of c f64 values (Q4_K row)
+//   tensor_matmul_f32(a, b, r_a, c_a, c_b)    f32 matmul (both operands arrays)
+//   tensor_matmul_q4(a, w_ptr, batch, c, r)   Q4_K GEMM: a is [batch x c],
+//                                                 W is [r x c] row-major, c % 256 == 0
+//   tensor_matmul_q6(a, w_ptr, batch, c, r)   same contract for Q6_K weights (GGML type 14)
+//   tensor_rms_norm(a)                        (via lib/transformer.donk)
+//   tensor_rope(a, pos)                       (via lib/transformer.donk)
+//   tensor_attention(q,k,v,seq,d)             (via lib/transformer.donk)
+//   tensor_silu(a)                            (via lib/transformer.donk)
+//   read_file, byte_at, substr, len, push, type, floor, exp, pow, keys, num
+//
+// AND on lib/transformer.donk (rms_norm, rope, attention, silu).
+//
+// A "tensor" here is a flat Donky array of numbers. Q4 weights live in the
+// mmap'd file; we pass the ABSOLUTE ADDRESS (a Donky number) plus the shape to
+// tensor_matmul_q4, which dequantizes on the fly inside C. Nothing is copied
+// into a GC string: the mmap'd bytes are read in place.
+//
+// POINTER MATH — read this before touching any *ptr:
+//   GGUF stores each tensor's `data_offset` relative to the START OF THE
+//   TENSOR-DATA SECTION, not relative to the file. `read_gguf_metadata` returns
+//   the file-relative offset of that section as `tensor_data_offset`.
+//   Therefore:
+//       absolute_tensor_ptr = mm["addr"] + meta["tensor_data_offset"]
+//                                                         + tensor.data_offset
+//   `model["weight_blob"]` is set to `mm["addr"] + meta["tensor_data_offset"]`
+//   (the tensor-data base). Every per-tensor pointer is
+//   `weight_blob + tensor.data_offset`. Do NOT add `tensor_data_offset` again
+//   inside llm_ptr — it is already baked into weight_blob.
+//
+// Public API:
+//   llm_load(path)                                 -> model map
+//   llm_forward(model, token_ids)                  -> logits (flat, vocab_size)
+//   llm_generate(model, prompt_ids, n, temp, topk) -> array of new token ids
+//   llm_greedy(logits)                             -> token id (argmax)
+//   llm_sample(logits, temperature, top_k)         -> token id
+//
+// GGUF layout (per https://github.com/ggerganov/ggml/blob/master/docs/gguf.md):
+//   magic "GGUF", version u32, tensor_count u64, metadata_kv_count u64,
+//   metadata KV pairs, tensor infos, (aligned) tensor data.
+// The metadata (header + KV + tensor table) is small; read_gguf_metadata parses
+// it in C and the tensor table is re-walked in Donky (llm_parse_tensor_table)
+// because read_gguf_metadata only returns the architecture fields.
+
+// ---------------------------------------------------------------- constants
+
+fn llm_gguf_magic() { return 0x46554747; }     // "GGUF" little-endian
+fn llm_max_layers() { return 256; }
+fn llm_max_vocab()  { return 320000; }
+
+// ---------------------------------------------------------------- byte helpers
+//
+// All reads are little-endian. `buf` is an absolute address (a Donky number);
+// ffi_peek(ptr, size) returns the unsigned integer at that address.
+
+fn llm_u8(addr, off) {
+    return ffi_peek(addr + off, 1.0);
+}
+
+fn llm_u16(addr, off) {
+    return ffi_peek(addr + off, 2.0);
+}
+
+fn llm_u32(addr, off) {
+    return ffi_peek(addr + off, 4.0);
+}
+
+fn llm_u64(addr, off) {
+    let lo = ffi_peek(addr + off, 4.0);
+    let hi = ffi_peek(addr + off + 4.0, 4.0);
+    return lo + hi * 4294967296.0;
+}
+
+// Read a GGUF string at `off` (u64 length + that many bytes). Returns the
+// string. The length is capped by the mmap length in the caller.
+// ffi_peek_str(ptr, n) copies n bytes from ptr into a fresh Donky string.
+fn llm_read_str(addr, off, limit) {
+    let n = llm_u64(addr, off);
+    if n < 0 || n > limit {
+        throw "llm: string length " + str(n) + " exceeds buffer";
+    }
+    return ffi_peek_str(addr + off + 8.0, n);
+}
+
+// ---------------------------------------------------------------- tensor table
+//
+// Walk the tensor infos from the mmap base address. `read_gguf_metadata` does
+// not return these, so we re-parse here. Returns name -> {dims, type,
+// data_offset, n_elements} or null if the table cannot be walked. The
+// `data_offset` stored in each entry is the tensor's offset WITHIN the
+// tensor-data section, exactly as it appears in the file — llm_ptr adds it to
+// `model["weight_blob"]`, which already includes the section base.
+//
+// The header layout we depend on:
+//   [0..4)   magic
+//   [4..8)   version u32
+//   [8..16)  tensor_count u64
+//   [16..24) metadata_kv_count u64
+//   [24..)   metadata KV pairs, then tensor infos
+// We re-skip the metadata using the same value-type sizes read_gguf_metadata
+// uses, so this function is self-contained (it does not need the C parser's
+// internals).
+fn llm_parse_tensor_table(addr) {
+    let magic = llm_u32(addr, 0);
+    if magic != llm_gguf_magic() {
+        throw "llm: not a GGUF file (bad magic at mmap base)";
+    }
+    let version = llm_u32(addr, 4.0);
+    if version < 2 || version > 3 {
+        throw "llm: unsupported GGUF version " + str(version);
+    }
+    let tensor_count = llm_u64(addr, 8.0);
+    let kv_count     = llm_u64(addr, 16.0);
+    if tensor_count < 0 || tensor_count > 65536 {
+        throw "llm: tensor_count " + str(tensor_count) + " out of range";
+    }
+    if kv_count < 0 || kv_count > 65536 {
+        throw "llm: metadata count " + str(kv_count) + " out of range";
+    }
+
+    let off = 24.0;
+    let i = 0;
+    while i < kv_count {
+        let key = llm_read_str(addr, off, 1e9);
+        off = off + 8.0 + len(key);
+        let vt = llm_u32(addr, off);
+        off = off + 4.0;
+        off = llm_skip_value(addr, off, vt);
+        i = i + 1;
+    }
+
+    let tensors = {};
+    i = 0;
+    while i < tensor_count {
+        let r = llm_read_tensor_info(addr, off);
+        let t = r[0];
+        off = r[1];
+        let dims = t["dims"];
+        let n_elem = 1.0;
+        let k = 0;
+        while k < len(dims) {
+            n_elem = n_elem * dims[k];
+            k = k + 1;
+        }
+        t["n_elements"] = n_elem;
+        tensors[t["name"]] = t;
+        i = i + 1;
+    }
+    return tensors;
+}
+
+fn llm_skip_value(addr, off, vt) {
+    if vt == 0 || vt == 1 || vt == 7 { return off + 1.0; }
+    if vt == 2 || vt == 3 { return off + 2.0; }
+    if vt == 4 || vt == 5 || vt == 6 { return off + 4.0; }
+    if vt == 10 || vt == 11 || vt == 12 { return off + 8.0; }
+    if vt == 8 {
+        let n = llm_u64(addr, off);
+        return off + 8.0 + n;
+    }
+    if vt == 9 {
+        let elem_vt = llm_u32(addr, off);
+        let count = llm_u64(addr, off + 4.0);
+        let base = off + 12.0;
+        if elem_vt == 8 {
+            let i = 0;
+            while i < count {
+                let n = llm_u64(addr, base);
+                base = base + 8.0 + n;
+                i = i + 1;
+            }
+            return base;
+        }
+        let es = llm_scalar_size(elem_vt);
+        if es < 0 { throw "llm: nested arrays are not supported"; }
+        return base + count * es;
+    }
+    throw "llm: unknown GGUF value type " + str(vt);
+}
+
+fn llm_scalar_size(vt) {
+    if vt == 0 || vt == 1 || vt == 7 { return 1.0; }
+    if vt == 2 || vt == 3 { return 2.0; }
+    if vt == 4 || vt == 5 || vt == 6 { return 4.0; }
+    if vt == 8 { return -1.0; }
+    if vt == 9 { return -2.0; }
+    if vt == 10 || vt == 11 || vt == 12 { return 8.0; }
+    throw "llm: unknown GGUF value type " + str(vt);
+}
+
+// Read one tensor info: name string, n_dims u32, dims[n_dims] u64,
+// ggml_type u32, offset u64 (offset WITHIN the tensor-data section). Returns
+// [info_map, new_offset].
+fn llm_read_tensor_info(addr, off) {
+    let name = llm_read_str(addr, off, 1e9);
+    off = off + 8.0 + len(name);
+    let n_dims = llm_u32(addr, off);
+    off = off + 4.0;
+    if n_dims < 1 || n_dims > 4 {
+        throw "llm: tensor " + name + " has " + str(n_dims) + " dims (expected 1..4)";
+    }
+    let dims = [];
+    let i = 0;
+    while i < n_dims {
+        push(dims, llm_u64(addr, off));
+        off = off + 8.0;
+        i = i + 1;
+    }
+    let ggml_type = llm_u32(addr, off);
+    off = off + 4.0;
+    let data_offset = llm_u64(addr, off);
+    off = off + 8.0;
+    let t = {};
+    t["name"]        = name;
+    t["dims"]        = dims;
+    t["type"]        = ggml_type;
+    t["data_offset"] = data_offset;
+    return [t, off];
+}
+
+// ---------------------------------------------------------------- GGUF loader
+//
+// llm_load(path) -> model map.
+//
+// POINTER MATH (the important bit):
+//   mm["addr"]                    = mmap base (file byte 0)
+//   meta["tensor_data_offset"]    = file-relative offset of the tensor-data
+//                                   section (returned by read_gguf_metadata)
+//   t["data_offset"]              = per-tensor offset WITHIN the section
+//
+//   model["weight_blob"]          = mm["addr"] + meta["tensor_data_offset"]
+//   llm_ptr(tensors, name, blob)  = blob + t["data_offset"]
+//
+// So `weight_blob + t["data_offset"]` lands exactly on the tensor's first byte.
+// Every tensor pointer in the file goes through llm_ptr / the same formula;
+// none of them should add `tensor_data_offset` a second time.
+//
+// Model map fields:
+//   arch, n_layers, n_embd, n_heads, n_heads_kv, d_head, n_ff, eps,
+//   weight_blob      (number, the TENSOR-DATA base = mmap base + section off)
+//   weight_blob_len  (number, the mapped length)
+//   tensors          (name -> {dims, type, data_offset, n_elements})
+//   layers           (array of per-layer pointer/type maps)
+//   token_embd, output, output_norm   (tensor info maps)
+//   vocab_size
+fn llm_load(path) {
+    if type(path) != "string" { throw "llm: path must be a string"; }
+
+    // 1. mmap the file directly. No read_file, no 4GB GC strings.
+    let mm = mmap_model(path);
+    if mm == null { throw "llm: mmap_model failed for " + path; }
+    let file_base = mm["addr"];
+    let len       = mm["size"];
+    if type(file_base) != "number" || file_base == 0 {
+        throw "llm: mmap_model returned a null address";
+    }
+
+    // 2. Parse GGUF metadata from the mmap'd region. The C parser also returns
+    //    the file-relative offset of the tensor-data section, which is what
+    //    converts per-tensor `data_offset`s into absolute addresses.
+    let meta = read_gguf_metadata(file_base);
+    if meta == null { throw "llm: read_gguf_metadata failed"; }
+
+    let arch               = meta["arch"];
+    let n_layers           = meta["layers"];
+    let n_embd             = meta["d_model"];
+    let n_heads            = meta["n_heads"];
+    let n_heads_kv         = meta["n_heads_kv"];
+    let n_ff               = meta["ffn"];
+    let tensor_data_offset = meta["tensor_data_offset"];
+
+    if type(tensor_data_offset) != "number" || tensor_data_offset < 0 {
+        throw "llm: read_gguf_metadata returned an invalid tensor_data_offset";
+    }
+    if n_layers < 1 || n_layers > llm_max_layers() {
+        throw "llm: n_layers " + str(n_layers) + " out of range";
+    }
+    if n_embd < 1 || n_embd > 1048576 {
+        throw "llm: n_embd " + str(n_embd) + " out of range";
+    }
+    if n_heads < 1 || n_embd % n_heads != 0 {
+        throw "llm: n_heads must divide n_embd";
+    }
+    if n_heads_kv == null { n_heads_kv = n_heads; }   // MHA models omit this
+    if n_heads_kv < 1 || n_heads % n_heads_kv != 0 {
+        throw "llm: n_heads must be a multiple of n_heads_kv";
+    }
+    let d_head = n_embd / n_heads;
+
+    // Q4_K requires the inner dimension of every GEMM to be a multiple of 256.
+    if n_embd % 256 != 0 {
+        throw "llm: n_embd " + str(n_embd) + " must be a multiple of 256 for Q4_K weights";
+    }
+    if n_ff % 256 != 0 {
+        throw "llm: n_ff " + str(n_ff) + " must be a multiple of 256 for Q4_K weights";
+    }
+    if (n_heads_kv * d_head) % 256 != 0 {
+        throw "llm: n_heads_kv * d_head must be a multiple of 256 for Q4_K weights";
+    }
+
+    let tdo = meta["tensor_data_offset"];
+    if type(tdo) != "number" || tdo < 0 {
+        throw "llm: read_gguf_metadata did not return tensor_data_offset";
+    }
+    // (data_base is computed once, below)
+    
+    // 3. Build the model map from meta. `weight_blob` is the TENSOR-DATA base,
+    //    not the file base; see the pointer-math comment above.
+    let data_base = file_base + tensor_data_offset;
+    let model = {};
+    model["arch"]            = arch;
+    model["n_layers"]        = n_layers;
+    model["n_embd"]          = n_embd;
+    model["n_heads"]         = n_heads;
+    model["n_heads_kv"]      = n_heads_kv;
+    model["d_head"]          = d_head;
+    model["n_ff"]            = n_ff;
+    model["weight_blob"]     = data_base;
+    model["weight_blob_len"] = len;
+    model["eps"]             = 0.00001;   // Llama-3 rms_norm_eps (tensor_rms_norm hardcodes the same 1e-5)
+
+    // 4. Re-walk the tensor table from the mmap'd file base (read_gguf_metadata
+    //    does not return it). Each entry's data_offset stays section-relative.
+    let tensors = llm_parse_tensor_table(file_base);
+    if tensors == null { throw "llm: llm_parse_tensor_table failed"; }
+    model["tensors"] = tensors;
+
+    // 5. Top-level tensors the forward pass needs. `output.weight` is optional
+    //    (tied-embedding models reuse token_embd); output_norm is NOT.
+    let tok = tensors["token_embd.weight"];
+    if tok == null { throw "llm: missing token_embd.weight"; }
+    model["token_embd"] = tok;
+
+    let out = tensors["output.weight"];
+    if out == null { out = tok; }
+    model["output"] = out;
+
+    let on = tensors["output_norm.weight"];
+    if on == null {
+        throw "llm: missing output_norm.weight (LLaMA requires it for the final RMSNorm)";
+    }
+    model["output_norm"] = on;
+
+    let vocab_size = tok["dims"][1];
+    if vocab_size < 1 || vocab_size > llm_max_vocab() {
+        throw "llm: vocab_size " + str(vocab_size) + " out of range";
+    }
+    model["vocab_size"] = vocab_size;
+
+    // 6. Collect layer pointers off the tensor-data base.
+    model["layers"] = llm_collect_layers(tensors, data_base);
+
+    return model;
+}
+
+// Pointer to a tensor's data: `data_base + t["data_offset"]`, where
+// `data_base` is `model["weight_blob"]` = mmap base + tensor-data-section
+// offset. The per-tensor offset is section-relative, so this is the absolute
+// address of the tensor's first byte. Do NOT add the section offset again.
+fn llm_ptr(tensors, name, data_base) {
+    let t = tensors[name];
+    if t == null { throw "llm: missing tensor " + name; }
+    return data_base + t["data_offset"];
+}
+
+fn llm_type(tensors, name) {
+    let t = tensors[name];
+    if t == null { throw "llm: missing tensor " + name; }
+    return t["type"];
+}
+
+// Build the per-layer pointer maps off the tensor-data base. Each value is
+// `data_base + tensor.data_offset`; llm_read_f32_vec / tensor_matmul_q4 accept
+// that absolute address directly. Missing tensors throw at load.
+fn llm_collect_layers(tensors, data_base) {
+    let out = [];
+    let names = keys(tensors);
+
+    // Collect blk.<N> layer indices.
+    let idxs = [];
+    let j = 0;
+    while j < len(names) {
+        let nm = names[j];
+        if len(nm) > 4 && substr(nm, 0, 4) == "blk." {
+            let dot1 = -1;
+            let k = 4;
+            while k < len(nm) {
+                if byte_at(nm, k) == 46.0 {  // '.'
+                    dot1 = k;
+                    k = len(nm);
+                } else {
+                    k = k + 1;
+                }
+            }
+            if dot1 > 4 {
+                let idx = num(substr(nm, 4, dot1));
+                if idx == floor(idx) && idx >= 0 {
+                    push(idxs, idx);
+                }
+            }
+        }
+        j = j + 1;
+    }
+
+    // De-duplicate + sort (insertion sort; n_layers <= 256).
+    let seen = {};
+    let uniq = [];
+    let i = 0;
+    while i < len(idxs) {
+        let v = idxs[i];
+        if seen[str(v)] == null {
+            seen[str(v)] = 1.0;
+            push(uniq, v);
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while i < len(uniq) {
+        let v = uniq[i];
+        let j2 = i - 1;
+        while j2 >= 0 && uniq[j2] > v {
+            uniq[j2 + 1] = uniq[j2];
+            j2 = j2 - 1;
+        }
+        uniq[j2 + 1] = v;
+        i = i + 1;
+    }
+    if len(uniq) == 0 { throw "llm: no blk.<N>.* tensors found"; }
+
+    // Build the per-layer maps. Every tensor we touch in the forward pass is
+    // validated here (llm_ptr / llm_type throw if absent).
+    i = 0;
+    while i < len(uniq) {
+        let n = uniq[i];
+        let p = "blk." + str(n) + ".";
+        let m = {};
+        m["attn_norm"]   = llm_ptr(tensors, p + "attn_norm.weight",   data_base);
+        m["attn_q"]      = llm_ptr(tensors, p + "attn_q.weight",      data_base);
+        m["attn_k"]      = llm_ptr(tensors, p + "attn_k.weight",      data_base);
+        m["attn_v"]      = llm_ptr(tensors, p + "attn_v.weight",      data_base);
+        m["attn_output"] = llm_ptr(tensors, p + "attn_output.weight", data_base);
+        m["ffn_norm"]    = llm_ptr(tensors, p + "ffn_norm.weight",    data_base);
+        m["ffn_gate"]    = llm_ptr(tensors, p + "ffn_gate.weight",    data_base);
+        m["ffn_up"]      = llm_ptr(tensors, p + "ffn_up.weight",      data_base);
+        m["ffn_down"]    = llm_ptr(tensors, p + "ffn_down.weight",    data_base);
+
+        m["attn_norm_type"]   = llm_type(tensors, p + "attn_norm.weight");
+        m["attn_q_type"]      = llm_type(tensors, p + "attn_q.weight");
+        m["attn_k_type"]      = llm_type(tensors, p + "attn_k.weight");
+        m["attn_v_type"]      = llm_type(tensors, p + "attn_v.weight");
+        m["attn_output_type"] = llm_type(tensors, p + "attn_output.weight");
+        m["ffn_norm_type"]    = llm_type(tensors, p + "ffn_norm.weight");
+        m["ffn_gate_type"]    = llm_type(tensors, p + "ffn_gate.weight");
+        m["ffn_up_type"]      = llm_type(tensors, p + "ffn_up.weight");
+        m["ffn_down_type"]    = llm_type(tensors, p + "ffn_down.weight");
+
+        push(out, m);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Weight-type dispatch for the quantized GEMM kernels. w_type is the GGML tensor type from the
+// tensor table: 12 = Q4_K, 14 = Q6_K (Q4_K_M files mix both: Q6_K for some attn_v / ffn_down
+// tensors and for output.weight). Same contract as the kernels: (a, w_ptr, batch, c, r).
+fn tf_matmul_auto(a, w_ptr, w_type, batch, c, r) {
+    if w_type == 12 { return tensor_matmul_q4(a, w_ptr, batch, c, r); }
+    if w_type == 14 { return tensor_matmul_q6(a, w_ptr, batch, c, r); }
+    throw "llm: unsupported weight type " + str(w_type);
+}
+
+// ---------------------------------------------------------------- forward pass
+//
+// llm_forward(model, token_ids) -> flat logits array of length vocab_size.
+//
+// Per layer:
+//   h  = rms_norm(x, attn_norm)
+//   q  = tensor_matmul_q4(h,  wq,  n, n_embd, n_embd)
+//   k  = tensor_matmul_q4(h,  wk,  n, n_embd, n_kv*dh)
+//   v  = tensor_matmul_q4(h,  wv,  n, n_embd, n_kv*dh)
+//   q  = rope(q); k = rope(k)
+//   a  = attention(q,k,v, ...)
+//   p  = tensor_matmul_q4(a,  wo,  n, n_embd, n_embd)
+//   x  = x + p
+//   h  = rms_norm(x, ffn_norm)
+//   g  = silu(gate_proj(h))
+//   u  = up_proj(h)
+//   a2 = g * u                       (SwiGLU)
+//   d  = tensor_matmul_q4(a2, w2,  n, n_ff, n_embd)
+//   x  = x + d
+// Then: rms_norm(x_last, output_norm) -> output projection -> logits.
+//
+// Every quantized projection goes through tf_matmul_auto (Q4_K or Q6_K, by tensor type).
+// The GEMM signature is (a, w_ptr, batch, c, r):
+//   a       [batch x c] activation matrix, row-major
+//   w_ptr   [r x c] Q4_K weight matrix, row-major, c % 256 == 0
+//   output  [batch x r]
+// so the last two shape arguments are (c, r): c is the inner (contracted)
+// dimension, r is the output width of W.
+fn llm_forward(model, token_ids) {
+    if type(model) != "map" { throw "llm_forward: model must be a map from llm_load"; }
+    if type(token_ids) != "array" { throw "llm_forward: token_ids must be an array"; }
+    let n = len(token_ids);
+    if n < 1 { throw "llm_forward: need at least one token"; }
+    let n_embd     = model["n_embd"];
+    let n_heads    = model["n_heads"];
+    let n_heads_kv = model["n_heads_kv"];
+    let d_head     = model["d_head"];
+    let n_ff       = model["n_ff"];
+    let n_layers   = model["n_layers"];
+    let eps        = model["eps"];
+    let vocab_size = model["vocab_size"];
+    let data_base  = model["weight_blob"];   // tensor-data base, not file base
+
+    // Embedding lookup. token_embd.weight is [n_embd, vocab_size] in GGUF
+    // (row-major by the last dim), so the row for token `t` starts at
+    // data_base + tok.data_offset + t * n_embd * 4 bytes (F32) or is one
+    // Q4_K row (n_embd / 256 blocks of 144 bytes). ffi_peek_f32 /
+    // ffi_peek_q4_row return f64 values.
+    let tok      = model["token_embd"];
+    let tok_ptr  = data_base + tok["data_offset"];
+    let tok_type = tok["type"];
+
+    let flat = [];
+    let t = 0;
+    while t < n {
+        let id = token_ids[t];
+        if type(id) != "number" || id < 0 || id >= vocab_size {
+            throw "llm_forward: token id " + str(id) + " out of range";
+        }
+        let row = null;
+        if tok_type == 0 {
+            // F32 embedding: 4 bytes per element.
+            let row_off = tok_ptr + id * n_embd * 4.0;
+            row = ffi_peek_f32(row_off, n_embd);
+        } else if tok_type == 12 {
+            // Q4_K embedding: one Q4_K row per token, n_embd columns.
+            row = ffi_peek_q4_row(tok_ptr, id, n_embd);
+        } else {
+            throw "llm: unsupported token_embd type " + str(tok_type);
+        }
+        if type(row) != "array" || len(row) != n_embd {
+            throw "llm_forward: failed to read embedding row for token " + str(id);
+        }
+        let j = 0;
+        while j < n_embd {
+            push(flat, row[j]);
+            j = j + 1;
+        }
+        t = t + 1;
+    }
+
+    // Layer loop.
+    let layers = model["layers"];
+    let li = 0;
+    while li < n_layers {
+        let L = layers[li];
+
+        // ---- attention sub-block ----
+        // Per-token RMSNorm. transformer.rms_norm is per-row; we loop.
+        let gamma_a = llm_read_f32_vec(L["attn_norm"], data_base, n_embd);
+        let hn = [];
+        t = 0;
+        while t < n {
+            let row = [];
+            let j = 0;
+            while j < n_embd {
+                push(row, flat[t * n_embd + j]);
+                j = j + 1;
+            }
+            let r = rms_norm(row, gamma_a, eps);
+            let j2 = 0;
+            while j2 < n_embd {
+                push(hn, r[j2]);
+                j2 = j2 + 1;
+            }
+            t = t + 1;
+        }
+
+
+        // QKV projections. GEMM shape: a is [n x n_embd]; W is [out x n_embd];
+        // result is [n x out]. So the call is (a, ptr, n, n_embd, out).
+        let q = tf_matmul_auto(hn, L["attn_q"], L["attn_q_type"], n, n_embd, n_embd);
+        let k = tf_matmul_auto(hn, L["attn_k"], L["attn_k_type"], n, n_embd, n_heads_kv * d_head);
+        let v = tf_matmul_auto(hn, L["attn_v"], L["attn_v_type"], n, n_embd, n_heads_kv * d_head);
+
+        // RoPE (cos/sin args are ignored; tensor_rope computes them).
+        q = rope(q, null, null, n, n_heads, d_head);
+        k = rope(k, null, null, n, n_heads_kv, d_head);
+
+        // Causal multi-head attention.
+        let attn = attention(q, k, v, n, n_heads, n_heads_kv, d_head);
+
+        // Output projection: W is [n_embd x n_embd], a is [n x n_embd].
+        let proj = tf_matmul_auto(attn, L["attn_output"], L["attn_output_type"], n, n_embd, n_embd);
+
+        // Residual add.
+        let h1 = [];
+        t = 0;
+        while t < n * n_embd {
+            push(h1, flat[t] + proj[t]);
+            t = t + 1;
+        }
+
+        // ---- feed-forward sub-block ----
+        let gamma_f = llm_read_f32_vec(L["ffn_norm"], data_base, n_embd);
+        let hn2 = [];
+        t = 0;
+        while t < n {
+            let row = [];
+            let j = 0;
+            while j < n_embd {
+                push(row, h1[t * n_embd + j]);
+                j = j + 1;
+            }
+            let r = rms_norm(row, gamma_f, eps);
+            let j2 = 0;
+            while j2 < n_embd {
+                push(hn2, r[j2]);
+                j2 = j2 + 1;
+            }
+            t = t + 1;
+        }
+
+        // SwiGLU: gate/up are [n_ff x n_embd], a is [n x n_embd] -> [n x n_ff].
+        let gate = tf_matmul_auto(hn2, L["ffn_gate"], L["ffn_gate_type"], n, n_embd, n_ff);
+        let up   = tf_matmul_auto(hn2, L["ffn_up"], L["ffn_up_type"], n, n_embd, n_ff);
+        let gs = silu(gate);
+        let act = [];
+        t = 0;
+        while t < n * n_ff {
+            push(act, gs[t] * up[t]);
+            t = t + 1;
+        }
+        // down: W is [n_embd x n_ff], a is [n x n_ff] -> [n x n_embd].
+        let down = tf_matmul_auto(act, L["ffn_down"], L["ffn_down_type"], n, n_ff, n_embd);
+
+        // Residual add.
+        let h2 = [];
+        t = 0;
+        while t < n * n_embd {
+            push(h2, h1[t] + down[t]);
+            t = t + 1;
+        }
+        flat = h2;
+        li = li + 1;
+    }
+
+    // Final RMSNorm + output projection on the LAST token only.
+    let last = [];
+    let j = 0;
+    while j < n_embd {
+        push(last, flat[(n - 1) * n_embd + j]);
+        j = j + 1;
+    }
+    let out_gamma = llm_read_f32_vec(
+        data_base + model["output_norm"]["data_offset"], data_base, n_embd);
+    let final_norm = rms_norm(last, out_gamma, eps);
+
+    // Output projection: W is [vocab_size x n_embd], a is [1 x n_embd].
+    let out_info = model["output"];
+    let out_ptr  = data_base + out_info["data_offset"];
+    let logits = null;
+    if out_info["type"] == 0 {
+        // F32 output: tensor_matmul_f32 takes both operands as arrays. Peek the
+        // whole [vocab_size x n_embd] matrix (large!) and call the array matmul.
+        let w = ffi_peek_f32(out_ptr, vocab_size * n_embd);
+        if type(w) != "array" || len(w) != vocab_size * n_embd {
+            throw "llm_forward: ffi_peek_f32 failed for the F32 output matrix";
+        }
+        logits = tensor_matmul_f32(final_norm, w, 1, n_embd, vocab_size);
+    } else {
+        // Quantized output (Q4_K or Q6_K): pass the pointer directly; the type picks the kernel.
+        logits = tf_matmul_auto(final_norm, out_ptr, out_info["type"], 1, n_embd, vocab_size);
+    }
+    return logits;
+}
+
+// Read `n` f32 values starting at absolute address `ptr` into a Donky array.
+// One C call: ffi_peek_f32(ptr, n) memcpy's `n` f32s and widens them to f64
+// in C, so there is no per-element ffi_peek and no llm_f32_from_bytes loop.
+fn llm_read_f32_vec(ptr, blob, n) {
+    // `blob` is kept for signature symmetry with the call sites; the pointer
+    // is absolute, so `ptr` alone is enough.
+    let v = ffi_peek_f32(ptr, n);
+    if type(v) != "array" || len(v) != n {
+        throw "llm_read_f32_vec: ffi_peek_f32 returned a bad array";
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------- sampling
+
+// llm_greedy(logits): argmax. Ties go to the lower index.
+fn llm_greedy(logits) {
+    if type(logits) != "array" || len(logits) == 0 {
+        throw "llm_greedy: logits must be a non-empty array";
+    }
+    let best = 0;
+    let i = 1;
+    while i < len(logits) {
+        if logits[i] > logits[best] { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+// llm_sample(logits, temperature, top_k): temperature + top-k, then one draw.
+// temperature <= 0 means greedy. top_k <= 0 or top_k > vocab means no truncation.
+fn llm_sample(logits, temperature, top_k) {
+    if type(logits) != "array" || len(logits) == 0 {
+        throw "llm_sample: logits must be a non-empty array";
+    }
+    if type(temperature) != "number" {
+        throw "llm_sample: temperature must be a number";
+    }
+    if type(top_k) != "number" {
+        throw "llm_sample: top_k must be a number";
+    }
+    if temperature <= 0.0 {
+        return llm_greedy(logits);
+    }
+    let n = len(logits);
+    let k = top_k;
+    if k <= 0 || k > n { k = n; }
+
+    // Partial selection of the top-k by repeated max. k is small in practice.
+    let masked = [];
+    let i = 0;
+    while i < n {
+        push(masked, 0.0);
+        i = i + 1;
+    }
+    let threshold = 0.0;
+    let pass = 0;
+    while pass < k {
+        let best = -1;
+        let bestv = 0.0;
+        i = 0;
+        while i < n {
+            if masked[i] == 0.0 {
+                let v = logits[i];
+                if best < 0 || v > bestv {
+                    best = i;
+                    bestv = v;
+                }
+            }
+            i = i + 1;
+        }
+        if best < 0 { break; }
+        masked[best] = 1.0;
+        threshold = bestv;
+        pass = pass + 1;
+    }
+
+    // Softmax over the top-k with temperature.
+    let sum = 0.0;
+    let probs = [];
+    i = 0;
+    while i < n {
+        push(probs, 0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        if masked[i] != 0.0 {
+            let p = exp((logits[i] - threshold) / temperature);
+            probs[i] = p;
+            sum = sum + p;
+        }
+        i = i + 1;
+    }
+    if !(sum > 0.0) { return llm_greedy(logits); }
+
+    let r = random(1000000) / 1000000.0;
+    let acc = 0.0;
+    i = 0;
+    while i < n {
+        if masked[i] != 0.0 {
+            acc = acc + probs[i] / sum;
+            if r < acc { return i; }
+        }
+        i = i + 1;
+    }
+    // Floating-point undershoot: return the last unmasked index.
+    i = n - 1;
+    while i >= 0 {
+        if masked[i] != 0.0 { return i; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- generation
+//
+// llm_generate(model, prompt_ids, n_tokens, temperature, top_k) -> new token ids.
+// Re-runs the full forward pass for every new token (no KV cache; see the
+// caveat in the header comment).
+fn llm_generate(model, prompt_ids, n_tokens, temperature, top_k) {
+    if type(prompt_ids) != "array" || len(prompt_ids) == 0 {
+        throw "llm_generate: prompt_ids must be a non-empty array";
+    }
+    if type(n_tokens) != "number" || n_tokens < 0 || n_tokens != floor(n_tokens) {
+        throw "llm_generate: n_tokens must be a non-negative whole number";
+    }
+    let ctx = [];
+    let i = 0;
+    while i < len(prompt_ids) {
+        push(ctx, prompt_ids[i]);
+        i = i + 1;
+    }
+    let out = [];
+    let step = 0;
+    while step < n_tokens {
+        let logits = llm_forward(model, ctx);
+        let next = llm_sample(logits, temperature, top_k);
+        push(out, next);
+        push(ctx, next);
+        step = step + 1;
+    }
+    return out;
+}

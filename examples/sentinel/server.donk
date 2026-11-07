@@ -1,0 +1,438 @@
+// examples/sentinel/server.donk — Sentinel V3 HTTP server.
+//
+// Supersedes examples/sentinel/sentinel.donk for V3. Same routes as V2
+// (/, /api/snapshot, /api/latest, /api/software, /api/kill) plus:
+//
+//   POST /api/chat   body: {"cpu": <pct>, "mem": <pct>, "procs": <count>,
+//                           "disk": <pct>, "threads": <n>, "load": <pct>}
+//                    resp: {"message": "...", "action": "..."}
+//
+// The /api/chat handler runs the body metrics through the Sentinel V3 MLP
+// (lib/neural.donk) and maps the argmax class to a canned response. Class
+// order is [Normal, High CPU, High Mem] — the same order the weights are
+// exported in by the training script.
+//
+// Model weights are NOT defined here. They live in run.donk and are
+// installed via global_set before setup_server() runs; handle_chat reads
+// them with global_get("AI_W1") .. global_get("AI_B2"). Top-level `let`
+// in an imported file does not execute, so defining them here would leave
+// the globals null and /api/chat would 500 with "model not loaded".
+//
+// HANG FIX (V3.1): read_body no longer issues a second blocking tcp_read.
+// A client that sent headers then stalled would pin one of the 16 spawn-pool
+// workers forever (SEMANTICS §11.5); 16 such clients deadlocked the server.
+// respond() now guarantees tcp_close even if tcp_write throws, closing an
+// fd-leak path on peer reset. See the comments on read_body and respond.
+//
+// Wiring in run.donk (V3):
+//   import "lib/winreg.donk";
+//   import "lib/proc.donk";
+//   import "lib/neural.donk";
+//   import "examples/sentinel/collector.donk";
+//   import "examples/sentinel/server.donk";   // <- replaces sentinel.donk
+//   ...
+//   global_set("AI_W1", AI_W1); ...           // before setup_server()
+//   spawn(start_server, srv);                 // unchanged
+
+// ---------------------------------------------------------------------------
+// read_request(client) -> string. Reads until "\r\n\r\n" or peer close.
+// Identical to V2 sentinel.donk.
+// ---------------------------------------------------------------------------
+fn read_request(client) {
+    let buf = "";
+    while len(buf) < 8192 {
+        let chunk = tcp_read(client, 4096);
+        if len(chunk) == 0 {
+            return "";
+        }
+        buf = buf + chunk;
+        if contains(buf, "\r\n\r\n") {
+            return buf;
+        }
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// request_path(raw) -> "/...".
+// ---------------------------------------------------------------------------
+fn request_path(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return "/"; }
+    let parts = split(lines[0], " ");
+    if len(parts) < 2 { return "/"; }
+    return parts[1];
+}
+
+fn request_method(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return ""; }
+    let parts = split(lines[0], " ");
+    if len(parts) == 0 { return ""; }
+    return parts[0];
+}
+
+fn header_value(raw, name) {
+    let lines = split(raw, "\r\n");
+    let i = 1;
+    while i < len(lines) {
+        let parts = split(lines[i], " ");
+        if len(parts) >= 2 {
+            if lower(parts[0]) == name { return parts[1]; }
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn request_body(raw) {
+    // A pure-Donky search for "\r\n\r\n" so we don't need a `find` builtin.
+    let len_raw = len(raw);
+    let i = 0;
+    let split_idx = -1;
+    while i < len_raw - 3 {
+        if substr(raw, i, i + 4) == "\r\n\r\n" {
+            split_idx = i + 4;
+            break;
+        }
+        i = i + 1;
+    }
+    if split_idx == -1 { return ""; }
+    return substr(raw, split_idx, len_raw);
+}
+
+fn read_body(conn_id, raw, max_len) {
+    let cl = header_value(raw, "content-length:");
+    if cl == null { return ""; }
+    let want = num(cl);
+    if want < 1 || want > max_len { return ""; }
+    
+    let body = request_body(raw);
+    
+    // If the body is incomplete, keep reading from the socket.
+    // The Lead Architect noted we should truncate to 'want' in case tcp_read over-returns.
+    while len(body) < want {
+        let chunk = tcp_read(conn_id, want - len(body));
+        if len(chunk) == 0 {
+            break; // Connection closed early
+        }
+        body = body + chunk;
+    }
+    
+    // Strict Content-Length truncation (protects against trailing garbage)
+    if len(body) > want {
+        body = substr(body, 0, want);
+    }
+    
+    return body;
+}
+
+fn origin_refused(raw) {
+    let o = header_value(raw, "origin:");
+    if o == null { return false; }
+    let v = lower(o);
+    if v == "http://localhost:8082" { return false; }
+    if v == "http://127.0.0.1:8082" { return false; }
+    return true;
+}
+
+fn is_pid_text(s) {
+    let n = len(s);
+    if n < 1 || n > 10 { return false; }
+    let i = 0;
+    while i < n {
+        if contains("0123456789", substr(s, i, i + 1)) {
+            i = i + 1;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// respond(client, status_line, mime, body) -> null. One write, one close.
+// tcp_write is wrapped in try/catch so a peer reset mid-write does not skip
+// the tcp_close and leak the fd. The worker's exit path is what matters,
+// not whether the bytes reached the client.
+// ---------------------------------------------------------------------------
+fn respond(client, status_line, mime, body) {
+    let resp = "HTTP/1.1 " + status_line + "\r\n"
+             + "Content-Type: " + mime + "\r\n"
+             + "Content-Length: " + str(len(body)) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Access-Control-Allow-Origin: *\r\n"
+             + "Connection: close\r\n"
+             + "\r\n"
+             + body;
+    try {
+        tcp_write(client, resp);
+    } catch e {
+        // Peer reset mid-write. Log and fall through to the close.
+        print("server: tcp_write failed: " + str(e));
+    }
+    tcp_close(client);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/chat. Body: {"cpu": <pct 0..100>, "mem": <pct 0..100>,
+//                       "procs": <count>, "disk": <pct>, "threads": <n>,
+//                       "load": <pct>}  — all optional, default 0.
+//
+// Response: {"message": "...", "action": "None" | "kill_chrome" | "suggest_mem"}
+//
+// Weights (AI_W1, AI_B1, AI_W2, AI_B2) are installed by run.donk via
+// global_set before the server starts. They are read here with global_get,
+// the same pattern the V2 HTML_CACHE escape hatch uses (SEMANTICS §11.3).
+// ---------------------------------------------------------------------------
+
+// Safe numeric read: missing / non-number / NaN -> 0. Used for the wire
+// fields, which are all optional.
+fn chat_num(m, key) {
+    if type(m) != "map" { return 0.0; }
+    let v = m[key];
+    if type(v) != "number" { return 0.0; }
+    if v - v != 0.0 { return 0.0; }       // NaN / inf
+    return v;
+}
+
+// chat_num + clamp to [lo, hi]. Keeps hostile input like {"cpu": 1e9}
+// from producing a message like "CPU is at 1000000000%".
+fn chat_num_clamped(m, key, lo, hi) {
+    let v = chat_num(m, key);
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+// Clamp a raw percentage to 0..1 after dividing. NaN/inf -> 0.
+fn chat_norm(pct, divisor) {
+    if type(pct) != "number" { return 0.0; }
+    if pct - pct != 0.0 { return 0.0; }   // NaN / inf
+    let v = pct / divisor;
+    if v < 0.0 { return 0.0; }
+    if v > 1.0 { return 1.0; }
+    return v;
+}
+
+fn chat_error_body(msg) {
+    let m = {};
+    m["error"] = msg;
+    return json_encode(m);
+}
+
+fn handle_chat(conn_id, raw) {
+    if request_method(raw) != "POST" {
+        respond(conn_id, "405 Method Not Allowed", "application/json",
+                chat_error_body("use POST"));
+        return null;
+    }
+    if origin_refused(raw) {
+        respond(conn_id, "403 Forbidden", "application/json",
+                chat_error_body("cross-origin request refused"));
+        return null;
+    }
+
+    let body = read_body(conn_id, raw, 8192);
+    if len(body) == 0 {
+        // Covers both "no Content-Length / too large" and "body did not
+        // arrive in the same segment as the headers" (see read_body).
+        respond(conn_id, "400 Bad Request", "application/json",
+                chat_error_body("empty or split body"));
+        return null;
+    }
+
+    let obj = json_decode(body);
+    if json_error() != "" {
+        respond(conn_id, "400 Bad Request", "application/json",
+                chat_error_body("invalid JSON: " + json_error()));
+        return null;
+    }
+    if type(obj) != "map" {
+        respond(conn_id, "400 Bad Request", "application/json",
+                chat_error_body("body must be a JSON object"));
+        return null;
+    }
+
+    // Raw percentages, clamped for the human-readable message. The network
+    // input is derived from the same values via chat_norm below.
+    let cpu_pct = chat_num_clamped(obj, "cpu", 0.0, 100.0);
+    let mem_pct = chat_num_clamped(obj, "mem", 0.0, 100.0);
+
+    // Flat 6-vector, normalised to 0..1. Order MUST match the weight export:
+    //   [cpu, mem, procs/400, disk/100, threads/4000, load/100]
+    let x = [];
+    push(x, chat_norm(cpu_pct, 100.0));
+    push(x, chat_norm(mem_pct, 100.0));
+    push(x, chat_norm(chat_num_clamped(obj, "procs",   0.0, 100000.0), 400.0));
+    push(x, chat_norm(chat_num_clamped(obj, "disk",    0.0, 100.0),   100.0));
+    push(x, chat_norm(chat_num_clamped(obj, "threads", 0.0, 1000000.0), 4000.0));
+    push(x, chat_norm(chat_num_clamped(obj, "load",    0.0, 100.0),   100.0));
+
+    // Read the model from the global map. If run.donk forgot to set these,
+    // fail loudly with a 500 rather than silently returning garbage.
+    let w1 = global_get("AI_W1");
+    let b1 = global_get("AI_B1");
+    let w2 = global_get("AI_W2");
+    let b2 = global_get("AI_B2");
+    if w1 == null || b1 == null || w2 == null || b2 == null {
+        print("server: /api/chat model weights not installed (run.donk must global_set AI_W1..AI_B2)");
+        respond(conn_id, "500 Internal Server Error", "application/json",
+                chat_error_body("model not loaded"));
+        return null;
+    }
+
+    let probs = null;
+    try {
+        probs = mlp_forward(x, 6, w1, b1, 8, w2, b2, 3);
+    } catch e {
+        print("server: /api/chat forward failed: " + str(e));
+        respond(conn_id, "500 Internal Server Error", "application/json",
+                chat_error_body("inference failed"));
+        return null;
+    }
+
+    // probs is guaranteed length 3 by mlp_forward's contract (tensor_softmax_f32
+    // on a non-empty out_dim=3 logit vector). No need for a second try/catch.
+    let k = mlp_classify(probs);
+
+    // Class order: [Normal, High CPU, High Mem].
+    let msg = "System is healthy.";
+    let action = "None";
+    if k == 1 {
+        msg = "CPU is at " + str(floor(cpu_pct + 0.5)) + "%. I recommend closing Chrome.";
+        action = "kill_chrome";
+    } else if k == 2 {
+        msg = "Memory is at " + str(floor(mem_pct + 0.5)) + "%. Close unused tabs.";
+        action = "suggest_mem";
+    }
+
+    let out = {};
+    out["message"] = msg;
+    out["action"] = action;
+    respond(conn_id, "200 OK", "application/json", json_encode(out));
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// handle_client(conn_id) -> null.
+// ---------------------------------------------------------------------------
+fn handle_client(conn_id) {
+    let raw = read_request(conn_id);
+    if len(raw) == 0 {
+        tcp_close(conn_id);
+        return null;
+    }
+    let path = request_path(raw);
+
+    if path == "/" || path == "/index.html" {
+        // HTML_CACHE is set by run.donk at top level (global_set via AOT
+        // §11.3). Fall back to reading the file so a stale cache doesn't
+        // shadow a hot-reloaded index.html during development.
+        let html = global_get("HTML_CACHE");
+        if html == null {
+            html = read_file("examples/sentinel/index.html");
+        }
+        if html == null {
+            html = "<!doctype html><title>Sentinel V3</title><p>index.html not found.</p>";
+        }
+        respond(conn_id, "200 OK", "text/html; charset=utf-8", html);
+        return null;
+    }
+
+    if path == "/api/snapshot" {
+        let buf = global_get("sentinel_buffer");
+        if buf == null { buf = []; }
+        respond(conn_id, "200 OK", "application/json", json_encode(buf));
+        return null;
+    }
+
+    if path == "/api/latest" {
+        let buf = global_get("sentinel_buffer");
+        if buf == null || len(buf) == 0 {
+            respond(conn_id, "200 OK", "application/json", "null");
+            return null;
+        }
+        let latest = buf[len(buf) - 1];
+        respond(conn_id, "200 OK", "application/json", json_encode(latest));
+        return null;
+    }
+
+    if path == "/api/software" {
+        respond(conn_id, "200 OK", "application/json",
+                json_encode(global_get("sentinel_software")));
+        return null;
+    }
+
+    if path == "/api/chat" {
+        handle_chat(conn_id, raw);
+        return null;
+    }
+
+    if path == "/api/kill" {
+        if request_method(raw) != "POST" {
+            respond(conn_id, "405 Method Not Allowed", "text/plain; charset=utf-8", "use POST");
+            return null;
+        }
+        if origin_refused(raw) {
+            respond(conn_id, "403 Forbidden", "text/plain; charset=utf-8", "cross-origin request refused");
+            return null;
+        }
+        let toks = split(read_body(conn_id, raw, 32), " \r\n");
+        let text = "";
+        if len(toks) == 1 { text = toks[0]; }
+        if is_pid_text(text) {
+            let pid = num(text);
+            if pid < 1 || pid > 4294967295 {
+                respond(conn_id, "400 Bad Request", "text/plain; charset=utf-8", "bad pid");
+                return null;
+            }
+            if kill_proc(pid) {
+                respond(conn_id, "200 OK", "text/plain; charset=utf-8", "ok");
+            } else {
+                respond(conn_id, "500 Internal Server Error", "text/plain; charset=utf-8", "kill failed");
+            }
+            return null;
+        }
+        respond(conn_id, "400 Bad Request", "text/plain; charset=utf-8", "bad pid");
+        return null;
+    }
+
+    let body = "not found: " + path;
+    respond(conn_id, "404 Not Found", "text/plain; charset=utf-8", body);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// setup_server() -> server handle (int) or null. Unchanged from V2.
+// ---------------------------------------------------------------------------
+fn setup_server() {
+    let port = 8082;
+    let server = tcp_listen(port);
+    if server == null || server < 0 {
+        print("sentinel: tcp_listen(" + str(port) + ") failed");
+        return null;
+    }
+    print("sentinel: listening on http://localhost:" + str(port) + "/");
+    return server;
+}
+
+// ---------------------------------------------------------------------------
+// start_server(server_handle) -> null (never returns). Unchanged from V2.
+// ---------------------------------------------------------------------------
+fn start_server(server_handle) {
+    if server_handle == null || server_handle < 0 {
+        print("sentinel: start_server called with invalid handle");
+        return null;
+    }
+    while true {
+        let conn = tcp_accept(server_handle);
+        if conn == null || conn < 0 {
+            sleep(50);
+        } else {
+            spawn(handle_client, conn);
+        }
+    }
+    return null;
+}

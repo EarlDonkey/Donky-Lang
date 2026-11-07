@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 70] = [    
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 86] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -101,6 +101,23 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 70] = [
     ("tensor_relu", "donky_tensor_relu", 1),
     ("tensor_softmax", "donky_tensor_softmax", 1),
     ("tensor_sgd_step", "donky_tensor_sgd_step", 3),
+    ("tensor_matmul_f32", "donky_tensor_matmul_f32", 5),
+    ("tensor_relu_f32", "donky_tensor_relu_f32", 1),
+    ("tensor_softmax_f32", "donky_tensor_softmax_f32", 1),
+    ("tensor_rms_norm",  "donky_tensor_rms_norm",  1),
+    ("tensor_rope",      "donky_tensor_rope",      2),
+    ("tensor_attention", "donky_tensor_attention", 5),
+    ("tensor_silu",      "donky_tensor_silu",      1),
+    ("sin", "donky_sin", 1),
+    ("cos", "donky_cos", 1),
+    ("mmap_model",         "donky_mmap_model",         1),
+    ("read_gguf_metadata", "donky_read_gguf_metadata", 1),
+    ("tensor_matmul_q4",   "donky_tensor_matmul_q4",   5),
+    ("ffi_peek_f32", "donky_ffi_peek_f32", 2),
+    ("ffi_peek_str", "donky_ffi_peek_str", 2),
+    ("ffi_peek_q4_row", "donky_ffi_peek_q4_row", 3),
+    ("tensor_matmul_q6", "donky_tensor_matmul_q6", 5),
+
 ];
 
 #[derive(Clone, Copy)]
@@ -136,7 +153,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 70], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 86], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -237,7 +254,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 70] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 86] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });

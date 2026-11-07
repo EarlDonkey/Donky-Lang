@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sentinel V2</title>
+<title>Sentinel V3</title>
 <style>
   :root {
     --bg: #0a0a0c;
@@ -133,6 +133,43 @@
   .btn:hover { border-color: var(--copper); color: var(--amber); }
   .btn:disabled { opacity: .5; cursor: wait; }
 
+  /* ---------- chat ---------- */
+  .chat-fab {
+    position: fixed; right: 22px; bottom: 22px; z-index: 40;
+    width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--line);
+    background: linear-gradient(140deg, var(--amber), #b4682c); color: #1a1208;
+    font: inherit; font-weight: 700; cursor: pointer; box-shadow: 0 6px 22px rgba(0,0,0,.5), 0 0 18px var(--copper-glow);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .chat-fab:hover { filter: brightness(1.06); }
+  .chat {
+    position: fixed; right: 22px; bottom: 86px; z-index: 41;
+    width: 360px; max-width: calc(100vw - 32px); height: 440px; max-height: calc(100vh - 140px);
+    display: flex; flex-direction: column;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+    box-shadow: 0 18px 50px rgba(0,0,0,.6);
+  }
+  .chat[hidden] { display: none; }
+  .chat-head {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    border-bottom: 1px solid var(--line); background: var(--raised);
+  }
+  .chat-head strong { color: var(--amber); font-size: 13px; }
+  .chat-head .ctx { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-left: auto; }
+  .chat-log { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 88%; padding: 8px 11px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--copper-glow); border: 1px solid #4a3220; color: var(--text); }
+  .msg.bot  { align-self: flex-start; background: var(--raised); border: 1px solid var(--line); color: var(--text); }
+  .msg.bot.err { border-color: #4a2a26; color: #ff8a7a; }
+  .msg .kill-inline { margin-top: 8px; display: block; }
+  .chat-form { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--line); background: var(--raised); }
+  .chat-form input {
+    flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 11px; font: inherit;
+  }
+  .chat-form input:focus { outline: none; border-color: var(--copper); box-shadow: 0 0 0 3px var(--copper-glow); }
+  .chat-form input::placeholder { color: var(--dim); }
+
   @media (max-width: 640px) {
     .bar { gap: 12px; padding: 0 12px; }
     .brand small, .live span { display: none; }
@@ -148,7 +185,7 @@
 
 <header>
   <div class="bar">
-    <div class="brand"><i></i>Sentinel <small>V2</small></div>
+    <div class="brand"><i></i>Sentinel <small>V3</small></div>
     <nav role="tablist" aria-label="Views">
       <button class="tab" role="tab" id="tab-processes" aria-controls="view-processes" aria-selected="true" data-view="processes">Processes</button>
       <button class="tab" role="tab" id="tab-software" aria-controls="view-software" aria-selected="false" data-view="software" tabindex="-1">Installed Software</button>
@@ -229,6 +266,18 @@
     </div>
   </section>
 </main>
+
+<button class="chat-fab" id="chat-fab" type="button" aria-label="Open Sentinel assistant" aria-expanded="false">AI</button>
+<div class="chat" id="chat" role="dialog" aria-label="Sentinel assistant" hidden>
+  <div class="chat-head">
+    <strong>Sentinel Assistant</strong>
+    <span class="ctx" id="chat-ctx">cpu — · mem —</span>
+  </div>
+  <div class="chat-log" id="chat-log" aria-live="polite"></div>
+  <form class="chat-form" id="chat-form" autocomplete="off">
+    <input id="chat-input" type="text" placeholder="Ask, or press Enter to diagnose…" aria-label="Chat message">
+  </form>
+</div>
 
 <script>
 (function () {
@@ -336,15 +385,20 @@
   }
 
   // Event delegation: the tbody is rebuilt on every poll, so listen on it rather than on each button.
+  // Shared kill helper so the chat button and the row buttons behave identically.
+  function killPid(pid, onDone, onFail) {
+    fetch("/api/kill", { method: "POST", body: String(pid) })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); if (onDone) onDone(); })
+      .catch(function (err) { if (onFail) onFail(err); });
+  }
+
   $("proc-body").addEventListener("click", function (e) {
     var btn = e.target.closest("button.kill");
     if (!btn) return;
     var pid = btn.dataset.pid;
     if (!confirm("Are you sure you want to terminate PID " + pid + "?")) return;
     btn.disabled = true;
-    fetch("/api/kill", { method: "POST", body: pid })
-      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); })
-      .catch(function (err) { alert("Could not terminate PID " + pid + " (" + err.message + ")."); });
+    killPid(pid, null, function (err) { alert("Could not terminate PID " + pid + " (" + err.message + ")."); });
     // No manual row removal: the next 2-second poll refreshes the table.
   });
 
@@ -356,8 +410,11 @@
       v.innerHTML = Math.round(p) + "<small>%</small>";
       b.style.width = p + "%"; b.className = level(p);
     }
-    $(id + "-sub").textContent = sub || " ";
+    $(id + "-sub").textContent = sub || " ";
   }
+
+  // Last-known cpu/mem, kept in the UI state so the chat can read them.
+  var metrics = { cpu: null, mem: null };
 
   // Tolerant of the exact snapshot layout. Expected: { cpu, mem_total, mem_used, disk:{total_gb,used_gb,free_gb},
   // cores?, uptime?, processes:[{pid,name,threads,mem}] } plus a few common aliases.
@@ -367,7 +424,7 @@
       if (buf.length === 0) return;
       buf = buf[buf.length - 1]; // grab the most recent sample
     }
-    
+
     // If the object is still not a valid sample, bail out.
     if (!buf || typeof buf !== "object") return;
 
@@ -377,7 +434,11 @@
 
     var mt = num(pick(buf, "mem_total"));
     var mu = num(pick(buf, "mem_used"));
-    setCard("mem", mt && mu != null ? mu / mt * 100 : null, mt && mu != null ? fmtMB(mu) + " of " + fmtMB(mt) : "");
+    var memPct = mt && mu != null ? mu / mt * 100 : null;
+    setCard("mem", memPct, mt && mu != null ? fmtMB(mu) + " of " + fmtMB(mt) : "");
+    metrics.cpu = cpu;
+    metrics.mem = memPct;
+    updateChatCtx();
 
     var dt = num(pick(buf, "disk_total"));
     var du = num(pick(buf, "disk_used"));
@@ -482,7 +543,125 @@
     }
   });
 
+  /* ============================================================
+     Chat assistant (floating, bottom-right)
+     ============================================================ */
+  var chat = {
+    root: $("chat"), log: $("chat-log"), input: $("chat-input"), fab: $("chat-fab"),
+    busy: false
+  };
+
+  function chatOpen(open) {
+    chat.root.hidden = !open;
+    chat.fab.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) chat.input.focus();
+  }
+  chat.fab.addEventListener("click", function () { chatOpen(chat.root.hidden); });
+
+  function updateChatCtx() {
+    $("chat-ctx").textContent =
+      "cpu " + (metrics.cpu == null ? "—" : Math.round(metrics.cpu) + "%") +
+      " · mem " + (metrics.mem == null ? "—" : Math.round(metrics.mem) + "%");
+  }
+
+  function chatScroll() { chat.log.scrollTop = chat.log.scrollHeight; }
+
+  function addMsg(text, kind) {
+    var el = document.createElement("div");
+    el.className = "msg " + kind;
+    el.textContent = text;
+    chat.log.appendChild(el);
+    chatScroll();
+    return el;
+  }
+
+  // Find the highest-memory process whose name contains "chrome" (case-insensitive).
+  function highestMemChrome() {
+    var best = null;
+    for (var i = 0; i < procs.length; i++) {
+      var p = procs[i];
+      if (p.pid == null || p.mem == null) continue;
+      if (String(p.name).toLowerCase().indexOf("chrome") < 0) continue;
+      if (!best || p.mem > best.mem) best = p;
+    }
+    return best;
+  }
+
+  function appendKillButton(msgEl, p) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn kill-inline";
+    btn.textContent = "Kill PID " + p.pid + " (" + Math.round(p.mem) + " MB)";
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      btn.textContent = "Killing PID " + p.pid + "…";
+      killPid(p.pid,
+        function () { addMsg("Done.", "bot"); },
+        function (err) {
+          btn.disabled = false;
+          btn.textContent = "Kill PID " + p.pid + " (" + Math.round(p.mem) + " MB)";
+          addMsg("Kill failed for PID " + p.pid + " (" + err.message + ").", "bot err");
+        });
+    });
+    msgEl.appendChild(btn);
+    chatScroll();
+  }
+
+  function sendChat(text) {
+    if (chat.busy) return;
+    text = String(text || "").trim();
+    if (!text) return;
+    chatOpen(true);
+    addMsg(text, "user");
+    chat.input.value = "";
+    chat.busy = true;
+
+    var body = {
+      cpu: metrics.cpu == null ? 0 : metrics.cpu,
+      mem: metrics.mem == null ? 0 : metrics.mem,
+      procs: procs.length
+    };
+
+    fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (data) {
+          if (!r.ok) {
+            var m = data && data.error ? data.error : ("HTTP " + r.status);
+            throw new Error(m);
+          }
+          return data;
+        });
+      })
+      .then(function (data) {
+        if (!data || typeof data !== "object") throw new Error("empty response");
+        var msgEl = addMsg(data.message == null ? "(no message)" : String(data.message), "bot");
+        if (data.action === "kill_chrome") {
+          var target = highestMemChrome();
+          if (target) {
+            appendKillButton(msgEl, target);
+          } else {
+            msgEl.appendChild(document.createTextNode("\nNo Chrome process found in the current process list."));
+            chatScroll();
+          }
+        }
+      })
+      .catch(function (err) {
+        addMsg("Assistant unavailable: " + err.message, "bot err");
+      })
+      .then(function () { chat.busy = false; });
+  }
+
+  $("chat-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    sendChat(chat.input.value);
+  });
+
   /* ---------- boot ---------- */
+  updateChatCtx();
   show(location.hash === "#software" ? "software" : "processes");
 })();
 </script>

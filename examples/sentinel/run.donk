@@ -1,63 +1,89 @@
-// examples/sentinel/run.donk — entrypoint for Sentinel (desktop app).
-//
-// PROCESS MODEL: Option B from the brief, adapted for a native window.
-//   * Collector on a spawn worker (thread pool, 16 workers, SEMANTICS §11.5).
-//   * HTTP accept loop on a spawn worker.
-//   * Main thread blocks in gui_webview() pointing at the local server.
-//
-// Startup order matters:
-//   1. cpu_usage() is called once to prime the C-side delta baseline, then
-//      we sleep(1000). Without this the first recorded sample has cpu == 0.
-//   2. setup_server() binds 8082 on the main thread *before* any spawn, so
-//      the port is live before the webview loads. If bind fails we still
-//      fall through (gui_webview will show a connection error, which is
-//      more useful than a silent exit).
-//   3. spawn(collector_loop, 0).
-//   4. spawn(start_server, srv) — accept loop hands off per-connection
-//      spawn(handle_client, conn) workers exactly as before.
-//   5. sleep(500) so the collector takes at least its first sample and the
-//      accept loop is scheduled before the window opens.
-//   6. gui_webview("http://localhost:8082") — blocks the main thread.
-//
-// spawn(func, arg) takes a top-level function by name and a single argument
-// (SEMANTICS §11.5). We pass 0 where the function ignores its argument, and
-// the server handle for start_server. Do NOT spawn a closure: the AOT stores
-// a raw code address, not a tagged function value, and non-function
-// arguments segfault the process.
+// examples/sentinel/run.donk — entrypoint for Sentinel V3 (desktop app).
+// V2 startup order preserved; V3 adds the model weights + global_set
+// before setup_server() so the /api/chat worker always sees them.
 
 import "lib/winreg.donk";
 import "lib/proc.donk";
+import "lib/neural.donk";
 import "examples/sentinel/collector.donk";
-import "examples/sentinel/sentinel.donk";
+import "examples/sentinel/server.donk";
 
-// Top-level let: written via donky_global_set by the AOT (SEMANTICS §11.3),
-// read inside handle_client via global_get("HTML_CACHE"). See the header
-// comment in sentinel.donk.
+// ---------------------------------------------------------------------------
+// Sentinel V3 model — 6 -> 8 -> 3, flat row-major buffers.
+// PLACEHOLDER weights; replace with export_weights.py output before shipping.
+// Shapes must match server.donk's handle_chat: in=6, hidden=8, out=3.
+// Class order: [Normal, High CPU, High Mem].
+//
+// Lengths (enforced by nn_check_flat in lib/neural.donk):
+//   AI_W1 : in_dim * hidden_dim = 6 * 8 = 48
+//   AI_B1 : hidden_dim          = 8
+//   AI_W2 : hidden_dim * out_dim = 8 * 3 = 24
+//   AI_B2 : out_dim             = 3
+// ---------------------------------------------------------------------------
+let AI_W1 = [
+    // input 0 = cpu    -> 8 hidden units
+     1.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    // input 1 = mem
+     0.0, 1.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    // input 2 = procs_norm
+     0.0, 0.0, 0.8, 0.8, 0.0, 0.0, 0.0, 0.0,
+    // input 3 = disk
+     0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0,
+    // input 4 = threads
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0,
+    // input 5 = load
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0
+];
+let AI_B1 = [
+    -0.85, -0.85,          // h0 cpu-high, h1 mem-high
+    -0.55, -0.55,          // h2/h3 procs-elevated
+    -0.90, -0.90, -0.90,   // h4 disk, h5 threads, h6 load
+     0.00                  // h7 slack — REQUIRED, bias1 must be length 8
+];
+let AI_W2 = [
+    // 8 hidden rows x 3 classes [Normal, HighCPU, HighMem]
+    -2.0, 3.0, 0.0,        // h0 cpu-high -> HighCPU
+    -2.0, 0.0, 3.0,        // h1 mem-high -> HighMem
+    -0.2, 0.2, 0.2,        // h2 procs
+    -0.2, 0.2, 0.2,        // h3 procs
+    -0.3, 0.1, 0.1,        // h4 disk
+    -0.3, 0.1, 0.1,        // h5 threads
+    -0.3, 0.2, 0.0,        // h6 load
+     0.0, 0.0, 0.0         // h7 slack
+];
+let AI_B2 = [ 2.0, 0.0, 0.0 ];   // Normal-class prior
+
+// Top-level let -> donky_global_set by the AOT (SEMANTICS §11.3). Read in
+// handle_client and handle_chat via global_get. HTML_CACHE is the existing
+// precedent from V2.
 let HTML_CACHE = read_file("examples/sentinel/index.html");
 if HTML_CACHE == null {
-    HTML_CACHE = "<!doctype html><title>Sentinel</title><p>index.html not found.</p>";
+    HTML_CACHE = "<!doctype html><title>Sentinel V3</title><p>index.html not found.</p>";
 }
 
-// 1. Prime cpu_usage(). The runtime keeps prev_idle/prev_kernel/prev_user in
-//    static storage per process; two calls >=1s apart yield a real delta.
+// 1. Prime cpu_usage() (V2 semantics: first call has no delta).
 let _prime = cpu_usage();
 sleep(1000);
 
-// 2. Bind 8082 on the main thread so the port is live before the webview.
+// 2. Install V3 weights into the global map BEFORE any worker can serve
+//    /api/chat. global_set is the only cross-thread way to pass a top-level
+//    value to a spawned handler (SEMANTICS §11.5: no closure capture).
+global_set("AI_W1", AI_W1);
+global_set("AI_B1", AI_B1);
+global_set("AI_W2", AI_W2);
+global_set("AI_B2", AI_B2);
+
+// 3. Bind the port on the main thread (V2 order preserved).
 let srv = setup_server();
 
-// 3. Collector worker.
+// 4. Collector worker.
 spawn(collector_loop, 0);
 
-// 4. HTTP accept-loop worker. start_server validates srv and exits cleanly
-//    if setup_server() failed above (it will already have printed the error).
+// 5. HTTP accept loop.
 spawn(start_server, srv);
 
-// 5. Let the collector take its first sample and the accept loop start
-//    before we open the window (avoids a flash of "null" / connection-
-//    refused on the first paint).
+// 6. Let the collector sample + accept loop start before the window.
 sleep(500);
 
-// 6. Native window. Blocks the main thread until the user closes it; the
-//    spawned workers keep serving/collecting behind it.
+// 7. Native window. Blocks the main thread.
 gui_webview("http://localhost:8082");

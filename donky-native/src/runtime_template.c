@@ -1351,6 +1351,14 @@ uint64_t donky_tanh(uint64_t a) {
     if (!is_number(a)) { donky_throw(donky_alloc_string("tanh: expected a number")); return TAG_BASE; }
     return make_number(tanh(as_number(a)));
 }
+uint64_t donky_sin(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("sin: expected a number")); return TAG_BASE; }
+    return make_number(sin(as_number(a)));
+}
+uint64_t donky_cos(uint64_t a) {
+    if (!is_number(a)) { donky_throw(donky_alloc_string("cos: expected a number")); return TAG_BASE; }
+    return make_number(cos(as_number(a)));
+}
 uint64_t donky_max(uint64_t a, uint64_t b) {
     if (!is_number(a) || !is_number(b)) { dk_throw_binop("max", a, b); return TAG_BASE; }
     return make_number(fmax(as_number(a), as_number(b)));
@@ -2480,7 +2488,14 @@ uint64_t donky_tcp_accept(uint64_t server_val) {
     if (srv == INVALID_SOCKET) return make_number(-1.0);
     SOCKET c = accept(srv, NULL, NULL);
     if (c == INVALID_SOCKET) return make_number(-1.0);
-    return make_number((double)dk_id_from_socket(c));
+    // dk_id_from_socket returns 0 when the DK_MAX_SOCK table is full. In that
+    // case the fd we just accepted has no handle, so nothing on the Donky side
+    // can reach it: close it here or it leaks at the OS level (the Donky accept
+    // loop only sees a -1 and keeps spinning). Drop the connection and report
+    // failure, the same way a failed accept() does.
+    int id = dk_id_from_socket(c);
+    if (id == 0) { closesocket(c); return make_number(-1.0); }
+    return make_number((double)id);
 }
 
 uint64_t donky_tcp_read(uint64_t client_val, uint64_t max_val) {
@@ -4077,6 +4092,57 @@ uint64_t donky_tensor_matmul(uint64_t a, uint64_t b, uint64_t r_a, uint64_t c_a,
     return r;
 }
 
+// tensor_matmul_f32(a, b, r_a, c_a, c_b): same contract as tensor_matmul, but the multiply/
+// accumulate runs in native float (roughly 2x faster and half the memory for the temporaries;
+// the Donky-visible result is still an array of f64 values, matching every other tensor op).
+// Inputs are unboxed once into float buffers, the product is accumulated in float, then each
+// output element is re-boxed with make_number. A NaN produced by the accumulation is canonicalized
+// by make_number, so it can never collide with the null tag.
+uint64_t donky_tensor_matmul_f32(uint64_t a, uint64_t b, uint64_t r_a, uint64_t c_a, uint64_t c_b) {
+    const char* who = "tensor_matmul_f32";
+    Array* pa; Array* pb;
+    size_t R, K, C;
+    char msg[160];
+    if (!dk_tensor_view(who, "a", a, &pa) || !dk_tensor_view(who, "b", b, &pb)) return TAG_BASE;
+    if (!dk_tensor_dim(who, "r_a", r_a, &R) || !dk_tensor_dim(who, "c_a", c_a, &K) || !dk_tensor_dim(who, "c_b", c_b, &C)) return TAG_BASE;
+    if (K == 0) { snprintf(msg, sizeof msg, "%s: c_a (the inner dimension) must be positive", who); return dk_ffi_err(msg); }
+    if (pa->len != R * K) {
+        snprintf(msg, sizeof msg, "%s: a has %zu elements but r_a * c_a = %zu * %zu = %zu", who, pa->len, R, K, R * K);
+        return dk_ffi_err(msg);
+    }
+    if (pb->len != K * C) {
+        snprintf(msg, sizeof msg, "%s: b has %zu elements but c_a * c_b = %zu * %zu = %zu", who, pb->len, K, C, K * C);
+        return dk_ffi_err(msg);
+    }
+    size_t na = R * K, nb = K * C, n = R * C;             // <= 2^62, no overflow
+    // Temporary float buffers. Kept null-safe: malloc(0) is allowed to return NULL.
+    float* fa = (float*)malloc(na * sizeof(float));
+    float* fb = (float*)malloc(nb * sizeof(float));
+    float* fo = (float*)calloc(n ? n : 1, sizeof(float));
+    if (!fa || !fb || !fo) {
+        free(fa); free(fb); free(fo);
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
+    for (size_t i = 0; i < na; i++) fa[i] = (float)as_number(pa->data[i]);
+    for (size_t i = 0; i < nb; i++) fb[i] = (float)as_number(pb->data[i]);
+    for (size_t i = 0; i < R; i++) {
+        for (size_t k = 0; k < K; k++) {
+            float aik = fa[i * K + k];
+            float* orow = fo + i * C;
+            const float* brow = fb + k * C;
+            for (size_t j = 0; j < C; j++) orow[j] += aik * brow[j];
+        }
+    }
+    // Box the float results back into a fresh Donky array of f64 values.
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) { free(fa); free(fb); free(fo); return TAG_BASE; }
+    for (size_t i = 0; i < n; i++) out[i] = make_number((double)fo[i]);
+    free(fa); free(fb); free(fo);
+    return r;
+}
+
 // tensor_relu(a): max(x, 0) per element (NaN stays NaN).
 uint64_t donky_tensor_relu(uint64_t a) {
     const char* who = "tensor_relu";
@@ -4114,6 +4180,68 @@ uint64_t donky_tensor_softmax(uint64_t a) {
     return r;
 }
 
+// tensor_relu_f32(a): max(x, 0) per element, computed in float. Same contract as tensor_relu;
+// the returned array is an array of f64 values.
+uint64_t donky_tensor_relu_f32(uint64_t a) {
+    const char* who = "tensor_relu_f32";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t n = pa->len;
+    float* fo = (float*)malloc(n ? n : 1);
+    if (!fo) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
+    for (size_t i = 0; i < n; i++) {
+        float x = (float)as_number(pa->data[i]);
+        fo[i] = x < 0.0f ? 0.0f : x;
+    }
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) { free(fo); return TAG_BASE; }
+    for (size_t i = 0; i < n; i++) out[i] = make_number((double)fo[i]);
+    free(fo);
+    return r;
+}
+
+// tensor_softmax_f32(a): softmax over the whole array, computed in float as
+// exp(x - max) / sum (the shift keeps large inputs from overflowing). Same contract as
+// tensor_softmax; the returned array is an array of f64 values.
+uint64_t donky_tensor_softmax_f32(uint64_t a) {
+    const char* who = "tensor_softmax_f32";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t n = pa->len;
+    if (n == 0) {
+        uint64_t* out = NULL;
+        return dk_tensor_alloc(who, 0, &out);
+    }
+    float* fo = (float*)malloc(n * sizeof(float));
+    if (!fo) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
+    float m = -INFINITY;
+    for (size_t i = 0; i < n; i++) {
+        float x = (float)as_number(pa->data[i]);
+        if (x > m) m = x;
+    }
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float e = expf((float)as_number(pa->data[i]) - m);
+        fo[i] = e;
+        sum += e;
+    }
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) { free(fo); return TAG_BASE; }
+    for (size_t i = 0; i < n; i++) out[i] = make_number((double)(fo[i] / sum));
+    free(fo);
+    return r;
+}
+
 // tensor_sgd_step(weights, grads, lr): weights[i] -= lr * grads[i], in place. Returns `weights`.
 uint64_t donky_tensor_sgd_step(uint64_t weights, uint64_t grads, uint64_t lr) {
     const char* who = "tensor_sgd_step";
@@ -4132,6 +4260,696 @@ uint64_t donky_tensor_sgd_step(uint64_t weights, uint64_t grads, uint64_t lr) {
     for (size_t i = 0; i < pw->len; i++)
         pw->data[i] = make_number(as_number(pw->data[i]) - rate * as_number(pg->data[i]));
     return weights;
+}
+
+// ---- Transformer primitives -------------------------------------------------
+// All four take flat, row-major Donky arrays of numbers (NaN-boxed f64, as every tensor
+// op does) and return a fresh flat array. Scratch buffers come from gc_malloc, not
+// mem_alloc: the GC is the only allocator in this file that reclaims an orphaned block
+// (the next sweep frees anything unreachable), so a throw between alloc and return
+// cannot leak. Each function still frees its scratch explicitly on the success and
+// error paths, so steady-state memory does not wait for a sweep.
+//
+// Shared helpers (dk_tensor_view / dk_tensor_dim / dk_tensor_alloc / dk_ffi_err /
+// dk_type_name / make_number / as_number) are defined above in the tensor section.
+
+// tensor_rms_norm(a): x[i] / sqrt(mean(x^2) + eps), eps = 1e-5 (Llama-3 rms_norm_eps).
+// Does NOT apply the learned norm weight: caller multiplies by attn_norm/ffn_norm weight.
+// Accumulates in double (n=4096 of x^2 cannot overflow). Zero vector -> zeros (eps>0).
+// Non-finite input is an error instead of being silently masked.
+uint64_t donky_tensor_rms_norm(uint64_t a) {
+    const char* who = "tensor_rms_norm";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t n = pa->len;
+    if (n == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    double ss = 0.0;
+    for (size_t i = 0; i < n; i++) { double x = as_number(pa->data[i]); ss += x * x; }
+    if (!isfinite(ss)) return dk_ffi_err("tensor_rms_norm: input contains NaN/inf");
+    const double inv = 1.0 / sqrt(ss / (double)n + 1e-5);
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    for (size_t i = 0; i < n; i++) out[i] = make_number(as_number(pa->data[i]) * inv);
+    return r;
+}
+
+// tensor_rope(a, pos): rotary positional embedding, applied to one vector `a` of even
+// length d at token position `pos`. Uses the standard Llama/Mistral interleaved-pair
+// layout: for each pair (x[2i], x[2i+1]),
+//     theta_i = pos * base^(-2i/d),  base = 10000
+//     y[2i]   = x[2i]   * cos(theta_i) - x[2i+1] * sin(theta_i)
+//     y[2i+1] = x[2i]   * sin(theta_i) + x[2i+1] * cos(theta_i)
+// `pos` must be a non-negative whole number. Odd-length vectors are rejected (a
+// rotation is only defined on pairs).
+uint64_t donky_tensor_rope(uint64_t a, uint64_t pos_val) {
+    const char* who = "tensor_rope";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    if (!is_number(pos_val) || pos_val == TAG_BASE) {
+        char msg[64]; snprintf(msg, sizeof msg, "%s: pos must be a number", who);
+        return dk_ffi_err(msg);
+    }
+    double posd = as_number(pos_val);
+    if (!(posd >= 0.0) || posd != floor(posd)) {
+        char msg[64]; snprintf(msg, sizeof msg, "%s: pos must be a non-negative whole number", who);
+        return dk_ffi_err(msg);
+    }
+    size_t n = pa->len;
+    if (n & 1) {
+        char msg[96]; snprintf(msg, sizeof msg, "%s: vector length must be even (got %zu)", who, n);
+        return dk_ffi_err(msg);
+    }
+    if (n == 0) { uint64_t* out = NULL; return dk_tensor_alloc(who, 0, &out); }
+    const double base = 10000.0;
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    // theta_i = pos * base^(-2i/n). Incremental: theta_{i+1}/theta_i = base^(-2/n).
+    double step = pow(base, -2.0 / (double)n);
+    double theta = posd;                            // theta_0 = pos * base^0
+    for (size_t i = 0; i < n; i += 2) {
+        double c = cos(theta), s = sin(theta);
+        double x0 = as_number(pa->data[i]);
+        double x1 = as_number(pa->data[i + 1]);
+        out[i]     = make_number(x0 * c - x1 * s);
+        out[i + 1] = make_number(x0 * s + x1 * c);
+        theta *= step;
+    }
+    return r;
+}
+
+// tensor_attention(q, k, v): single-head causal self-attention for one sequence of
+// `seq` tokens of head dimension `d`, all flat row-major:
+//     Q, K, V are each seq*d elements.
+//     S = Q * K^T / sqrt(d)          (seq x seq)
+//     S[t][u] = -inf for u > t       (causal mask; masked entries become 0 after softmax)
+//     P = softmax(S, axis=1)         (row-wise)
+//     O = P * V                      (seq x d)  -> returned flat, seq*d elements
+// A row whose only unmasked entry is the diagonal still softmaxes to 1.0 on that
+// entry (the -inf entries contribute exp(-inf - max) = 0), so no row is all-zero.
+uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq_val, uint64_t d_val) {
+    const char* who = "tensor_attention";
+    Array* pq; Array* pk; Array* pv;
+    size_t seq, d;
+    char msg[160];
+    if (!dk_tensor_view(who, "q", q, &pq) ||
+        !dk_tensor_view(who, "k", k, &pk) ||
+        !dk_tensor_view(who, "v", v, &pv)) return TAG_BASE;
+    if (!dk_tensor_dim(who, "seq", seq_val, &seq) || !dk_tensor_dim(who, "d", d_val, &d)) return TAG_BASE;
+    if (d == 0) { snprintf(msg, sizeof msg, "%s: d must be positive", who); return dk_ffi_err(msg); }
+    if (seq > 65536) { snprintf(msg, sizeof msg, "%s: seq too large (max 65536)", who); return dk_ffi_err(msg); }
+    size_t n = seq * d;
+    if (pq->len != n || pk->len != n || pv->len != n) {
+        snprintf(msg, sizeof msg, "%s: q/k/v must each have seq*d = %zu elements (got %zu/%zu/%zu)",
+                 who, n, pq->len, pk->len, pv->len);
+        return dk_ffi_err(msg);
+    }
+    if (n == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+ 
+    double* srow = (double*)malloc(seq * sizeof(double));
+    double* orow = (double*)malloc(d   * sizeof(double));     // allocated ONCE, not per row
+    if (!srow || !orow) { free(srow); free(orow); return dk_ffi_err("tensor_attention: out of memory"); }
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) { free(srow); free(orow); return TAG_BASE; }
+ 
+    const double scale = 1.0 / sqrt((double)d);
+    for (size_t t = 0; t < seq; t++) {
+        const uint64_t* qt = pq->data + t * d;
+        double rowmax = -INFINITY;
+        for (size_t u = 0; u <= t; u++) {                      // causal: keys 0..t only
+            const uint64_t* ku = pk->data + u * d;
+            double dot = 0.0;
+            for (size_t j = 0; j < d; j++) dot += as_number(qt[j]) * as_number(ku[j]);
+            double sc = dot * scale;
+            srow[u] = sc;
+            if (sc > rowmax) rowmax = sc;
+        }
+        double sum = 0.0;
+        for (size_t u = 0; u <= t; u++) { double e = exp(srow[u] - rowmax); srow[u] = e; sum += e; }
+        const double inv = 1.0 / sum;                          // sum >= 1 (the max term is e^0)
+        for (size_t j = 0; j < d; j++) orow[j] = 0.0;
+        for (size_t u = 0; u <= t; u++) {
+            const double p = srow[u] * inv;
+            const uint64_t* vu = pv->data + u * d;
+            for (size_t j = 0; j < d; j++) orow[j] += p * as_number(vu[j]);
+        }
+        for (size_t j = 0; j < d; j++) out[t * d + j] = make_number(orow[j]);
+    }
+    free(srow); free(orow);
+    return r;
+}
+
+// tensor_silu(a): x * sigmoid(x) = x / (1 + exp(-x)), element-wise.
+// Uses the overflow-safe form: for large positive x, exp(-x) underflows to 0 -> x;
+// for large negative x, exp(-x) overflows to +inf -> x/inf = -0, which is 0.0.
+uint64_t donky_tensor_silu(uint64_t a) {
+    const char* who = "tensor_silu";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t n = pa->len;
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    for (size_t i = 0; i < n; i++) {
+        double x = as_number(pa->data[i]);
+        double e = exp(-x);
+        double y = x / (1.0 + e);                  // NaN in -> NaN out (canonicalised by make_number)
+        out[i] = make_number(y);
+    }
+    return r;
+}
+
+// mmap_model(path) -> { addr, size } | null
+// Opens `path`, maps it read-only (shared), and returns the base address and file size as
+// numbers. The mapping is NOT GC-tracked and is intentionally never unmapped: a model is
+// mapped for the process lifetime. Any handle returned by dll_call / ffi_alloc is also a
+// plain number, so the map slots in with the existing FFI conventions.
+uint64_t donky_mmap_model(uint64_t path_val) {
+    if (!dk_is_str(path_val)) return dk_ffi_err("mmap_model: path must be a string");
+    const char* path = dk_s(path_val);
+#ifdef _WIN32
+    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+        return dk_ffi_err("mmap_model: cannot open file");
+    LARGE_INTEGER sz; sz.QuadPart = 0;
+    if (!GetFileSizeEx(hf, &sz) || sz.QuadPart <= 0) {
+        CloseHandle(hf);
+        return dk_ffi_err("mmap_model: empty or unreadable file");
+    }
+    HANDLE hm = CreateFileMappingA(hf, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hm) { CloseHandle(hf); return dk_ffi_err("mmap_model: CreateFileMapping failed"); }
+    void* base = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hm); CloseHandle(hf);           // mapping keeps the file alive
+    if (!base) return dk_ffi_err("mmap_model: MapViewOfFile failed");
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return dk_ffi_err("mmap_model: cannot open file");
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return dk_ffi_err("mmap_model: empty or unreadable file");
+    }
+    void* base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);                                  // mapping keeps the file alive
+    if (base == MAP_FAILED) return dk_ffi_err("mmap_model: mmap failed");
+#endif
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("addr"), make_number((double)(uint64_t)(uintptr_t)base));
+    #ifdef _WIN32
+    donky_map_set(m, donky_alloc_string("size"), make_number((double)(uint64_t)sz.QuadPart));
+#else
+    donky_map_set(m, donky_alloc_string("size"), make_number((double)(uint64_t)st.st_size));
+#endif
+    return m;
+}
+
+// GGUF constants (v1..v3 all share this layout for the header + KV block)
+#define GGUF_MAGIC   0x46554747u            // "GGUF" little-endian on disk
+#define GGUF_MAX_KV  65536u                 // sanity cap: no real model has more
+#define GGUF_MAX_STR (64u * 1024u * 1024u)  // sanity cap: strings, not blob data
+
+typedef struct { const uint8_t* p; const uint8_t* end; } GgufRd;
+static int gguf_take(GgufRd* r, size_t n, const uint8_t** out) {
+    if ((size_t)(r->end - r->p) < n) return 0;
+    *out = r->p; r->p += n; return 1;
+}
+static int gguf_u32(GgufRd* r, uint32_t* v) {
+    const uint8_t* q; if (!gguf_take(r, 4, &q)) return 0;
+    *v = (uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+    return 1;
+}
+static int gguf_u64(GgufRd* r, uint64_t* v) {
+    const uint8_t* q; if (!gguf_take(r, 8, &q)) return 0;
+    *v = (uint64_t)q[0] | ((uint64_t)q[1] << 8) | ((uint64_t)q[2] << 16) | ((uint64_t)q[3] << 24)
+       | ((uint64_t)q[4] << 32) | ((uint64_t)q[5] << 40) | ((uint64_t)q[6] << 48) | ((uint64_t)q[7] << 56);
+    return 1;
+}
+// GGUF string: u64 length + bytes. Returns a NUL-terminated copy the caller frees.
+static char* gguf_string(GgufRd* r) {
+    uint64_t n; if (!gguf_u64(r, &n) || n > GGUF_MAX_STR) return NULL;
+    const uint8_t* q; if (!gguf_take(r, (size_t)n, &q)) return NULL;
+    char* s = (char*)malloc((size_t)n + 1);
+    if (!s) return NULL;
+    memcpy(s, q, (size_t)n); s[n] = 0; return s;
+}
+
+// gguf_type codes (GGUF v2/v3)
+enum { GGUF_T_U8=0, GGUF_T_I8, GGUF_T_U16, GGUF_T_I16, GGUF_T_U32, GGUF_T_I32,
+       GGUF_T_F32, GGUF_T_BOOL, GGUF_T_STRING, GGUF_T_ARRAY, GGUF_T_U64, GGUF_T_I64, GGUF_T_F64 };
+
+// Skips a value of the given type. For arrays, reads the element type + length and walks.
+static int gguf_skip(GgufRd* r, uint32_t type) {
+    const uint8_t* q; uint32_t et; uint64_t n;
+    switch (type) {
+        case GGUF_T_U8: case GGUF_T_I8: case GGUF_T_BOOL: return gguf_take(r, 1, &q);
+        case GGUF_T_U16: case GGUF_T_I16: return gguf_take(r, 2, &q);
+        case GGUF_T_U32: case GGUF_T_I32: case GGUF_T_F32: return gguf_take(r, 4, &q);
+        case GGUF_T_U64: case GGUF_T_I64: case GGUF_T_F64: return gguf_take(r, 8, &q);
+        case GGUF_T_STRING: { char* s = gguf_string(r); if (!s) return 0; free(s); return 1; }
+        case GGUF_T_ARRAY: {
+            if (!gguf_u32(r, &et) || !gguf_u64(r, &n)) return 0;
+            if (n > GGUF_MAX_STR) return 0;         // arrays of scalars/strings, not blob bodies
+            for (uint64_t i = 0; i < n; i++) if (!gguf_skip(r, et)) return 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Returns the integer/floating value of the next scalar as a double (used for metadata).
+static int gguf_scalar_as_double(GgufRd* r, uint32_t type, double* out) {
+    const uint8_t* q;
+    switch (type) {
+        case GGUF_T_U8:  { if (!gguf_take(r,1,&q)) return 0; *out = (double)q[0]; return 1; }
+        case GGUF_T_I8:  { if (!gguf_take(r,1,&q)) return 0; *out = (double)(int8_t)q[0]; return 1; }
+        case GGUF_T_U16: { if (!gguf_take(r,2,&q)) return 0; *out = (double)((uint32_t)q[0]|((uint32_t)q[1]<<8)); return 1; }
+        case GGUF_T_I16: { if (!gguf_take(r,2,&q)) return 0; *out = (double)(int16_t)((uint32_t)q[0]|((uint32_t)q[1]<<8)); return 1; }
+        case GGUF_T_U32: { uint32_t v; if (!gguf_u32(r,&v)) return 0; *out=(double)v; return 1; }
+        case GGUF_T_I32: { uint32_t v; if (!gguf_u32(r,&v)) return 0; *out=(double)(int32_t)v; return 1; }
+        case GGUF_T_U64: { uint64_t v; if (!gguf_u64(r,&v)) return 0; *out=(double)v; return 1; }
+        case GGUF_T_I64: { uint64_t v; if (!gguf_u64(r,&v)) return 0; *out=(double)(int64_t)v; return 1; }
+        case GGUF_T_F32: { uint32_t v; if (!gguf_u32(r,&v)) return 0; float f; memcpy(&f,&v,4); *out=(double)f; return 1; }
+        case GGUF_T_F64: { uint64_t v; if (!gguf_u64(r,&v)) return 0; double d; memcpy(&d,&v,8); *out=d; return 1; }
+        case GGUF_T_BOOL: { if (!gguf_take(r,1,&q)) return 0; *out = q[0] ? 1.0 : 0.0; return 1; }
+    }
+    return 0;
+}
+
+// ===== Tasks 2+3: replace the whole donky_read_gguf_metadata (and its comment) =====
+// read_gguf_metadata(addr) -> { "d_model","n_heads","n_heads_kv","layers","context","ffn",
+//                               "rope_base","arch",
+//                               "tensor_data_offset",   // aligned file offset of the data section
+//                               "tensor_table" } | throws
+// tensor_table: name -> { "type": ggml type code (0=F32 1=F16 2=Q4_0 8=Q8_0 12=Q4_K 14=Q6_K ...),
+//                         "offset": byte offset RELATIVE to the data section (as stored in the file),
+//                         "abs_offset": tensor_data_offset + offset (add to the mmap base for the pointer),
+//                         "dims": [ne0, ne1, ...] }   // GGUF order: dims[0] is the contiguous/input dim,
+//                                                    // so a weight with dims [4096, 14336] is 14336 rows x 4096 cols.
+uint64_t donky_read_gguf_metadata(uint64_t addr_val) {
+    if (!is_number(addr_val)) return dk_ffi_err("read_gguf_metadata: addr must be a number from mmap_model");
+    const uint8_t* base = (const uint8_t*)(uintptr_t)(uint64_t)as_number(addr_val);
+    if (!base) return dk_ffi_err("read_gguf_metadata: null address");
+    GgufRd r = { base, base + (64u * 1024u * 1024u) };   // conservative cap
+ 
+    uint32_t magic, ver; uint64_t n_tensors, n_kv;
+    if (!gguf_u32(&r, &magic) || magic != GGUF_MAGIC) return dk_ffi_err("read_gguf_metadata: bad magic");
+    if (!gguf_u32(&r, &ver) || ver < 1 || ver > 3)    return dk_ffi_err("read_gguf_metadata: unsupported version");
+    if (!gguf_u64(&r, &n_tensors) || n_tensors > (1u << 20)) return dk_ffi_err("read_gguf_metadata: bad n_tensors");
+    if (!gguf_u64(&r, &n_kv) || n_kv > GGUF_MAX_KV)   return dk_ffi_err("read_gguf_metadata: bad n_kv");
+ 
+    char arch[64] = "";
+    double d_model = 0, n_heads = 0, n_heads_kv = 0, layers = 0, ctx = 0, ffn = 0, rope = 0;
+    double align_kv = 0;                                  // general.alignment, if present
+    for (uint64_t i = 0; i < n_kv; i++) {
+        char* key = gguf_string(&r);
+        if (!key) return dk_ffi_err("read_gguf_metadata: bad key");
+        uint32_t type; if (!gguf_u32(&r, &type)) { free(key); return dk_ffi_err("read_gguf_metadata: truncated KV"); }
+        double v = 0; int scalar = 0;
+        if (type == GGUF_T_STRING) {
+            char* s = gguf_string(&r);
+            if (!s) { free(key); return dk_ffi_err("read_gguf_metadata: bad string value"); }
+            if (strcmp(key, "general.architecture") == 0) {
+                strncpy(arch, s, sizeof arch - 1); arch[sizeof arch - 1] = 0;
+            }
+            free(s);
+        } else if (type == GGUF_T_ARRAY) {
+            if (!gguf_skip(&r, type)) { free(key); return dk_ffi_err("read_gguf_metadata: bad array"); }
+        } else {
+            if (!gguf_scalar_as_double(&r, type, &v)) { free(key); return dk_ffi_err("read_gguf_metadata: bad scalar"); }
+            scalar = 1;
+        }
+        if (scalar) {
+            if      (strcmp(key, "general.alignment") == 0)                 align_kv  = v;
+            else if (strstr(key, ".embedding_length"))                      d_model   = v;
+            else if (strstr(key, ".attention.head_count_kv"))               n_heads_kv= v;
+            else if (strstr(key, ".attention.head_count"))                  n_heads   = v;
+            else if (strstr(key, ".block_count"))                           layers    = v;
+            else if (strstr(key, ".context_length"))                        ctx       = v;
+            else if (strstr(key, ".feed_forward_length"))                   ffn       = v;
+            else if (strstr(key, ".rope.freq_base"))                        rope      = v;
+        }
+        free(key);
+    }
+ 
+    // Result map first, so everything allocated below is reachable from it.
+    uint64_t m = donky_alloc_map();
+    uint64_t tensor_table = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("tensor_table"), tensor_table);
+ 
+    // Tensor-info records: name (u64 len + bytes), n_dims (u32), dims (u64 * n_dims),
+    // type (u32), offset (u64, relative to the data section). Offsets are stored raw here;
+    // abs_offset is filled in once the aligned data start is known (second pass below).
+    // Truncation is an error: a silent break would give a wrong tensor_data_offset.
+    typedef struct { char* name; uint32_t type; uint64_t off; uint32_t nd; uint64_t dims[8]; } DkGgufTI;
+    DkGgufTI* ti = (DkGgufTI*)calloc(n_tensors ? (size_t)n_tensors : 1, sizeof(DkGgufTI));
+    if (!ti) return dk_ffi_err("read_gguf_metadata: out of memory");
+    const char* bad = NULL;
+    uint64_t got = 0;
+    for (; got < n_tensors; got++) {
+        DkGgufTI* t = &ti[got];
+        t->name = gguf_string(&r);
+        if (!t->name)                                   { bad = "truncated tensor name"; break; }
+        if (!gguf_u32(&r, &t->nd) || t->nd == 0 || t->nd > 8) { got++; bad = "bad tensor n_dims"; break; }
+        int ok = 1;
+        for (uint32_t d = 0; d < t->nd && ok; d++) ok = gguf_u64(&r, &t->dims[d]);
+        if (!ok || !gguf_u32(&r, &t->type) || !gguf_u64(&r, &t->off)) { got++; bad = "truncated tensor info"; break; }
+    }
+    size_t alignment = 32;
+    if (align_kv >= 1 && align_kv <= 1048576 && align_kv == floor(align_kv)) alignment = (size_t)align_kv;
+    size_t hdr_end = (size_t)(r.p - base);
+    size_t aligned = ((hdr_end + alignment - 1) / alignment) * alignment;
+ 
+    if (!bad) {
+        for (uint64_t i = 0; i < n_tensors; i++) {
+            DkGgufTI* t = &ti[i];
+            uint64_t info = donky_alloc_map();
+            uint64_t* dd = NULL;
+            uint64_t dims_v = dk_tensor_alloc("read_gguf_metadata", t->nd, &dd);
+            if (dims_v == TAG_BASE) { bad = "out of memory"; break; }
+            for (uint32_t d = 0; d < t->nd; d++) dd[d] = make_number((double)t->dims[d]);
+            donky_map_set(info, donky_alloc_string("type"),       make_number((double)t->type));
+            donky_map_set(info, donky_alloc_string("offset"),     make_number((double)t->off));
+            donky_map_set(info, donky_alloc_string("abs_offset"), make_number((double)((uint64_t)aligned + t->off)));
+            donky_map_set(info, donky_alloc_string("dims"),       dims_v);
+            donky_map_set(tensor_table, donky_alloc_string(t->name), info);
+        }
+    }
+    for (uint64_t i = 0; i < got && i < n_tensors; i++) free(ti[i].name);
+    free(ti);
+    if (bad) {
+        char msg[96]; snprintf(msg, sizeof msg, "read_gguf_metadata: %s", bad);
+        return dk_ffi_err(msg);
+    }
+ 
+    if (d_model)    donky_map_set(m, donky_alloc_string("d_model"),    make_number(d_model));
+    if (n_heads)    donky_map_set(m, donky_alloc_string("n_heads"),    make_number(n_heads));
+    if (n_heads_kv) donky_map_set(m, donky_alloc_string("n_heads_kv"), make_number(n_heads_kv));
+    if (layers)     donky_map_set(m, donky_alloc_string("layers"),     make_number(layers));
+    if (ctx)        donky_map_set(m, donky_alloc_string("context"),    make_number(ctx));
+    if (ffn)        donky_map_set(m, donky_alloc_string("ffn"),        make_number(ffn));
+    if (rope)       donky_map_set(m, donky_alloc_string("rope_base"),  make_number(rope));
+    if (arch[0])    donky_map_set(m, donky_alloc_string("arch"),       donky_alloc_string(arch));
+    donky_map_set(m, donky_alloc_string("tensor_data_offset"), make_number((double)aligned));
+    return m;
+}
+
+// ---- Q4_K dequantization ---------------------------------------------------
+// llama.cpp block_q4_K: 144 bytes, 256 weights. d/dmin are IEEE fp16.
+typedef struct __attribute__((packed)) {
+    uint16_t d;          // fp16 super-block scale
+    uint16_t dmin;       // fp16 super-block min
+    uint8_t  scales[12]; // 6-bit packed sub-block scales/mins (8 each)
+    uint8_t  qs[128];    // 256 nibbles
+} DkQ4KBlock;
+typedef char dk_q4k_size_check[(sizeof(DkQ4KBlock) == 144) ? 1 : -1];
+
+static inline float dk_fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1F;
+    uint32_t mant = (uint32_t)h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign << 31; }
+        else {                            // subnormal: normalize
+            int e = -1;
+            do { e++; mant <<= 1; } while ((mant & 0x400) == 0);
+            mant &= 0x3FF;
+            f = (sign << 31) | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {             // inf / nan
+        f = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float out; memcpy(&out, &f, 4); return out;
+}
+
+// Unpack the 8 6-bit scales and 8 6-bit mins from the 12 packed bytes (llama.cpp's
+// get_scale_min_k4). Result: sc[0..7], mn[0..7] in [0,63], scaled by d / dmin.
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = (uint8_t)(q[j]     & 63);
+        *m = (uint8_t)(q[j + 4] & 63);
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4)   | ((q[j]     >> 6) << 4));
+    }
+}
+
+// Dequantize one 256-weight Q4_K block (ggml dequantize_row_q4_K).
+// Each 32-byte qs segment holds TWO sub-blocks: low nibbles -> weights [j, j+32),
+// high nibbles -> weights [j+32, j+64); then j += 64, q += 32, is += 2.
+static void dk_q4k_dequant(const DkQ4KBlock* blk, float* dst) {
+    const float d    = dk_fp16_to_fp32(blk->d);
+    const float dmin = dk_fp16_to_fp32(blk->dmin);
+    const uint8_t* q = blk->qs;
+    int is = 0;
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc0, mn0, sc1, mn1;
+        get_scale_min_k4(is + 0, blk->scales, &sc0, &mn0);
+        get_scale_min_k4(is + 1, blk->scales, &sc1, &mn1);
+        const float d1 = d * (float)sc0, m1 = dmin * (float)mn0;
+        const float d2 = d * (float)sc1, m2 = dmin * (float)mn1;
+        for (int l = 0; l < 32; ++l) dst[j + l]      = d1 * (float)(q[l] & 0x0F) - m1;
+        for (int l = 0; l < 32; ++l) dst[j + 32 + l] = d2 * (float)(q[l] >> 4)   - m2;
+        q += 32;
+        is += 2;
+    }
+}
+
+// ffi_peek_q4_row(ptr, row_id, n_embd): extracts a single row of Q4_K weights
+// from a quantized matrix and dequantizes it to a fresh f64 Donky array.
+uint64_t donky_ffi_peek_q4_row(uint64_t ptr_val, uint64_t row_id_val, uint64_t n_embd_val) {
+    if (!is_number(ptr_val) || !is_number(row_id_val) || !is_number(n_embd_val)) return TAG_BASE;
+    size_t row_id = (size_t)as_number(row_id_val);
+    size_t n_embd = (size_t)as_number(n_embd_val);
+    if (n_embd == 0 || (n_embd % 256) != 0) return dk_ffi_err("ffi_peek_q4_row: n_embd must be a multiple of 256");
+    
+    const uint8_t* base = (const uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!base) return dk_ffi_err("ffi_peek_q4_row: null pointer");
+    
+    size_t blocks_per_row = n_embd / 256;
+    // The row starts at: base + (row_id * blocks_per_row * sizeof(DkQ4KBlock))
+    const uint8_t* rowp = base + (row_id * blocks_per_row * sizeof(DkQ4KBlock));
+    
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc("ffi_peek_q4_row", n_embd, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    
+    float block[256];
+    for (size_t b = 0; b < blocks_per_row; b++) {
+        const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
+        dk_q4k_dequant(blk, block);
+        for (int i = 0; i < 256; i++) {
+            out[b * 256 + i] = make_number((double)block[i]);
+        }
+    }
+    return r;
+}
+
+// tensor_matmul_q4(a, w_ptr, batch, c, r):  out[i*r + j] = sum_k a[i*c + k] * dequant(W[j*c + k])
+// W is [r rows x c cols] Q4_K, row-major, each row = c/256 consecutive 144-byte blocks.
+// Accumulates in a zero-initialised double buffer and boxes every output exactly once.
+// NOTE: ONLY valid for GGML type 12 (Q4_K). Q6_K (type 14: attn_v, ffn_down, output.weight
+// in Q4_K_M files) has a different 210-byte block; feeding it here reads garbage fp16
+// scales (inf/NaN). The non-finite-scale check below turns that into a clear error.
+uint64_t donky_tensor_matmul_q4(uint64_t a, uint64_t w_ptr,
+                                uint64_t batch_val, uint64_t c_val, uint64_t r_val) {
+    const char* who = "tensor_matmul_q4";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t B, C, R;
+    if (!dk_tensor_dim(who, "batch", batch_val, &B) ||
+        !dk_tensor_dim(who, "c",     c_val,     &C) ||
+        !dk_tensor_dim(who, "r",     r_val,     &R)) return TAG_BASE;
+    if (C == 0 || (C % 256) != 0) {
+        char msg[96]; snprintf(msg, sizeof msg, "%s: c must be a positive multiple of 256", who);
+        return dk_ffi_err(msg);
+    }
+    if (B == 0 || R == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    if (pa->len != B * C) {
+        char msg[160]; snprintf(msg, sizeof msg,
+            "%s: a has %zu elements but batch*c = %zu * %zu = %zu", who, pa->len, B, C, B * C);
+        return dk_ffi_err(msg);
+    }
+    if (!is_number(w_ptr)) return dk_ffi_err("tensor_matmul_q4: w_ptr must be a number");
+    const uint8_t* wp = (const uint8_t*)(uintptr_t)(uint64_t)as_number(w_ptr);
+    if (!wp) return dk_ffi_err("tensor_matmul_q4: null weight pointer");
+ 
+    const size_t k_blocks = C / 256;
+    const size_t n_out    = B * R;
+ 
+    float*  fa  = (float*)malloc(B * C * sizeof(float));
+    double* acc = (double*)malloc(n_out * sizeof(double));
+    if (!fa || !acc) { free(fa); free(acc); return dk_ffi_err("tensor_matmul_q4: out of memory"); }
+    memset(acc, 0, n_out * sizeof(double));
+    for (size_t i = 0; i < B * C; i++) fa[i] = (float)as_number(pa->data[i]);
+ 
+    float block[256];
+    for (size_t row = 0; row < R; row++) {
+        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ4KBlock);
+        for (size_t b = 0; b < k_blocks; b++) {
+            const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
+            if (!isfinite(dk_fp16_to_fp32(blk->d)) || !isfinite(dk_fp16_to_fp32(blk->dmin))) {
+                char msg[200]; snprintf(msg, sizeof msg,
+                    "%s: non-finite block scale at row %zu block %zu (weight is not Q4_K? "
+                    "Q6_K/Q4_0 tensor, or wrong data offset)", who, row, b);
+                free(fa); free(acc);
+                return dk_ffi_err(msg);
+            }
+            dk_q4k_dequant(blk, block);
+            for (size_t bi = 0; bi < B; bi++) {
+                const float* xb = fa + bi * C + b * 256;
+                double s = 0.0;
+                for (int i = 0; i < 256; i++) s += (double)block[i] * (double)xb[i];
+                acc[bi * R + row] += s;
+            }
+        }
+    }
+    free(fa);
+ 
+    uint64_t* out = NULL;
+    uint64_t res = dk_tensor_alloc(who, n_out, &out);
+    if (res == TAG_BASE) { free(acc); return TAG_BASE; }
+    for (size_t i = 0; i < n_out; i++) out[i] = make_number(acc[i]);   // box once
+    free(acc);
+    return res;
+}
+
+// ===== Task 1: Q6_K (GGML type 14). Paste right after dk_q4k_dequant / donky_tensor_matmul_q4. =====
+// llama.cpp block_q6_K: 210 bytes = 128 (ql, low 4 bits) + 64 (qh, high 2 bits)
+//                                   + 16 (int8 scales) + 2 (fp16 d, LAST) for 256 weights.
+typedef struct __attribute__((packed)) {
+    uint8_t  ql[128];
+    uint8_t  qh[64];
+    int8_t   scales[16];
+    uint16_t d;
+} DkQ6KBlock;
+typedef char dk_q6k_size_check[(sizeof(DkQ6KBlock) == 210) ? 1 : -1];
+ 
+// Matches ggml dequantize_row_q6_K: per 128-weight half, 4 quarters of 32 weights;
+// quarter 0/1 use the low nibbles of ql[l] / ql[l+32], quarter 2/3 the high nibbles;
+// qh[l] supplies 2 bits per quarter; scale index = l/16 + 2*quarter (+8 for 2nd half).
+static void dk_q6k_dequant(const DkQ6KBlock* blk, float* dst) {
+    const float d = dk_fp16_to_fp32(blk->d);
+    const uint8_t* ql = blk->ql;
+    const uint8_t* qh = blk->qh;
+    const int8_t*  sc = blk->scales;
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int q1 = (int)((ql[l]      & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[l]      >> 4)   | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[l + 32] >> 4)   | (((qh[l] >> 6) & 3) << 4)) - 32;
+            dst[l]      = d * (float)sc[is + 0] * (float)q1;
+            dst[l + 32] = d * (float)sc[is + 2] * (float)q2;
+            dst[l + 64] = d * (float)sc[is + 4] * (float)q3;
+            dst[l + 96] = d * (float)sc[is + 6] * (float)q4;
+        }
+        dst += 128; ql += 64; qh += 32; sc += 8;
+    }
+}
+ 
+// tensor_matmul_q6(a, w_ptr, batch, c, r): same contract as tensor_matmul_q4, for Q6_K weights
+//   out[i*r + j] = sum_k a[i*c + k] * dequant(W[j*c + k])      W: [r rows x c cols], c % 256 == 0
+// Use for output.weight and the Q6_K attn_v / ffn_down tensors of Q4_K_M files.
+uint64_t donky_tensor_matmul_q6(uint64_t a, uint64_t w_ptr,
+                                uint64_t batch_val, uint64_t c_val, uint64_t r_val) {
+    const char* who = "tensor_matmul_q6";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    size_t B, C, R;
+    if (!dk_tensor_dim(who, "batch", batch_val, &B) ||
+        !dk_tensor_dim(who, "c",     c_val,     &C) ||
+        !dk_tensor_dim(who, "r",     r_val,     &R)) return TAG_BASE;
+    if (C == 0 || (C % 256) != 0) {
+        char msg[96]; snprintf(msg, sizeof msg, "%s: c must be a positive multiple of 256", who);
+        return dk_ffi_err(msg);
+    }
+    if (B == 0 || R == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    if (pa->len != B * C) {
+        char msg[160]; snprintf(msg, sizeof msg,
+            "%s: a has %zu elements but batch*c = %zu * %zu = %zu", who, pa->len, B, C, B * C);
+        return dk_ffi_err(msg);
+    }
+    if (!is_number(w_ptr)) return dk_ffi_err("tensor_matmul_q6: w_ptr must be a number");
+    const uint8_t* wp = (const uint8_t*)(uintptr_t)(uint64_t)as_number(w_ptr);
+    if (!wp) return dk_ffi_err("tensor_matmul_q6: null weight pointer");
+ 
+    const size_t k_blocks = C / 256;
+    const size_t n_out    = B * R;
+    float*  fa  = (float*)malloc(B * C * sizeof(float));
+    double* acc = (double*)malloc(n_out * sizeof(double));
+    if (!fa || !acc) { free(fa); free(acc); return dk_ffi_err("tensor_matmul_q6: out of memory"); }
+    memset(acc, 0, n_out * sizeof(double));
+    for (size_t i = 0; i < B * C; i++) fa[i] = (float)as_number(pa->data[i]);
+ 
+    float block[256];
+    for (size_t row = 0; row < R; row++) {
+        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ6KBlock);
+        for (size_t b = 0; b < k_blocks; b++) {
+            const DkQ6KBlock* blk = (const DkQ6KBlock*)(rowp + b * sizeof(DkQ6KBlock));
+            if (!isfinite(dk_fp16_to_fp32(blk->d))) {
+                char msg[200]; snprintf(msg, sizeof msg,
+                    "%s: non-finite block scale at row %zu block %zu (weight is not Q6_K, "
+                    "or wrong data offset)", who, row, b);
+                free(fa); free(acc);
+                return dk_ffi_err(msg);
+            }
+            dk_q6k_dequant(blk, block);
+            for (size_t bi = 0; bi < B; bi++) {
+                const float* xb = fa + bi * C + b * 256;
+                double s = 0.0;
+                for (int i = 0; i < 256; i++) s += (double)block[i] * (double)xb[i];
+                acc[bi * R + row] += s;
+            }
+        }
+    }
+    free(fa);
+    uint64_t* out = NULL;
+    uint64_t res = dk_tensor_alloc(who, n_out, &out);
+    if (res == TAG_BASE) { free(acc); return TAG_BASE; }
+    for (size_t i = 0; i < n_out; i++) out[i] = make_number(acc[i]);
+    free(acc);
+    return res;
+}
+
+// ffi_peek_f32(ptr, n): memcpy n float32 values from ptr into a new Donky array.
+// This is the fast path for loading GGUF F32 embeddings without byte-by-byte peeking.
+uint64_t donky_ffi_peek_f32(uint64_t ptr_val, uint64_t n_val) {
+    if (!is_number(ptr_val) || !is_number(n_val)) return TAG_BASE;
+    double dn = as_number(n_val);
+    if (!(dn >= 0.0) || dn > 1e9) return dk_ffi_err("ffi_peek_f32: n out of range");
+    size_t n = (size_t)dn;
+    if (n == 0) return donky_alloc_array();
+    const float* src = (const float*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!src) return donky_alloc_array();
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc("ffi_peek_f32", n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    for (size_t i = 0; i < n; i++) out[i] = make_number((double)src[i]);
+    return r;
+}
+
+// ffi_peek_str(ptr, n): copy n bytes from ptr into a new Donky string.
+// This is the fast path for reading GGUF tensor names and metadata keys.
+uint64_t donky_ffi_peek_str(uint64_t ptr_val, uint64_t n_val) {
+    if (!is_number(ptr_val) || !is_number(n_val)) return TAG_BASE;
+    double dn = as_number(n_val);
+    if (!(dn >= 0.0) || dn > 1e9) return dk_ffi_err("ffi_peek_str: n out of range");
+    size_t n = (size_t)dn;
+    if (n == 0) return donky_alloc_string("");
+    const char* src = (const char*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!src) return donky_alloc_string("");
+    char* copy = gc_malloc(n + 1);
+    memcpy(copy, src, n);
+    copy[n] = 0;
+    ((GCHeader*)copy - 1)->type_tag = TAG_STRING;
+    return TAG_BASE | (TAG_STRING << 48) | (uint64_t)copy;
 }
 
 // ---- hashing ----

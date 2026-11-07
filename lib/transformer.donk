@@ -1,0 +1,401 @@
+// lib/transformer.donk — LLaMA-style transformer block for Sentinel V3.
+//
+// Chains the C runtime primitives that already exist in runtime_template.c
+// (SEMANTICS §11.20: an unregistered name fails the whole build, so this file
+// uses ONLY names in STDLIB_BUILTINS):
+//
+//   tensor_matmul_f32(a, b, r_a, c_a, c_b)   flat row-major matmul
+//   tensor_rms_norm(a)                       x / sqrt(mean(x^2) + 1e-5)
+//   tensor_rope(a, pos)                      rotary embedding, one vector, base 10000
+//   tensor_attention(q, k, v, seq, d)        single-head causal attention
+//   tensor_silu(a)                           x * sigmoid(x)
+//   tensor_softmax_f32(a)                    (unused here — softmax is inside attention)
+//   tensor_add(a, b)                         elementwise add (broadcast a number)
+//   tensor_mul(a, b)                         elementwise (Hadamard) product
+//
+// The four helpers below (rms_norm, rope, attention, silu) are THIN wrappers
+// over the C builtins. Only the multi-head / GQA assembly and the gamma scaling
+// happen in Donky, because the C primitives are single-vector / single-head.
+//
+// API (flat, row-major; "x" is the running activation):
+//
+//   transformer_forward(x, cfg, weights) -> array
+//       x        flat array, length seq_len * d_model
+//       cfg      map: {seq_len, d_model, n_heads, n_kv_heads, d_head, d_ff, eps}
+//       weights  map: {wq, wk, wv, wo, w1, w2,
+//                      rms_att, rms_ffn,   (gamma vectors, length d_model)
+//                      rope_cos, rope_sin} (IGNORED: tensor_rope computes them)
+//       returns  flat array, length seq_len * d_model
+//
+//   rms_norm(x, gamma, eps) -> array
+//   rope(x, cos, sin, seq_len, n_heads, d_head) -> array   (cos/sin ignored)
+//   attention(q, k, v, seq_len, n_heads, n_kv_heads, d_head) -> array
+//   silu(x) -> array
+//
+// cos/sin are kept in the rope() signature only so existing callers do not
+// break; tensor_rope computes sin/cos internally (hardcoded base 10000, the
+// Llama/Mistral default). The eps argument to rms_norm is likewise ignored:
+// tensor_rms_norm hardcodes 1e-5 (Llama-3 rms_norm_eps).
+
+// ---------------------------------------------------------------- shape / type helpers
+
+fn tf_check_flat(name, a, want) {
+    if type(a) != "array" {
+        throw "transformer: " + name + " must be an array";
+    }
+    if len(a) != want {
+        throw "transformer: " + name + " has length " + str(len(a)) + ", expected " + str(want);
+    }
+    let i = 0;
+    while i < len(a) {
+        let v = a[i];
+        if type(v) != "number" {
+            throw "transformer: " + name + "[" + str(i) + "] is not a number";
+        }
+        if !(v - v == 0.0) {
+            throw "transformer: " + name + "[" + str(i) + "] is not finite";
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn tf_check_int(name, v, lo) {
+    if type(v) != "number" || v != floor(v) || v < lo {
+        throw "transformer: " + name + " must be a whole number >= " + str(lo);
+    }
+    return null;
+}
+
+fn tf_cfg(cfg, key) {
+    let v = cfg[key];
+    if v == null {
+        throw "transformer: cfg missing key '" + key + "'";
+    }
+    return v;
+}
+
+fn tf_w(weights, key, want) {
+    let v = weights[key];
+    if v == null {
+        throw "transformer: weights missing key '" + key + "'";
+    }
+    tf_check_flat(key, v, want);
+    return v;
+}
+
+// Copy `len` elements starting at `start` from flat array `a` into a fresh array.
+fn tf_slice(a, start, len) {
+    let out = [];
+    let i = 0;
+    while i < len {
+        push(out, a[start + i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Append every element of `src` to `dst` (mutates dst, returns dst).
+fn tf_extend(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+// Elementwise multiply of two equal-length arrays (gamma scaling in rms_norm).
+// Implemented as a Donky loop to avoid relying on tensor_mul accepting two arrays
+// — although it does (see runtime_template.c dk_tensor_binop), a loop is equally
+// cheap here and mirrors the "no closures, no surprises" style of lib/neural.donk.
+fn tf_mul_elem(a, b, what) {
+    if type(a) != "array" || type(b) != "array" || len(a) != len(b) {
+        throw "transformer: " + what + ": multiply length mismatch";
+    }
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        push(out, a[i] * b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- RMSNorm
+
+// rms_norm(x, gamma, eps): one row of length d. Uses tensor_rms_norm(x) for
+// the normalization (it hardcodes eps = 1e-5), then scales by gamma with a
+// plain loop, because tensor_rms_norm does not take a gamma vector.
+fn rms_norm(x, gamma, eps) {
+    if type(x) != "array" || type(gamma) != "array" || len(x) != len(gamma) {
+        throw "rms_norm: x and gamma must be equal-length arrays";
+    }
+    if len(x) == 0 {
+        throw "rms_norm: empty input";
+    }
+    // tensor_rms_norm returns the unit-RMS vector; gamma is applied below.
+    // (eps is accepted for signature compatibility; the C builtin hardcodes 1e-5.)
+    let normed = tensor_rms_norm(x);
+    return tf_mul_elem(normed, gamma, "rms_norm");
+}
+
+// RMSNorm applied to every row of a flat [rows x d] buffer. Returns a flat array.
+fn tf_rms_norm_rows(x, gamma, rows, d, eps) {
+    if len(x) != rows * d {
+        throw "transformer: rms_norm row buffer has " + str(len(x)) + " values, expected " + str(rows * d);
+    }
+    let out = [];
+    let r = 0;
+    while r < rows {
+        let row = tf_slice(x, r * d, d);
+        let n = rms_norm(row, gamma, eps);
+        tf_extend(out, n);
+        r = r + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- RoPE
+
+// rope(x, cos, sin, seq_len, n_heads, d_head)
+//   x is flat [seq_len x n_heads x d_head] (row-major token, head, dim).
+//   cos/sin are accepted for signature compatibility but IGNORED:
+//   tensor_rope(a, pos) computes sin/cos internally (base 10000).
+// For each (pos, head) the d_head-vector is rotated in place by tensor_rope.
+fn rope(x, cos, sin, seq_len, n_heads, d_head) {
+    tf_check_int("seq_len", seq_len, 1);
+    tf_check_int("n_heads", n_heads, 1);
+    tf_check_int("d_head", d_head, 1);
+    if d_head % 2 != 0 {
+        throw "rope: d_head must be even (tensor_rope rotates pairs)";
+    }
+    tf_check_flat("x", x, seq_len * n_heads * d_head);
+
+    let out = [];
+    let p = 0;
+    while p < seq_len {
+        let h = 0;
+        while h < n_heads {
+            let base = (p * n_heads + h) * d_head;
+            let vec = tf_slice(x, base, d_head);
+            // tensor_rope(vec, pos) — pos is the token index p.
+            let rotated = tensor_rope(vec, p);
+            tf_extend(out, rotated);
+            h = h + 1;
+        }
+        p = p + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- attention
+
+// attention(q, k, v, seq_len, n_heads, n_kv_heads, d_head)
+//   q: flat [seq_len x n_heads    x d_head]
+//   k: flat [seq_len x n_kv_heads x d_head]
+//   v: flat [seq_len x n_kv_heads x d_head]
+//
+// tensor_attention(q, k, v, seq, d) is SINGLE-head and CAUSAL. This wrapper
+// loops over query heads, picks the matching KV head (GQA grouping), extracts
+// the per-head slices, calls tensor_attention, and concatenates the per-head
+// outputs into flat [seq_len x n_heads x d_head].
+//
+// Per-head slice layout: for query head h at token t, the d_head-vector lives
+// at q[(t * n_heads + h) * d_head .. + d_head]. tensor_attention wants the
+// whole per-head Q/K/V as [seq x d_head] flat, i.e. Q_head[i*d_head + j] =
+// q[(i * n_heads + h) * d_head + j]. So we build a per-head contiguously
+// packed [seq_len x d_head] buffer for Q, K and V before calling.
+fn attention(q, k, v, seq_len, n_heads, n_kv_heads, d_head) {
+    tf_check_int("seq_len", seq_len, 1);
+    tf_check_int("n_heads", n_heads, 1);
+    tf_check_int("n_kv_heads", n_kv_heads, 1);
+    tf_check_int("d_head", d_head, 1);
+    if n_heads % n_kv_heads != 0 {
+        throw "attention: n_heads must be a multiple of n_kv_heads";
+    }
+    tf_check_flat("q", q, seq_len * n_heads * d_head);
+    tf_check_flat("k", k, seq_len * n_kv_heads * d_head);
+    tf_check_flat("v", v, seq_len * n_kv_heads * d_head);
+
+    let group = n_heads / n_kv_heads;
+    let out = [];
+    let h = 0;
+    while h < n_heads {
+        let kvh = floor(h / group);   // integer KV-head index: Donky '/' is float division
+
+        // Pack this head's Q/K/V into contiguous [seq_len x d_head] buffers.
+        let q_head = [];
+        let k_head = [];
+        let v_head = [];
+        let t = 0;
+        while t < seq_len {
+            let qb = (t * n_heads + h) * d_head;
+            let kb = (t * n_kv_heads + kvh) * d_head;
+            tf_extend(q_head, tf_slice(q, qb, d_head));
+            tf_extend(k_head, tf_slice(k, kb, d_head));
+            tf_extend(v_head, tf_slice(v, kb, d_head));
+            t = t + 1;
+        }
+
+        // Single-head causal attention over the whole sequence.
+        let head_out = tensor_attention(q_head, k_head, v_head, seq_len, d_head);
+
+        // head_out is [seq_len x d_head], flat. Scatter it back into the
+        // interleaved [seq_len x n_heads x d_head] layout: for each token t,
+        // the d_head-vector goes at out[(t * n_heads + h) * d_head .. + d_head].
+        t = 0;
+        while t < seq_len {
+            let dst_start = (t * n_heads + h) * d_head;
+            let src_start = t * d_head;
+            let j = 0;
+            while j < d_head {
+                push(out, head_out[src_start + j]);
+                j = j + 1;
+            }
+            // pad out up to dst_start + d_head if this is not the last head
+            // (the interleaved layout interleaves heads per token; we cannot
+            //  push directly at an arbitrary index, so we build the array in
+            //  token-major order by pre-allocating below).
+            t = t + 1;
+        }
+        h = h + 1;
+    }
+
+    // The loop above pushes heads back-to-back (head-major), which is the
+    // wrong layout. Rebuild in token-major order from per-head results.
+    // Simpler: redo the scatter with an explicit output buffer sized up front.
+    // We do that here rather than pre-allocating because the C builtin already
+    // paid the attention cost; the reassembly is O(seq*n_heads*d_head).
+    return tf_interleave_heads(out, seq_len, n_heads, d_head);
+}
+
+// Reorder a head-major [n_heads x seq_len x d_head] buffer into the
+// token-major [seq_len x n_heads x d_head] layout that transformer_forward
+// (and everything downstream of attention) expects.
+fn tf_interleave_heads(head_major, seq_len, n_heads, d_head) {
+    let total = seq_len * n_heads * d_head;
+    if len(head_major) != total {
+        throw "transformer: interleave_heads: buffer has " + str(len(head_major)) + " values, expected " + str(total);
+    }
+    // Allocate the output by pushing placeholders, then overwrite.
+    let out = [];
+    let i = 0;
+    while i < total {
+        push(out, 0.0);
+        i = i + 1;
+    }
+    let h = 0;
+    while h < n_heads {
+        let t = 0;
+        while t < seq_len {
+            let src = (h * seq_len + t) * d_head;
+            let dst = (t * n_heads + h) * d_head;
+            let j = 0;
+            while j < d_head {
+                out[dst + j] = head_major[src + j];
+                j = j + 1;
+            }
+            t = t + 1;
+        }
+        h = h + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- SiLU
+
+// silu(x): tensor_silu is a flat-array builtin; no wrapper loop needed.
+fn silu(x) {
+    if type(x) != "array" {
+        throw "silu: expected an array";
+    }
+    return tensor_silu(x);
+}
+
+// ---------------------------------------------------------------- the block
+
+// transformer_forward(x, cfg, weights) -> flat [seq_len x d_model]
+//
+// Pre-norm LLaMA decoder block:
+//   h = x + attn(rms_norm(x, rms_att))
+//   y = h + ffn (rms_norm(h, rms_ffn))
+// where attn = wo @ attention(rope(Q), rope(K), V) and ffn = w2 @ silu(w1 @ .).
+fn transformer_forward(x, cfg, weights) {
+    // ---- read + validate config ----
+    let seq_len = tf_cfg(cfg, "seq_len");
+    let d_model = tf_cfg(cfg, "d_model");
+    let n_heads = tf_cfg(cfg, "n_heads");
+    let n_kv_heads = tf_cfg(cfg, "n_kv_heads");
+    let d_head = tf_cfg(cfg, "d_head");
+    let d_ff = tf_cfg(cfg, "d_ff");
+    let eps = tf_cfg(cfg, "eps");
+
+    tf_check_int("seq_len", seq_len, 1);
+    tf_check_int("d_model", d_model, 1);
+    tf_check_int("n_heads", n_heads, 1);
+    tf_check_int("n_kv_heads", n_kv_heads, 1);
+    tf_check_int("d_head", d_head, 1);
+    tf_check_int("d_ff", d_ff, 1);
+    if type(eps) != "number" {
+        throw "transformer: eps must be a number";
+    }
+    if n_heads * d_head != d_model {
+        throw "transformer: n_heads * d_head must equal d_model";
+    }
+    if n_heads % n_kv_heads != 0 {
+        throw "transformer: n_heads must be a multiple of n_kv_heads";
+    }
+
+    let rows = seq_len;
+    tf_check_flat("x", x, rows * d_model);
+
+    // ---- validate every weight tensor up front (fail before any allocation) ----
+    let wq = tf_w(weights, "wq", d_model * (n_heads * d_head));
+    let wk = tf_w(weights, "wk", d_model * (n_kv_heads * d_head));
+    let wv = tf_w(weights, "wv", d_model * (n_kv_heads * d_head));
+    let wo = tf_w(weights, "wo", (n_heads * d_head) * d_model);
+    let w1 = tf_w(weights, "w1", d_model * d_ff);
+    let w2 = tf_w(weights, "w2", d_ff * d_model);
+    let rms_att = tf_w(weights, "rms_att", d_model);
+    let rms_ffn = tf_w(weights, "rms_ffn", d_model);
+    // rope_cos / rope_sin are accepted but ignored: tensor_rope computes them.
+    // (Kept optional so older weights maps still load.)
+
+    // ================= attention sub-block =================
+    // x_norm = rms_norm(x) per row (gamma = rms_att, eps folded in by the C builtin)
+    let x_norm = tf_rms_norm_rows(x, rms_att, rows, d_model, eps);
+
+    // q = x_norm @ wq   [rows x (n_heads*d_head)]
+    let q = tensor_matmul_f32(x_norm, wq, rows, d_model, n_heads * d_head);
+    // k = x_norm @ wk   [rows x (n_kv_heads*d_head)]
+    let k = tensor_matmul_f32(x_norm, wk, rows, d_model, n_kv_heads * d_head);
+    // v = x_norm @ wv
+    let v = tensor_matmul_f32(x_norm, wv, rows, d_model, n_kv_heads * d_head);
+
+    // rope on q and k (v is not rotated). cos/sin args are ignored by rope().
+    let q = rope(q, null, null, seq_len, n_heads, d_head);
+    let k = rope(k, null, null, seq_len, n_kv_heads, d_head);
+
+    // multi-head causal attention
+    let attn = attention(q, k, v, seq_len, n_heads, n_kv_heads, d_head);
+
+    // output projection: [rows x d_model]
+    let proj = tensor_matmul_f32(attn, wo, rows, n_heads * d_head, d_model);
+
+    // residual: h = x + proj  (tensor_add handles two equal-length arrays)
+    let h = tensor_add(x, proj);
+
+    // ================= feed-forward sub-block =================
+    let h_norm = tf_rms_norm_rows(h, rms_ffn, rows, d_model, eps);
+
+    // up projection: [rows x d_ff]
+    let up = tensor_matmul_f32(h_norm, w1, rows, d_model, d_ff);
+    // SiLU activation (flat-array builtin)
+    let act = silu(up);
+    // down projection: [rows x d_model]
+    let down = tensor_matmul_f32(act, w2, rows, d_ff, d_model);
+
+    // residual: y = h + down
+    return tensor_add(h, down);
+}

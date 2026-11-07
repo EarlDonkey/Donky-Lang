@@ -15,4 +15,4 @@ src\profiler.rs:
 src\aot.rs:
 src\runtime_template.c:
 
-# env-dep:CARGO_PKG_VERSION=3.0.1
+# env-dep:CARGO_PKG_VERSION=3.2.0

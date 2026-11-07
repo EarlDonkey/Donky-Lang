@@ -1,0 +1,94 @@
+// lib/neural.donk — MLP forward pass for Sentinel V3.
+//
+// Depends ONLY on the three builtins Agent 1 added to runtime_template.c
+// (SEMANTICS §11.20: unknown names fail the build, so there is no fallback):
+//   tensor_matmul_f32(a, b)   flat row-major matmul, shapes passed out-of-band
+//   tensor_relu_f32(a)        elementwise max(0, x)
+//   tensor_softmax_f32(a)     elementwise softmax over a 1D buffer
+//
+// Bias is folded in with a plain loop — Agent 1 did not add tensor_add_f32,
+// and an elementwise add is four lines. Do NOT introduce tensor_add_f32
+// without adding it to STDLIB_BUILTINS first.
+//
+// API:
+//   mlp_forward(input, in_dim, w1, b1, hidden_dim, w2, b2, out_dim) -> array
+//       input:    flat array, length in_dim
+//       w1:       flat array, length in_dim*hidden_dim  (row-major: w1[i*hidden+j])
+//       b1:       flat array, length hidden_dim
+//       w2:       flat array, length hidden_dim*out_dim (row-major: w2[j*out+k])
+//       b2:       flat array, length out_dim
+//       returns softmax(relu(input·W1 + b1)·W2 + b2), length out_dim
+//   mlp_classify(probs) -> int   argmax, ties to lower index
+//
+// Shapes are enforced by mlp_forward before any builtin is called. The
+// builtins themselves are assumed to be "dumb matmul given the flat buffers
+// and the shape the caller already knows" — i.e. tensor_matmul_f32(a, b)
+// with a of length m*k and b of length k*n. If Agent 1's builtin carries
+// shapes inside the buffer, swap the calls in mlp_forward; nothing else
+// changes.
+
+fn nn_check_flat(name, a, want) {
+    if type(a) != "array" {
+        throw "neural: " + name + " must be an array";
+    }
+    if len(a) != want {
+        throw "neural: " + name + " has length " + str(len(a)) + ", expected " + str(want);
+    }
+    let i = 0;
+    while i < len(a) {
+        if type(a[i]) != "number" {
+            throw "neural: " + name + "[" + str(i) + "] is not a number";
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+// Elementwise add, used only for the bias. Four lines beats a fourth builtin.
+fn nn_add(a, b) {
+    if type(a) != "array" || type(b) != "array" || len(a) != len(b) {
+        throw "neural: nn_add length mismatch";
+    }
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        push(out, a[i] + b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mlp_forward(input, in_dim, weights1, bias1, hidden_dim, weights2, bias2, out_dim) {
+    if in_dim < 1 || hidden_dim < 1 || out_dim < 1 {
+        throw "neural: dims must be positive";
+    }
+    nn_check_flat("input", input, in_dim);
+    nn_check_flat("weights1", weights1, in_dim * hidden_dim);
+    nn_check_flat("bias1", bias1, hidden_dim);
+    nn_check_flat("weights2", weights2, hidden_dim * out_dim);
+    nn_check_flat("bias2", bias2, out_dim);
+
+    // h = relu(input · W1 + b1)         1 x in_dim  ·  in_dim x hidden_dim
+    let h = tensor_matmul_f32(input, weights1, 1, in_dim, hidden_dim);
+    h = nn_add(h, bias1);
+    h = tensor_relu_f32(h);
+
+    // logits = h · W2 + b2              1 x hidden_dim  ·  hidden_dim x out_dim
+    let logits = tensor_matmul_f32(h, weights2, 1, hidden_dim, out_dim);
+    logits = nn_add(logits, bias2);
+
+    return tensor_softmax_f32(logits);
+}
+
+fn mlp_classify(probs) {
+    if type(probs) != "array" || len(probs) == 0 {
+        throw "neural: mlp_classify requires a non-empty array";
+    }
+    let best = 0;
+    let i = 1;
+    while i < len(probs) {
+        if probs[i] > probs[best] { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
