@@ -1,0 +1,100 @@
+// lib/state.donk — NetGuard cross-thread state bus.
+//
+// All state that survives across spawn()ed tasks lives in one append-only log
+// file plus a tiny "current snapshot" file that the ARP watcher rewrites.
+// This is deliberate: a security tool's event trail must be auditable, must
+// survive a crash, and must be readable by an external SIEM. global_set() is a
+// demo mechanism; a file is a product mechanism.
+//
+// Layout under %TEMP%:
+//   netguard-<session>.log     append-only event stream, one line per event
+//   netguard-<session>.state   the current snapshot (overwritten, JSON)
+//
+// Line format (log):  <ISO8601>\t<LEVEL>\t<EVENT>\t<payload>
+//   LEVEL is one of: INFO / WARN / CRIT
+//   EVENT is a stable identifier, e.g. ARP_PINNED, ARP_MISMATCH, DNS_FORCED
+//
+// The state file is rewritten via write_file (truncates). The log is appended
+// via sys_append_file. Neither is atomic at the syscall level, but writes are
+// single-line and short (< 200 bytes), which is best-effort safe in practice.
+// v3.3.1 will add a native atomic-append primitive.
+
+fn _session_path(suffix) {
+    // One session per process. sys_getenv returns null if TEMP is unset,
+    // which should not happen on Windows but we degrade gracefully anyway.
+    let tmp = sys_getenv("TEMP")
+    if tmp == null { tmp = "." }
+    // Session id = process start time in ms, stable for the process lifetime.
+    // Cached via global_set so a second caller gets the same path.
+    let sid = global_get("netguard:session")
+    if sid == null {
+        sid = str(sys_epoch_ms())
+        global_set("netguard:session", sid)
+    }
+    return tmp + "\\netguard-" + sid + suffix
+}
+
+fn state_log_path() { return _session_path(".log") }
+fn state_snapshot_path() { return _session_path(".state") }
+
+fn _iso_now() {
+    return sys_strftime(sys_epoch_ms() / 1000, "%Y-%m-%dT%H:%M:%SZ")
+}
+
+// Append one event. Cheap, non-throwing, safe to call from any thread.
+fn state_log(level, event, payload) {
+    // payload may contain tabs; escape them so the line stays 4-field.
+    let safe = join(split(str(payload), "\t"), " ")
+    let line = _iso_now() + "\t" + str(level) + "\t" + str(event) + "\t" + safe + "\n"
+    sys_append_file(state_log_path(), line)
+    return null
+}
+
+// Rewrite the whole snapshot. The ARP watcher calls this once per poll; the
+// HTTP handler reads it on each dashboard request. If two writers race, the
+// last one wins — acceptable because the snapshot is regenerated on the next
+// tick (500 ms later).
+fn state_snapshot(m) {
+    let s = json_encode(m)
+    write_file(state_snapshot_path(), s)
+    return null
+}
+
+// Read the snapshot, or an empty map if it does not exist yet.
+fn state_read_snapshot() {
+    let path = state_snapshot_path()
+    if !file_exists(path) { return {} }
+    let raw = read_file(path)
+    let v = json_decode(raw)
+    if v == null { return {} }
+    return v
+}
+
+// Read the last N lines of the log, oldest first. If the log is shorter,
+// returns whatever exists. Used by the HTTP handler to build the dashboard.
+fn state_tail(n) {
+    let path = state_log_path()
+    if !file_exists(path) { return [] }
+    let raw = read_file(path)
+    let lines = split(raw, "\n")
+    // split() drops empty tokens; a trailing newline produces a trailing ""
+    // which is already dropped. Reverse, take N, reverse back.
+    let out = []
+    let i = len(lines) - 1
+    let taken = 0
+    while i >= 0 && taken < n {
+        push(out, lines[i])
+        i = i - 1
+        taken = taken + 1
+    }
+    // We built it backwards; reverse in place.
+    let rev = []
+    let j = len(out) - 1
+    while j >= 0 { push(rev, out[j]); j = j - 1 }
+    return rev
+}
+
+// Convenience wrappers for the three levels we actually use.
+fn log_info(event, payload) { state_log("INFO", event, payload); return null }
+fn log_warn(event, payload) { state_log("WARN", event, payload); return null }
+fn log_crit(event, payload) { state_log("CRIT", event, payload); return null }

@@ -1,0 +1,599 @@
+// lib/tokenizer.donk — GGUF byte-level BPE tokenizer (Llama-3 style), written in Donky.
+//
+// Where the data lives: `tokenizer.ggml.tokens` (the vocabulary) and `tokenizer.ggml.merges` (the BPE
+// merge list) are metadata arrays in the GGUF key/value section, NOT tensors, and read_gguf_metadata
+// skips arrays. So this file re-walks the KV section of the mmap'd file (same technique as
+// llm_parse_tensor_table) and reads the strings with ffi_peek / ffi_peek_str.
+//
+// What tok_attach(model, file_base) adds to the model map:
+//   vocab_addr    absolute address of the first token string (its u64 length prefix)
+//   vocab_len     number of tokens
+//   merges_addr   absolute address of the first merge string
+//   merges_len    number of merges
+//   vocab         array: id -> token string (the GPT-2 byte-level alphabet, e.g. "Ġhello")
+//   vocab_ids     map:   token string -> id
+//   bos_id, eos_id   from tokenizer.ggml.{bos,eos}_token_id, or -1
+//   byte_chars, byte_rev   the GPT-2 byte <-> printable-character tables
+// The merge-rank map (merge string -> rank) has 280k entries for Llama-3, so it is built on the first
+// tokenize_bpe call, not at load.
+//
+// Public functions:
+//   tokenize_bpe(model, text)        -> array of token ids (no BOS, no special tokens)
+//   tok_decode(model, ids)           -> string
+//   tok_chat_prompt(model, user)     -> ids of the Llama-3 chat template for one user turn
+//   tok_chat_stops(model)            -> ids that end an assistant turn (<|eot_id|>, <|end_of_text|>)
+//
+// Limits (all deliberate):
+//   - Pre-tokenization follows the Llama-3 regex exactly for ASCII text. Every byte >= 128 is treated as a
+//     letter (no Unicode category tables here), so non-ASCII punctuation / emoji / CJK may be SPLIT
+//     differently from llama.cpp. Encoding stays lossless (byte-level BPE), only the token boundaries differ.
+//   - Special-token text inside user input is encoded as ordinary text, never as control tokens.
+//   - GGUF version 2 and 3 only (version 1 used 32-bit lengths).
+//   - Merge strings contain no raw space inside a symbol (true for byte-level BPE: space is "Ġ").
+//   - Donky constraints: no file-level constants, no closures, floor() instead of integer division.
+
+// ---------------------------------------------------------------- GGUF byte readers
+// Self-contained copies of the llm.donk readers, so this file does not depend on llm.donk.
+
+fn tok_u32(addr, off) {
+    return ffi_peek(addr + off, 4.0);
+}
+
+fn tok_u64(addr, off) {
+    let lo = ffi_peek(addr + off, 4.0);
+    let hi = ffi_peek(addr + off + 4.0, 4.0);
+    return lo + hi * 4294967296.0;
+}
+
+fn tok_scalar_size(vt) {
+    if vt == 0 || vt == 1 || vt == 7 { return 1.0; }
+    if vt == 2 || vt == 3 { return 2.0; }
+    if vt == 4 || vt == 5 || vt == 6 { return 4.0; }
+    if vt == 10 || vt == 11 || vt == 12 { return 8.0; }
+    if vt == 8 { return -1.0; }
+    if vt == 9 { return -2.0; }
+    throw "tokenizer: unknown GGUF value type " + str(vt);
+}
+
+// Offset just past a value of GGUF type vt that starts at `off`.
+fn tok_skip_value(addr, off, vt) {
+    if vt == 8 {
+        return off + 8.0 + tok_u64(addr, off);
+    }
+    if vt == 9 {
+        let elem_vt = tok_u32(addr, off);
+        let count = tok_u64(addr, off + 4.0);
+        let base = off + 12.0;
+        if elem_vt == 8 {
+            let i = 0;
+            while i < count {
+                base = base + 8.0 + tok_u64(addr, base);
+                i = i + 1;
+            }
+            return base;
+        }
+        let es = tok_scalar_size(elem_vt);
+        if es < 0 { throw "tokenizer: nested arrays are not supported"; }
+        return base + count * es;
+    }
+    let sz = tok_scalar_size(vt);
+    return off + sz;
+}
+
+// Walk the KV section once and return where the tokenizer arrays are:
+//   { tokens_off, tokens_len, merges_off, merges_len, bos_id, eos_id }
+// Offsets are relative to `base` (-1 when the key is absent) and point at the first string's length prefix.
+fn tok_scan(base) {
+    if tok_u32(base, 0.0) != 1179993927.0 {
+        throw "tokenizer: not a GGUF file (bad magic)";
+    }
+    let version = tok_u32(base, 4.0);
+    if version < 2 || version > 3 {
+        throw "tokenizer: unsupported GGUF version " + str(version);
+    }
+    let kv_count = tok_u64(base, 16.0);
+    if kv_count > 65536 {
+        throw "tokenizer: metadata count " + str(kv_count) + " is implausible";
+    }
+    let info = {};
+    info["tokens_off"] = -1.0;
+    info["tokens_len"] = 0.0;
+    info["merges_off"] = -1.0;
+    info["merges_len"] = 0.0;
+    info["bos_id"] = -1.0;
+    info["eos_id"] = -1.0;
+
+    let off = 24.0;
+    let i = 0;
+    while i < kv_count {
+        let klen = tok_u64(base, off);
+        if klen > 65536 {
+            throw "tokenizer: metadata key length " + str(klen) + " is implausible";
+        }
+        let key = ffi_peek_str(base + off + 8.0, klen);
+        off = off + 8.0 + klen;
+        let vt = tok_u32(base, off);
+        off = off + 4.0;
+
+        if vt == 9 {
+            if key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.merges" {
+                let evt = tok_u32(base, off);
+                if evt != 8 { throw "tokenizer: " + key + " is not a string array"; }
+                let count = tok_u64(base, off + 4.0);
+                if key == "tokenizer.ggml.tokens" {
+                    info["tokens_off"] = off + 12.0;
+                    info["tokens_len"] = count;
+                } else {
+                    info["merges_off"] = off + 12.0;
+                    info["merges_len"] = count;
+                }
+            }
+        }
+        if vt == 4 || vt == 5 {
+            if key == "tokenizer.ggml.bos_token_id" { info["bos_id"] = tok_u32(base, off); }
+            if key == "tokenizer.ggml.eos_token_id" { info["eos_id"] = tok_u32(base, off); }
+        }
+        off = tok_skip_value(base, off, vt);
+        i = i + 1;
+    }
+    return info;
+}
+
+// ---------------------------------------------------------------- GPT-2 byte <-> character tables
+
+// UTF-8 encoding of a code point below 2048, as a string.
+fn tok_utf8(cp) {
+    if cp < 128 { return bytes_to_str([cp]); }
+    return bytes_to_str([192 + floor(cp / 64), 128 + cp % 64]);
+}
+
+// byte_chars[b] = the printable character (UTF-8 string) GPT-2 uses for byte b: the printable
+// Latin-1 bytes map to themselves, the other 68 bytes map to U+0100, U+0101, ... in byte order.
+fn tok_byte_chars() {
+    let tbl = [];
+    let extra = 0;
+    let b = 0;
+    while b < 256 {
+        let keep = false;
+        if b >= 33 && b <= 126 { keep = true; }
+        if b >= 161 && b <= 172 { keep = true; }
+        if b >= 174 && b <= 255 { keep = true; }
+        let cp = b;
+        if !keep {
+            cp = 256 + extra;
+            extra = extra + 1;
+        }
+        push(tbl, tok_utf8(cp));
+        b = b + 1;
+    }
+    return tbl;
+}
+
+// byte_rev[cp] = the byte that code point stands for, or -1 (cp < 324 covers the whole alphabet).
+fn tok_byte_rev() {
+    let rev = [];
+    let i = 0;
+    while i < 324 {
+        push(rev, -1);
+        i = i + 1;
+    }
+    let extra = 0;
+    let b = 0;
+    while b < 256 {
+        let keep = false;
+        if b >= 33 && b <= 126 { keep = true; }
+        if b >= 161 && b <= 172 { keep = true; }
+        if b >= 174 && b <= 255 { keep = true; }
+        let cp = b;
+        if !keep {
+            cp = 256 + extra;
+            extra = extra + 1;
+        }
+        rev[cp] = b;
+        b = b + 1;
+    }
+    return rev;
+}
+
+// ---------------------------------------------------------------- loading
+
+// Record the tokenizer's location in `model` and load the vocabulary. A GGUF without
+// tokenizer.ggml.tokens gets an empty vocabulary (tok_require then explains it when you need one).
+fn tok_attach(model, base) {
+    let info = tok_scan(base);
+    model["vocab_addr"] = 0.0;
+    model["vocab_len"] = 0.0;
+    model["merges_addr"] = 0.0;
+    model["merges_len"] = 0.0;
+    model["bos_id"] = info["bos_id"];
+    model["eos_id"] = info["eos_id"];
+    model["merge_rank"] = null;
+    model["vocab"] = [];
+    model["vocab_ids"] = {};
+    if info["tokens_off"] < 0 { return null; }
+
+    model["vocab_addr"] = base + info["tokens_off"];
+    model["vocab_len"] = info["tokens_len"];
+    if info["merges_off"] >= 0 {
+        model["merges_addr"] = base + info["merges_off"];
+        model["merges_len"] = info["merges_len"];
+    }
+
+    let addr = model["vocab_addr"];
+    let n = model["vocab_len"];
+    let vocab = [];
+    let ids = {};
+    let off = 0.0;
+    let i = 0;
+    while i < n {
+        let sl = tok_u64(addr, off);
+        let s = ffi_peek_str(addr + off + 8.0, sl);
+        push(vocab, s);
+        if type(ids[s]) != "number" { ids[s] = i; }
+        off = off + 8.0 + sl;
+        i = i + 1;
+    }
+    model["vocab"] = vocab;
+    model["vocab_ids"] = ids;
+    model["byte_chars"] = tok_byte_chars();
+    model["byte_rev"] = tok_byte_rev();
+    return null;
+}
+
+fn tok_require(model) {
+    if type(model) != "map" { throw "tokenizer: model must be a map from llm_load"; }
+    let v = model["vocab"];
+    if type(v) != "array" || len(v) == 0 {
+        throw "tokenizer: this model has no vocabulary (the GGUF has no tokenizer.ggml.tokens)";
+    }
+    return null;
+}
+
+// merge string ("Ġ t") -> rank, built once from the mmap'd merge list (first occurrence wins).
+fn tok_merge_ranks(model) {
+    let cached = model["merge_rank"];
+    if type(cached) == "map" { return cached; }
+    let ranks = {};
+    let addr = model["merges_addr"];
+    let n = model["merges_len"];
+    let off = 0.0;
+    let i = 0;
+    while i < n {
+        let sl = tok_u64(addr, off);
+        let s = ffi_peek_str(addr + off + 8.0, sl);
+        if type(ranks[s]) != "number" { ranks[s] = i; }
+        off = off + 8.0 + sl;
+        i = i + 1;
+    }
+    model["merge_rank"] = ranks;
+    return ranks;
+}
+
+// ---------------------------------------------------------------- pre-tokenizer
+// The Llama-3 split pattern:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}
+//   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// implemented by hand over the UTF-8 bytes of the text (letter = A-Z a-z or any byte >= 128).
+
+fn tok_is_letter(c) {
+    if c >= 65 && c <= 90 { return true; }
+    if c >= 97 && c <= 122 { return true; }
+    if c >= 128 { return true; }
+    return false;
+}
+
+fn tok_is_digit(c) {
+    if c >= 48 && c <= 57 { return true; }
+    return false;
+}
+
+fn tok_is_nl(c) {
+    if c == 10 || c == 13 { return true; }
+    return false;
+}
+
+fn tok_is_space(c) {
+    if c == 32 { return true; }
+    if c >= 9 && c <= 13 { return true; }
+    return false;
+}
+
+// [^\s\p{L}\p{N}]
+fn tok_is_other(c) {
+    if tok_is_space(c) { return false; }
+    if tok_is_letter(c) { return false; }
+    if tok_is_digit(c) { return false; }
+    return true;
+}
+
+// b[i] is an apostrophe: length of the contraction starting there ('s 't 'm 'd 're 've 'll), else 0.
+fn tok_contraction_len(b, i) {
+    let n = len(b);
+    if i + 1 >= n { return 0; }
+    let c1 = b[i + 1];
+    if c1 >= 65 && c1 <= 90 { c1 = c1 + 32; }
+    if c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100 { return 2; }
+    if i + 2 >= n { return 0; }
+    let c2 = b[i + 2];
+    if c2 >= 65 && c2 <= 90 { c2 = c2 + 32; }
+    if c1 == 114 && c2 == 101 { return 3; }
+    if c1 == 118 && c2 == 101 { return 3; }
+    if c1 == 108 && c2 == 108 { return 3; }
+    return 0;
+}
+
+// b: array of byte values. Returns [starts, ends]: pre-token k is b[starts[k] .. ends[k]).
+fn tok_pretokenize(b) {
+    let n = len(b);
+    let starts = [];
+    let ends = [];
+    let i = 0;
+    while i < n {
+        let c = b[i];
+        let e = -1;
+
+        if c == 39 {
+            let cl = tok_contraction_len(b, i);
+            if cl > 0 { e = i + cl; }
+        }
+
+        if e < 0 {
+            let j = i;
+            if !tok_is_nl(c) && !tok_is_letter(c) && !tok_is_digit(c) { j = i + 1; }
+            if j < n {
+                if tok_is_letter(b[j]) {
+                    let k = j;
+                    while k < n && tok_is_letter(b[k]) { k = k + 1; }
+                    e = k;
+                }
+            }
+        }
+
+        if e < 0 {
+            if tok_is_digit(c) {
+                let k2 = i;
+                while k2 < n && k2 < i + 3 && tok_is_digit(b[k2]) { k2 = k2 + 1; }
+                e = k2;
+            }
+        }
+
+        if e < 0 {
+            let j2 = i;
+            if c == 32 { j2 = i + 1; }
+            if j2 < n {
+                if tok_is_other(b[j2]) {
+                    let k3 = j2;
+                    while k3 < n && tok_is_other(b[k3]) { k3 = k3 + 1; }
+                    while k3 < n && tok_is_nl(b[k3]) { k3 = k3 + 1; }
+                    e = k3;
+                }
+            }
+        }
+
+        if e < 0 {
+            // whitespace: \s*[\r\n]+ (through the last newline of the run), else \s+(?!\S), else \s+
+            let k4 = i;
+            let last_nl = -1;
+            while k4 < n && tok_is_space(b[k4]) {
+                if tok_is_nl(b[k4]) { last_nl = k4; }
+                k4 = k4 + 1;
+            }
+            if last_nl >= 0 {
+                e = last_nl + 1;
+            } else {
+                if k4 >= n {
+                    e = k4;
+                } else {
+                    if k4 - i > 1 { e = k4 - 1; } else { e = i + 1; }
+                }
+            }
+        }
+
+        push(starts, i);
+        push(ends, e);
+        i = e;
+    }
+    return [starts, ends];
+}
+
+// ---------------------------------------------------------------- BPE
+// symbols: array of strings (one printable character each). Repeatedly merge the adjacent pair with the
+// lowest merge rank, in every non-overlapping position, until no pair is in the merge list.
+fn tok_bpe(ranks, symbols) {
+    while len(symbols) > 1 {
+        let best = -1;
+        let best_rank = 0.0;
+        let i = 0;
+        while i < len(symbols) - 1 {
+            let r = ranks[symbols[i] + " " + symbols[i + 1]];
+            if type(r) == "number" {
+                if best < 0 || r < best_rank {
+                    best = i;
+                    best_rank = r;
+                }
+            }
+            i = i + 1;
+        }
+        if best < 0 { break; }
+
+        let left = symbols[best];
+        let right = symbols[best + 1];
+        let merged = [];
+        i = 0;
+        while i < len(symbols) {
+            if i < len(symbols) - 1 && symbols[i] == left && symbols[i + 1] == right {
+                push(merged, left + right);
+                i = i + 2;
+            } else {
+                push(merged, symbols[i]);
+                i = i + 1;
+            }
+        }
+        symbols = merged;
+    }
+    return symbols;
+}
+
+// text -> token ids. No BOS and no special tokens: the caller adds those.
+fn tokenize_bpe(model, text) {
+    if type(text) != "string" { throw "tokenize_bpe: text must be a string"; }
+    tok_require(model);
+    let ranks = tok_merge_ranks(model);
+    let ids = model["vocab_ids"];
+    let chars = model["byte_chars"];
+
+    let n = len(text);
+    let b = [];
+    let i = 0;
+    while i < n {
+        push(b, byte_at(text, i));
+        i = i + 1;
+    }
+
+    let out = [];
+    let bounds = tok_pretokenize(b);
+    let starts = bounds[0];
+    let ends = bounds[1];
+    let p = 0;
+    while p < len(starts) {
+        let symbols = [];
+        let j = starts[p];
+        while j < ends[p] {
+            push(symbols, chars[b[j]]);
+            j = j + 1;
+        }
+        symbols = tok_bpe(ranks, symbols);
+        let k = 0;
+        while k < len(symbols) {
+            let id = ids[symbols[k]];
+            if type(id) != "number" {
+                throw "tokenizer: symbol " + symbols[k] + " is not in the vocabulary";
+            }
+            push(out, id);
+            k = k + 1;
+        }
+        p = p + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- decoding
+
+// Append the bytes a token string stands for to `out`. Characters outside the byte alphabet (the text of
+// special tokens like <|eot_id|>) are copied through unchanged.
+fn tok_append_decoded(s, rev, out) {
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let c = byte_at(s, i);
+        let cp = -1;
+        let w = 1;
+        if c < 128 {
+            cp = c;
+        } else {
+            if c >= 192 && c < 224 && i + 1 < n {
+                cp = (c % 32) * 64 + (byte_at(s, i + 1) % 64);
+                w = 2;
+            }
+        }
+        let v = -1;
+        if cp >= 0 && cp < 324 { v = rev[cp]; }
+        if v >= 0 {
+            push(out, v);
+        } else {
+            let q = 0;
+            while q < w {
+                push(out, byte_at(s, i + q));
+                q = q + 1;
+            }
+        }
+        i = i + w;
+    }
+    return null;
+}
+
+// token ids -> string (the exact bytes the tokens stand for; special tokens appear as their text).
+fn tok_decode(model, ids) {
+    tok_require(model);
+    if type(ids) != "array" { throw "tok_decode: ids must be an array"; }
+    let vocab = model["vocab"];
+    let rev = model["byte_rev"];
+    let out = [];
+    let i = 0;
+    while i < len(ids) {
+        let id = ids[i];
+        if type(id) != "number" || id < 0 || id >= len(vocab) || id != floor(id) {
+            throw "tok_decode: bad token id " + str(id);
+        }
+        tok_append_decoded(vocab[id], rev, out);
+        i = i + 1;
+    }
+    return bytes_to_str(out);
+}
+
+// ---------------------------------------------------------------- Llama-3 chat template
+
+// Exact vocabulary entry -> id, or -1.
+fn tok_token_id(model, text) {
+    let id = model["vocab_ids"][text];
+    if type(id) == "number" { return id; }
+    return -1;
+}
+
+fn tok_special(model, text) {
+    let id = tok_token_id(model, text);
+    if id < 0 { throw "tokenizer: the vocabulary has no token " + text + " (is this a Llama-3 model?)"; }
+    return id;
+}
+
+fn tok_extend(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        push(dst, src[i]);
+        i = i + 1;
+    }
+    return null;
+}
+
+// Strip ASCII whitespace from both ends (the Llama-3 template trims message content).
+fn tok_trim(s) {
+    let a = 0;
+    let b = len(s);
+    while a < b && tok_is_space(byte_at(s, a)) { a = a + 1; }
+    while b > a && tok_is_space(byte_at(s, b - 1)) { b = b - 1; }
+    return substr(s, a, b);
+}
+
+// <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>
+// <|start_header_id|>assistant<|end_header_id|>\n\n      as token ids. The control tokens are looked up in
+// the vocabulary; everything between them goes through tokenize_bpe.
+fn tok_chat_prompt(model, user_prompt) {
+    if type(user_prompt) != "string" { throw "tok_chat_prompt: user_prompt must be a string"; }
+    tok_require(model);
+    let bos = tok_special(model, "<|begin_of_text|>");
+    let sh  = tok_special(model, "<|start_header_id|>");
+    let eh  = tok_special(model, "<|end_header_id|>");
+    let eot = tok_special(model, "<|eot_id|>");
+
+    let ids = [bos, sh];
+    tok_extend(ids, tokenize_bpe(model, "user"));
+    push(ids, eh);
+    tok_extend(ids, tokenize_bpe(model, "\n\n" + tok_trim(user_prompt)));
+    push(ids, eot);
+    push(ids, sh);
+    tok_extend(ids, tokenize_bpe(model, "assistant"));
+    push(ids, eh);
+    tok_extend(ids, tokenize_bpe(model, "\n\n"));
+    return ids;
+}
+
+// Ids that end an assistant turn: <|eot_id|> and <|end_of_text|> (whichever the vocabulary has).
+fn tok_chat_stops(model) {
+    tok_require(model);
+    let stops = [];
+    let eot = tok_token_id(model, "<|eot_id|>");
+    if eot >= 0 { push(stops, eot); }
+    let eos = tok_token_id(model, "<|end_of_text|>");
+    if eos >= 0 { push(stops, eos); }
+    return stops;
+}

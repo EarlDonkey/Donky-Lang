@@ -1,0 +1,255 @@
+// lib/netguard.donk — Donky NetGuard: Wi-Fi defense shield.
+//
+// Phase 1 (Pre-Connection): MAC spoof + hostname obfuscation + DNS override.
+// Phase 2 (Active Connection): captive-portal probe + ARP watcher.
+//
+// Everything that survives across spawn()ed tasks goes through lib/state.donk.
+// Every error is logged before it is thrown, so the dashboard shows the trail
+// even if the caller swallows the exception.
+
+import "lib/state.donk"
+import "lib/winreg.donk"
+import "lib/iphlp.donk"
+
+// Registry paths. Kept as function locals — file-level `let` is not visible
+// inside functions (SEMANTICS §11.3).
+fn _adapter_class()  { return "SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002bE10318}" }
+fn _tcpip_params()   { return "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters" }
+fn _computer_name()  { return "SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName" }
+fn _dns_interfaces() { return "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces" }
+
+// HKEY constants.
+fn _hklm() { return 2147483650 }  // HKEY_LOCAL_MACHINE
+
+// Providers.
+fn _dns_quad9()      { return ["9.9.9.9", "149.112.112.112"] }
+fn _dns_cloudflare() { return ["1.1.1.1", "1.0.0.1"] }
+
+// ---------------------------------------------------------------- Phase 1
+
+// Random MAC: locally-administered unicast. First byte's low 2 bits = 10.
+fn generate_random_mac() {
+    let b = secure_random(6)
+    // b[0] & 0xFC  clears bit 0 (unicast) and bit 1 (LAA);
+    // then | 0x02 sets the LAA bit.
+    let b0 = (b[0] % 64) * 4 + 2
+    let parts = [b0, b[1], b[2], b[3], b[4], b[5]]
+    let hexd = "0123456789ABCDEF"
+    let s = ""
+    let i = 0
+    while i < 6 {
+        let byte = parts[i]
+        let hi = byte / 16
+        let lo = byte % 16
+        s = s + substr(hexd, hi, hi + 1) + substr(hexd, lo, lo + 1)
+        i = i + 1
+    }
+    return s
+}
+
+fn is_elevated() {
+    // If we can open a key that requires admin, we're elevated. Non-throwing.
+    let k = reg_open_key(_hklm(), _adapter_class())
+    if k == null { return false }
+    reg_close_key(k)
+    return true
+}
+
+fn _set_hostname(safe_name) {
+    reg_write_string(_hklm(), _tcpip_params(), "Hostname", safe_name)
+    reg_write_string(_hklm(), _tcpip_params(), "NV Hostname", safe_name)
+    reg_write_string(_hklm(), _computer_name(), "ComputerName", safe_name)
+}
+
+// Cycle the Wi-Fi adapter via netsh. Returns true on success. Logs both
+// commands' output to the state log so the dashboard shows exactly what netsh
+// said (drivers that ignore NetworkAddress report it here).
+fn _cycle_wifi_adapter() {
+    log_info("NETSH", "disabling Wi-Fi")
+    let r1 = exec_wait("netsh", ["interface", "set", "interface", "Wi-Fi", "disable"], 15000)
+    if r1.code != 0 {
+        log_warn("NETSH_FAIL", "disable rc=" + str(r1.code) + " err=" + str(r1.stderr))
+        return false
+    }
+    log_info("NETSH", "enabling Wi-Fi")
+    let r2 = exec_wait("netsh", ["interface", "set", "interface", "Wi-Fi", "enable"], 15000)
+    if r2.code != 0 {
+        log_warn("NETSH_FAIL", "enable rc=" + str(r2.code) + " err=" + str(r2.stderr))
+        return false
+    }
+    return true
+}
+
+fn scramble_identity(adapter_id) {
+    if !is_elevated() {
+        log_warn("SPOOF_SKIPPED", "not elevated")
+        throw "netguard: scramble_identity requires Administrator"
+    }
+    let new_mac = generate_random_mac()
+    let reg_path = _adapter_class() + "\\" + adapter_id
+    log_info("MAC_SPOOF", "adapter=" + adapter_id + " mac=" + new_mac)
+    reg_write_string(_hklm(), reg_path, "NetworkAddress", new_mac)
+
+    let safe_name = "DESKTOP-GUEST"
+    log_info("HOSTNAME", "new=" + safe_name)
+    _set_hostname(safe_name)
+
+    if !_cycle_wifi_adapter() {
+        throw "netguard: adapter cycle failed; MAC may not be active until reboot"
+    }
+
+    // Post-verify: re-list adapters so the dashboard shows current state.
+    let adapters = get_adapters()
+    let seen = ""
+    for a in adapters { seen = seen + a.name + " " }
+    log_info("ADAPTERS", "seen=" + seen)
+
+    // Snapshot for the dashboard.
+    state_snapshot({
+        "phase": "1",
+        "spoofed_mac": new_mac,
+        "hostname": safe_name,
+        "elevated": true,
+        "last_event": "SCRAMBLE_DONE"
+    })
+    return new_mac
+}
+
+// ---------------------------------------------------------------- Phase 1.5: DNS
+
+fn force_dns(adapter_id, provider) {
+    if !is_elevated() {
+        log_warn("DNS_SKIPPED", "not elevated")
+        throw "netguard: force_dns requires Administrator"
+    }
+    let key_path = _dns_interfaces() + "\\" + adapter_id
+    let joined = join(provider, ",")
+    log_info("DNS_FORCED", joined)
+    reg_write_string(_hklm(), key_path, "NameServer", joined)
+    // Flush the resolver cache so the change takes effect immediately.
+    exec_wait("ipconfig", ["/flushdns"], 5000)
+    return true
+}
+
+fn force_dns_quad9(adapter_id)      { return force_dns(adapter_id, _dns_quad9()) }
+fn force_dns_cloudflare(adapter_id) { return force_dns(adapter_id, _dns_cloudflare()) }
+
+// ---------------------------------------------------------------- Phase 2: captive portal
+
+fn probe_captive_portal() {
+    // FireFox's canonical captive-portal endpoint: a clean network returns 204
+    // with an empty body; a captive portal intercepts and returns 200/302.
+    let body = http_request("HEAD", "http://detectportal.firefox.com/canonical.html", "", "")
+    let st = http_status()
+    let verdict = "clean"
+    if st != 204 { verdict = "portal" }
+    log_info("CAPTIVE_PROBE", "status=" + str(st) + " verdict=" + verdict)
+    state_snapshot({
+        "phase": "2",
+        "captive_portal": verdict,
+        "last_event": "CAPTIVE_PROBE"
+    })
+    return verdict == "clean"
+}
+
+// ---------------------------------------------------------------- Phase 2: ARP watcher
+
+// Watch the gateway MAC on if_index forever. Pins the current gateway MAC
+// after confirming with ping, then re-polls every interval_ms. On three
+// consecutive mismatches, logs a CRIT event. Never severs the link; the user
+// decides. Designed to run under spawn().
+fn arp_watch(if_index, interval_ms) {
+    // 1. Find a candidate gateway MAC via the heuristic.
+    let candidate = get_gateway_mac(if_index)
+    if candidate == null {
+        log_warn("ARP_NO_CANDIDATE", "if_index=" + str(if_index))
+        state_snapshot({
+            "phase": "2",
+            "arp_watching": false,
+            "arp_reason": "no gateway candidate"
+        })
+        return null
+    }
+    // 2. Ping the .1/.254 of the same subnet. We do not know the full prefix
+    //    from just the MAC, so re-scan the ARP table for the IP that matched.
+    let pinned_ip = null
+    let t = get_arp_table()
+    for row in t {
+        if row.if_index == if_index && row.mac == candidate {
+            let parts = split(row.ip, ".")
+            let last = num(parts[3])
+            if last == 1 || last == 254 { pinned_ip = row.ip }
+        }
+    }
+    if pinned_ip == null || !ping(pinned_ip, 2) {
+        log_warn("ARP_PIN_FAILED", "candidate=" + candidate + " no ping reply")
+        state_snapshot({
+            "phase": "2",
+            "arp_watching": false,
+            "arp_reason": "candidate did not answer ping"
+        })
+        return null
+    }
+
+    log_info("ARP_PINNED", "ip=" + pinned_ip + " mac=" + candidate)
+    state_snapshot({
+        "phase": "2",
+        "arp_watching": true,
+        "arp_pinned_ip": pinned_ip,
+        "arp_pinned_mac": candidate,
+        "arp_mismatches": 0,
+        "last_event": "ARP_PINNED"
+    })
+
+    // 3. Poll loop.
+    let consecutive = 0
+    while true {
+        sleep(interval_ms)
+        let cur_mac = null
+        let cur_ip = null
+        let table = get_arp_table()
+        for row in table {
+            if row.if_index == if_index && row.mac == candidate {
+                cur_mac = row.mac
+                cur_ip = row.ip
+            }
+        }
+        // Re-query by IP (the MAC may have changed).
+        let actual = null
+        for row in table {
+            if row.if_index == if_index && row.ip == pinned_ip {
+                actual = row.mac
+            }
+        }
+        if actual != null && actual != candidate {
+            consecutive = consecutive + 1
+            log_warn("ARP_MISMATCH", "ip=" + pinned_ip + " was=" + candidate + " now=" + actual + " n=" + str(consecutive))
+            if consecutive == 3 {
+                log_crit("ARP_MITM_SUSPECTED", "ip=" + pinned_ip + " mac changed from " + candidate + " to " + actual)
+            }
+            state_snapshot({
+                "phase": "2",
+                "arp_watching": true,
+                "arp_pinned_ip": pinned_ip,
+                "arp_pinned_mac": candidate,
+                "arp_current_mac": actual,
+                "arp_mismatches": consecutive,
+                "last_event": "ARP_MISMATCH"
+            })
+        } else {
+            if consecutive > 0 {
+                log_info("ARP_RECOVERED", "ip=" + pinned_ip + " mac=" + candidate)
+            }
+            consecutive = 0
+            state_snapshot({
+                "phase": "2",
+                "arp_watching": true,
+                "arp_pinned_ip": pinned_ip,
+                "arp_pinned_mac": candidate,
+                "arp_current_mac": candidate,
+                "arp_mismatches": 0,
+                "last_event": "ARP_OK"
+            })
+        }
+    }
+}

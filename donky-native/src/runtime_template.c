@@ -1321,6 +1321,69 @@ uint64_t donky_random(uint64_t max_val) {
     return make_number((double)(rand() % max));
 }
 
+// donky_secure_random(n): CSPRNG, returns n whole bytes as a Donky array of numbers 0-255.
+// Windows: BCryptGenRandom. POSIX: getrandom(2) on Linux, arc4random_buf on macOS/BSD.
+// This is for MAC spoofing, hostname entropy, and any security-sensitive randomness.
+// Do NOT use donky_random() (rand()-backed) for these.
+#ifdef _WIN32
+#pragma comment(lib, "bcrypt.lib")
+#include <bcrypt.h>
+uint64_t donky_secure_random(uint64_t n_val) {
+    if (!is_number(n_val)) { donky_throw(donky_alloc_string("secure_random: n must be a number")); return TAG_BASE; }
+    double d = as_number(n_val);
+    if (!(d >= 0.0) || d > 1048576.0 || d != floor(d)) {
+        donky_throw(donky_alloc_string("secure_random: n must be a whole number in [0, 1048576]"));
+        return TAG_BASE;
+    }
+    size_t n = (size_t)d;
+    uint64_t arr = donky_alloc_array();
+    if (n == 0) return arr;
+    uint8_t* buf = (uint8_t*)malloc(n);
+    if (!buf) { donky_throw(donky_alloc_string("secure_random: out of memory")); return TAG_BASE; }
+    NTSTATUS st = BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(st)) {
+        free(buf);
+        donky_throw(donky_alloc_string("secure_random: BCryptGenRandom failed"));
+        return TAG_BASE;
+    }
+    for (size_t i = 0; i < n; i++) donky_array_push(arr, make_number((double)buf[i]));
+    free(buf);
+    return arr;
+}
+#else
+#include <sys/random.h>
+uint64_t donky_secure_random(uint64_t n_val) {
+    if (!is_number(n_val)) { donky_throw(donky_alloc_string("secure_random: n must be a number")); return TAG_BASE; }
+    double d = as_number(n_val);
+    if (!(d >= 0.0) || d > 1048576.0 || d != floor(d)) {
+        donky_throw(donky_alloc_string("secure_random: n must be a whole number in [0, 1048576]"));
+        return TAG_BASE;
+    }
+    size_t n = (size_t)d;
+    uint64_t arr = donky_alloc_array();
+    if (n == 0) return arr;
+    uint8_t* buf = (uint8_t*)malloc(n);
+    if (!buf) { donky_throw(donky_alloc_string("secure_random: out of memory")); return TAG_BASE; }
+#ifdef __APPLE__
+    arc4random_buf(buf, n);
+#else
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = getrandom(buf + got, n - got, 0);
+        if (r <= 0) {
+            free(buf);
+            donky_throw(donky_alloc_string("secure_random: getrandom failed"));
+            return TAG_BASE;
+        }
+        got += (size_t)r;
+    }
+#endif
+    for (size_t i = 0; i < n; i++) donky_array_push(arr, make_number((double)buf[i]));
+    free(buf);
+    return arr;
+}
+#endif
+
 uint64_t donky_keys(uint64_t map_val) {
     if (get_tag(map_val) != TAG_MAP) return donky_alloc_array();
     Map* map = (Map*)as_index(map_val);
@@ -3354,6 +3417,166 @@ uint64_t donky_wait(uint64_t pid_val) {
 #endif
 }
 
+// donky_exec_wait(path, argv, timeout_ms) -> { code, stdout, stderr }
+// Runs a child process to completion (or timeout) and captures its output.
+// Unlike exec(), this RETURNS and does not replace the Donky process.
+// Windows: CreateProcessW + WaitForSingleObject. POSIX: fork/execvp/pipe/waitpid.
+// timeout_ms <= 0 means "wait forever". On timeout the child is killed; code is -9.
+#ifdef _WIN32
+uint64_t donky_exec_wait(uint64_t path_val, uint64_t argv_val, uint64_t timeout_val) {
+    if (!dk_is_str(path_val)) return dk_ffi_err("exec_wait: path must be a string");
+    Array* arr = NULL; size_t argc = 0;
+    if (argv_val != TAG_BASE) {
+        if (get_tag(argv_val) != TAG_ARRAY) return dk_ffi_err("exec_wait: argv must be an array of strings (or null)");
+        arr = (Array*)as_index(argv_val); argc = arr->len;
+    }
+    // Build the command line: quote each arg; Windows requires this.
+    size_t cap = 4096 + argc * 260; char* cmd = (char*)malloc(cap); if (!cmd) return dk_ffi_err("exec_wait: out of memory");
+    size_t o = 0;
+    o += (size_t)snprintf(cmd + o, cap - o, "\"%s\"", dk_s(path_val));
+    for (size_t i = 0; i < argc; i++) {
+        if (!dk_is_str(arr->data[i])) { free(cmd); return dk_ffi_err("exec_wait: every argv element must be a string"); }
+        o += (size_t)snprintf(cmd + o, cap - o, " \"%s\"", dk_s(arr->data[i]));
+    }
+    // Pipes: [0] = read end, [1] = write end, for stdout then stderr.
+    SECURITY_ATTRIBUTES sa = {0}; sa.nLength = sizeof sa; sa.bInheritHandle = TRUE;
+    HANDLE out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL;
+    if (!CreatePipe(&out_r, &out_w, &sa, 0) || !CreatePipe(&err_r, &err_w, &sa, 0)) {
+        free(cmd); return dk_ffi_err("exec_wait: CreatePipe failed");
+    }
+    SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si = {0}; si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out_w; si.hStdError = err_w; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(out_w); CloseHandle(err_w);
+    free(cmd);
+    if (!ok) {
+        CloseHandle(out_r); CloseHandle(err_r);
+        char msg[128]; snprintf(msg, sizeof msg, "exec_wait: CreateProcess failed (err %lu)", GetLastError());
+        return dk_ffi_err(msg);
+    }
+    // Read both pipes until EOF (with a timeout on WaitForSingleObject).
+    DWORD timeout = (is_number(timeout_val) && as_number(timeout_val) > 0.0) ? (DWORD)as_number(timeout_val) : INFINITE;
+    int timed_out = 0;
+    char* outbuf = NULL; size_t outn = 0, outcap = 0;
+    char* errbuf = NULL; size_t errn = 0, errcap = 0;
+    DWORD start = GetTickCount();
+    for (;;) {
+        DWORD remaining = INFINITE;
+        if (timeout != INFINITE) { DWORD el = GetTickCount() - start; remaining = (el >= timeout) ? 0 : (timeout - el); }
+        DWORD wr = WaitForSingleObject(pi.hProcess, 50);
+        if (wr == WAIT_TIMEOUT && remaining == 0) { timed_out = 1; break; }
+        if (wr == WAIT_OBJECT_0) break;
+        // Drain pipes
+        DWORD avail = 0;
+        if (PeekNamedPipe(out_r, NULL, 0, NULL, &avail, NULL) && avail) {
+            if (outn + avail + 1 > outcap) { outcap = (outcap ? outcap * 2 : 4096) + avail; outbuf = (char*)realloc(outbuf, outcap); }
+            DWORD rd = 0; ReadFile(out_r, outbuf + outn, avail, &rd, NULL); outn += rd;
+        }
+        if (PeekNamedPipe(err_r, NULL, 0, NULL, &avail, NULL) && avail) {
+            if (errn + avail + 1 > errcap) { errcap = (errcap ? errcap * 2 : 4096) + avail; errbuf = (char*)realloc(errbuf, errcap); }
+            DWORD rd = 0; ReadFile(err_r, errbuf + errn, avail, &rd, NULL); errn += rd;
+        }
+    }
+    if (timed_out) { TerminateProcess(pi.hProcess, 9); WaitForSingleObject(pi.hProcess, 1000); }
+    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
+    // Drain anything left after process exit
+    for (;;) { DWORD avail = 0; if (!PeekNamedPipe(out_r, NULL, 0, NULL, &avail, NULL) || !avail) break;
+        if (outn + avail + 1 > outcap) { outcap = (outcap ? outcap * 2 : 4096) + avail; outbuf = (char*)realloc(outbuf, outcap); }
+        DWORD rd = 0; ReadFile(out_r, outbuf + outn, avail, &rd, NULL); outn += rd; }
+    for (;;) { DWORD avail = 0; if (!PeekNamedPipe(err_r, NULL, 0, NULL, &avail, NULL) || !avail) break;
+        if (errn + avail + 1 > errcap) { errcap = (errcap ? errcap * 2 : 4096) + avail; errbuf = (char*)realloc(errbuf, errcap); }
+        DWORD rd = 0; ReadFile(err_r, errbuf + errn, avail, &rd, NULL); errn += rd; }
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(out_r); CloseHandle(err_r);
+    if (!outbuf) { outbuf = (char*)malloc(1); }
+    if (!errbuf) { errbuf = (char*)malloc(1); }
+    outbuf[outn] = 0; errbuf[errn] = 0;
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("code"),   make_number(timed_out ? -9.0 : (double)code));
+    donky_map_set(m, donky_alloc_string("stdout"), donky_alloc_string(outbuf));
+    donky_map_set(m, donky_alloc_string("stderr"), donky_alloc_string(errbuf));
+    free(outbuf); free(errbuf);
+    return m;
+}
+#else
+uint64_t donky_exec_wait(uint64_t path_val, uint64_t argv_val, uint64_t timeout_val) {
+    if (!dk_is_str(path_val)) return dk_ffi_err("exec_wait: path must be a string");
+    Array* arr = NULL; size_t argc = 0;
+    if (argv_val != TAG_BASE) {
+        if (get_tag(argv_val) != TAG_ARRAY) return dk_ffi_err("exec_wait: argv must be an array of strings (or null)");
+        arr = (Array*)as_index(argv_val); argc = arr->len;
+    }
+    int out_pipe[2], err_pipe[2];
+    if (pipe(out_pipe) < 0 || pipe(err_pipe) < 0) return dk_ffi_err("exec_wait: pipe failed");
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); return dk_ffi_err("exec_wait: fork failed"); }
+    if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]);
+        char** argv = (char**)malloc((argc + 2) * sizeof(char*));
+        argv[0] = (char*)dk_s(path_val);
+        for (size_t i = 0; i < argc; i++) argv[i + 1] = (char*)dk_s(arr->data[i]);
+        argv[argc + 1] = NULL;
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(out_pipe[1]); close(err_pipe[1]);
+    // Read both pipes with select() and a timeout.
+    char* outbuf = NULL; size_t outn = 0, outcap = 0;
+    char* errbuf = NULL; size_t errn = 0, errcap = 0;
+    struct timeval tv_start, tv_now;
+    gettimeofday(&tv_start, NULL);
+    double timeout_ms = (is_number(timeout_val) && as_number(timeout_val) > 0.0) ? as_number(timeout_val) : 0.0;
+    int timed_out = 0;
+    int open_r = 2; int fds[2] = { out_pipe[0], err_pipe[0] };
+    while (open_r > 0) {
+        fd_set rfds; FD_ZERO(&rfds);
+        int maxfd = -1;
+        for (int i = 0; i < 2; i++) if (fds[i] >= 0) { FD_SET(fds[i], &rfds); if (fds[i] > maxfd) maxfd = fds[i]; }
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
+        int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (timeout_ms > 0) {
+            gettimeofday(&tv_now, NULL);
+            double elapsed = (tv_now.tv_sec - tv_start.tv_sec) * 1000.0 + (tv_now.tv_usec - tv_start.tv_usec) / 1000.0;
+            if (elapsed > timeout_ms) { timed_out = 1; break; }
+        }
+        if (sel <= 0) continue;
+        for (int i = 0; i < 2; i++) {
+            if (fds[i] < 0 || !FD_ISSET(fds[i], &rfds)) continue;
+            char buf[4096]; ssize_t r = read(fds[i], buf, sizeof buf);
+            if (r <= 0) { close(fds[i]); fds[i] = -1; open_r--; continue; }
+            if (i == 0) {
+                if (outn + (size_t)r + 1 > outcap) { outcap = (outcap ? outcap * 2 : 4096) + (size_t)r; outbuf = (char*)realloc(outbuf, outcap); }
+                memcpy(outbuf + outn, buf, (size_t)r); outn += (size_t)r;
+            } else {
+                if (errn + (size_t)r + 1 > errcap) { errcap = (errcap ? errcap * 2 : 4096) + (size_t)r; errbuf = (char*)realloc(errbuf, errcap); }
+                memcpy(errbuf + errn, buf, (size_t)r); errn += (size_t)r;
+            }
+        }
+    }
+    if (timed_out) kill(pid, SIGKILL);
+    int status = 0; waitpid(pid, &status, 0);
+    int code = 0;
+    if (timed_out) code = -9;
+    else if (WIFEXITED(status)) code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) code = -WTERMSIG(status);
+    if (!outbuf) { outbuf = (char*)malloc(1); }
+    if (!errbuf) { errbuf = (char*)malloc(1); }
+    outbuf[outn] = 0; errbuf[errn] = 0;
+    uint64_t m = donky_alloc_map();
+    donky_map_set(m, donky_alloc_string("code"),   make_number((double)code));
+    donky_map_set(m, donky_alloc_string("stdout"), donky_alloc_string(outbuf));
+    donky_map_set(m, donky_alloc_string("stderr"), donky_alloc_string(errbuf));
+    free(outbuf); free(errbuf);
+    return m;
+}
+#endif
+
 // pipe(): returns [read_fd, write_fd]. The fds are plain (inherited across fork/exec); close
 // the ends you do not use or the reader never sees EOF.
 uint64_t donky_pipe(void) {
@@ -3997,14 +4220,16 @@ static int dk_tensor_dim(const char* who, const char* name, uint64_t v, size_t* 
     return 1;
 }
 
-// New array with exactly n slots and len == n; the caller must fill all n slots. Returns TAG_BASE
-// (with a pending throw) if the memory cannot be had.
+// ------------------------------------------------------------------ dk_tensor_alloc (shared helper)
+// New array with exactly n slots and len == n. The slots are ZERO-filled (all-zero bits are +0.0, a valid
+// number), so the array is always safe for the GC to scan, even if the caller fills it slowly or throws
+// part-way. Returns TAG_BASE (with a pending throw) if the memory cannot be had.
 static uint64_t dk_tensor_alloc(const char* who, size_t n, uint64_t** data) {
     uint64_t av = donky_alloc_array();
     Array* arr = (Array*)as_index(av);
     if (n) {
         char msg[64];
-        if (n > SIZE_MAX / sizeof(uint64_t) || !(arr->data = (uint64_t*)malloc(n * sizeof(uint64_t)))) {
+        if (n > SIZE_MAX / sizeof(uint64_t) || !(arr->data = (uint64_t*)calloc(n, sizeof(uint64_t)))) {
             arr->data = NULL;
             snprintf(msg, sizeof msg, "%s: out of memory", who);
             return dk_ffi_err(msg);
@@ -4273,25 +4498,48 @@ uint64_t donky_tensor_sgd_step(uint64_t weights, uint64_t grads, uint64_t lr) {
 // Shared helpers (dk_tensor_view / dk_tensor_dim / dk_tensor_alloc / dk_ffi_err /
 // dk_type_name / make_number / as_number) are defined above in the tensor section.
 
-// tensor_rms_norm(a): x[i] / sqrt(mean(x^2) + eps), eps = 1e-5 (Llama-3 rms_norm_eps).
-// Does NOT apply the learned norm weight: caller multiplies by attn_norm/ffn_norm weight.
-// Accumulates in double (n=4096 of x^2 cannot overflow). Zero vector -> zeros (eps>0).
-// Non-finite input is an error instead of being silently masked.
-uint64_t donky_tensor_rms_norm(uint64_t a) {
-    const char* who = "tensor_rms_norm";
+// ------------------------------------------------------------------ donky_tensor_rms_norm  [+ dk_rms_norm_impl, optional donky_tensor_rms_norm_eps]
+// RMSNorm over the whole vector: out[i] = x[i] / sqrt(mean(x^2) + eps), accumulated in double
+// (n = 4096 cannot overflow unless |x| > ~1e152). NaN/inf in the input propagate as IEEE says; they
+// are NOT masked. Note: inf in the input makes rms = inf, so every FINITE element becomes 0.
+// This does not multiply by the learned norm weight; do that with tensor_mul afterwards.
+static uint64_t dk_rms_norm_impl(const char* who, uint64_t a, double eps) {
     Array* pa;
     if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
     size_t n = pa->len;
-    if (n == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    if (n == 0) {                                   // empty in, empty out
+        uint64_t* out = NULL;
+        return dk_tensor_alloc(who, 0, &out);
+    }
     double ss = 0.0;
-    for (size_t i = 0; i < n; i++) { double x = as_number(pa->data[i]); ss += x * x; }
-    if (!isfinite(ss)) return dk_ffi_err("tensor_rms_norm: input contains NaN/inf");
-    const double inv = 1.0 / sqrt(ss / (double)n + 1e-5);
+    for (size_t i = 0; i < n; i++) {
+        double x = as_number(pa->data[i]);
+        ss += x * x;
+    }
+    double rms = sqrt(ss / (double)n + eps);
     uint64_t* out = NULL;
     uint64_t r = dk_tensor_alloc(who, n, &out);
     if (r == TAG_BASE) return TAG_BASE;
-    for (size_t i = 0; i < n; i++) out[i] = make_number(as_number(pa->data[i]) * inv);
+    for (size_t i = 0; i < n; i++)
+        out[i] = make_number(as_number(pa->data[i]) / rms);
     return r;
+}
+ 
+// tensor_rms_norm(a): eps = 1e-5, the rms_norm_eps of Llama-2/3 and Mistral.
+uint64_t donky_tensor_rms_norm(uint64_t a) {
+    return dk_rms_norm_impl("tensor_rms_norm", a, 1e-5);
+}
+ 
+// tensor_rms_norm_eps(a, eps): same, with the epsilon from the model (GGUF
+// "<arch>.attention.layer_norm_rms_epsilon"). OPTIONAL: needs registering as a 2-arg builtin.
+uint64_t donky_tensor_rms_norm_eps(uint64_t a, uint64_t eps_val) {
+    const char* who = "tensor_rms_norm_eps";
+    if (!is_number(eps_val) || !(as_number(eps_val) >= 0.0) || !isfinite(as_number(eps_val))) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "%s: eps must be a finite number >= 0, got %s", who, dk_type_name(eps_val));
+        return dk_ffi_err(msg);
+    }
+    return dk_rms_norm_impl(who, a, as_number(eps_val));
 }
 
 // tensor_rope(a, pos): rotary positional embedding, applied to one vector `a` of even
@@ -4339,15 +4587,13 @@ uint64_t donky_tensor_rope(uint64_t a, uint64_t pos_val) {
     return r;
 }
 
-// tensor_attention(q, k, v): single-head causal self-attention for one sequence of
-// `seq` tokens of head dimension `d`, all flat row-major:
-//     Q, K, V are each seq*d elements.
-//     S = Q * K^T / sqrt(d)          (seq x seq)
-//     S[t][u] = -inf for u > t       (causal mask; masked entries become 0 after softmax)
-//     P = softmax(S, axis=1)         (row-wise)
-//     O = P * V                      (seq x d)  -> returned flat, seq*d elements
-// A row whose only unmasked entry is the diagonal still softmaxes to 1.0 on that
-// entry (the -inf entries contribute exp(-inf - max) = 0), so no row is all-zero.
+// ------------------------------------------------------------------ donky_tensor_attention
+// tensor_attention(q, k, v, seq, d): single-head causal self-attention, flat row-major.
+//     S[t][u] = dot(Q[t], K[u]) / sqrt(d)   for u <= t   (u > t is masked: contributes exactly 0)
+//     P[t]    = softmax(S[t][0..t])          (max subtracted, so exp never overflows)
+//     O[t]    = sum_u P[t][u] * V[u]
+// Scratch is plain malloc/free (two buffers, freed on every path): nothing here is left for the GC.
+// NaN/inf in q/k/v propagate; they are not masked.
 uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq_val, uint64_t d_val) {
     const char* who = "tensor_attention";
     Array* pq; Array* pk; Array* pv;
@@ -4359,17 +4605,21 @@ uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq
     if (!dk_tensor_dim(who, "seq", seq_val, &seq) || !dk_tensor_dim(who, "d", d_val, &d)) return TAG_BASE;
     if (d == 0) { snprintf(msg, sizeof msg, "%s: d must be positive", who); return dk_ffi_err(msg); }
     if (seq > 65536) { snprintf(msg, sizeof msg, "%s: seq too large (max 65536)", who); return dk_ffi_err(msg); }
-    size_t n = seq * d;
+    size_t n = seq * d;                            // seq<=65536, d<=2^31: fits size_t
     if (pq->len != n || pk->len != n || pv->len != n) {
         snprintf(msg, sizeof msg, "%s: q/k/v must each have seq*d = %zu elements (got %zu/%zu/%zu)",
                  who, n, pq->len, pk->len, pv->len);
         return dk_ffi_err(msg);
     }
-    if (n == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    if (n == 0) { uint64_t* out = NULL; return dk_tensor_alloc(who, 0, &out); }
  
-    double* srow = (double*)malloc(seq * sizeof(double));
-    double* orow = (double*)malloc(d   * sizeof(double));     // allocated ONCE, not per row
-    if (!srow || !orow) { free(srow); free(orow); return dk_ffi_err("tensor_attention: out of memory"); }
+    double* srow = (double*)malloc(seq * sizeof(double));      // one score row
+    double* orow = (double*)malloc(d * sizeof(double));        // one output row
+    if (!srow || !orow) {
+        free(srow); free(orow);
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
     uint64_t* out = NULL;
     uint64_t r = dk_tensor_alloc(who, n, &out);
     if (r == TAG_BASE) { free(srow); free(orow); return TAG_BASE; }
@@ -4378,7 +4628,7 @@ uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq
     for (size_t t = 0; t < seq; t++) {
         const uint64_t* qt = pq->data + t * d;
         double rowmax = -INFINITY;
-        for (size_t u = 0; u <= t; u++) {                      // causal: keys 0..t only
+        for (size_t u = 0; u <= t; u++) {              // causal: keys 0..t only
             const uint64_t* ku = pk->data + u * d;
             double dot = 0.0;
             for (size_t j = 0; j < d; j++) dot += as_number(qt[j]) * as_number(ku[j]);
@@ -4387,11 +4637,14 @@ uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq
             if (sc > rowmax) rowmax = sc;
         }
         double sum = 0.0;
-        for (size_t u = 0; u <= t; u++) { double e = exp(srow[u] - rowmax); srow[u] = e; sum += e; }
-        const double inv = 1.0 / sum;                          // sum >= 1 (the max term is e^0)
+        for (size_t u = 0; u <= t; u++) {              // stable softmax: exp(s - max), the max entry gives exactly 1
+            double e = exp(srow[u] - rowmax);
+            srow[u] = e;
+            sum += e;
+        }
         for (size_t j = 0; j < d; j++) orow[j] = 0.0;
         for (size_t u = 0; u <= t; u++) {
-            const double p = srow[u] * inv;
+            double p = srow[u] / sum;
             const uint64_t* vu = pv->data + u * d;
             for (size_t j = 0; j < d; j++) orow[j] += p * as_number(vu[j]);
         }
@@ -4562,7 +4815,8 @@ uint64_t donky_read_gguf_metadata(uint64_t addr_val) {
  
     char arch[64] = "";
     double d_model = 0, n_heads = 0, n_heads_kv = 0, layers = 0, ctx = 0, ffn = 0, rope = 0;
-    double align_kv = 0;                                  // general.alignment, if present
+    double align_kv = 0; // general.alignment, if present
+    const uint8_t* vocab_hdr = NULL; double n_vocab = 0; // tokenizer.ggml.tokens: array header address + count                                  // general.alignment, if present
     for (uint64_t i = 0; i < n_kv; i++) {
         char* key = gguf_string(&r);
         if (!key) return dk_ffi_err("read_gguf_metadata: bad key");
@@ -4576,7 +4830,13 @@ uint64_t donky_read_gguf_metadata(uint64_t addr_val) {
             }
             free(s);
         } else if (type == GGUF_T_ARRAY) {
+            const uint8_t* arr_start = r.p;
             if (!gguf_skip(&r, type)) { free(key); return dk_ffi_err("read_gguf_metadata: bad array"); }
+            if (strcmp(key, "tokenizer.ggml.tokens") == 0) {
+                GgufRd h = { arr_start, r.p };
+                uint32_t et; uint64_t cnt;
+                if (gguf_u32(&h, &et) && gguf_u64(&h, &cnt) && et == GGUF_T_STRING) { vocab_hdr = arr_start; n_vocab = (double)cnt; }
+            }
         } else {
             if (!gguf_scalar_as_double(&r, type, &v)) { free(key); return dk_ffi_err("read_gguf_metadata: bad scalar"); }
             scalar = 1;
@@ -4652,6 +4912,10 @@ uint64_t donky_read_gguf_metadata(uint64_t addr_val) {
     if (ffn)        donky_map_set(m, donky_alloc_string("ffn"),        make_number(ffn));
     if (rope)       donky_map_set(m, donky_alloc_string("rope_base"),  make_number(rope));
     if (arch[0])    donky_map_set(m, donky_alloc_string("arch"),       donky_alloc_string(arch));
+    if (vocab_hdr) {
+        donky_map_set(m, donky_alloc_string("vocab_addr"), make_number((double)(uint64_t)(uintptr_t)vocab_hdr));
+        donky_map_set(m, donky_alloc_string("n_vocab"), make_number(n_vocab));
+    }
     donky_map_set(m, donky_alloc_string("tensor_data_offset"), make_number((double)aligned));
     return m;
 }
@@ -4750,12 +5014,28 @@ uint64_t donky_ffi_peek_q4_row(uint64_t ptr_val, uint64_t row_id_val, uint64_t n
     return r;
 }
 
-// tensor_matmul_q4(a, w_ptr, batch, c, r):  out[i*r + j] = sum_k a[i*c + k] * dequant(W[j*c + k])
-// W is [r rows x c cols] Q4_K, row-major, each row = c/256 consecutive 144-byte blocks.
-// Accumulates in a zero-initialised double buffer and boxes every output exactly once.
-// NOTE: ONLY valid for GGML type 12 (Q4_K). Q6_K (type 14: attn_v, ffn_down, output.weight
-// in Q4_K_M files) has a different 210-byte block; feeding it here reads garbage fp16
-// scales (inf/NaN). The non-finite-scale check below turns that into a clear error.
+// ------------------------------------------------------------------ donky_tensor_matmul_q4  [+ dk_dot256]
+// 256-element dot product of a dequantized block against an activation slice. Four independent
+// double accumulators keep the FP adds independent and stay deterministic. Measured: only ~10-15% faster than one
+// chain on a 4096x4096 projection (dequantisation dominates), so don't expect more from this alone.
+static inline double dk_dot256(const float* w, const float* x) {
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    for (int i = 0; i < 256; i += 4) {
+        s0 += (double)w[i]     * (double)x[i];
+        s1 += (double)w[i + 1] * (double)x[i + 1];
+        s2 += (double)w[i + 2] * (double)x[i + 2];
+        s3 += (double)w[i + 3] * (double)x[i + 3];
+    }
+    return (s0 + s1) + (s2 + s3);
+}
+ 
+// tensor_matmul_q4(a, w_ptr, batch, c, r): GEMM of a [batch x c] f64 activation matrix against an
+// [r x c] Q4_K weight matrix (row-major, c a multiple of 256). Returns [batch x r] row-major:
+//     out[i * r + j] = sum_k a[i * c + k] * dequant(W[j * c + k])
+// Weight row j starts at w_ptr + j * (c/256) * 144 bytes. Each block is dequantized once and dotted
+// against every batch row. Partial sums live in a plain double buffer (zeroed); results are boxed
+// into the Donky array once, at the end. The weights MUST really be Q4_K (ggml type 12): Q4_K_M files
+// also contain Q6_K (type 14) tensors, and feeding those here produces garbage / NaN.
 uint64_t donky_tensor_matmul_q4(uint64_t a, uint64_t w_ptr,
                                 uint64_t batch_val, uint64_t c_val, uint64_t r_val) {
     const char* who = "tensor_matmul_q4";
@@ -4766,56 +5046,53 @@ uint64_t donky_tensor_matmul_q4(uint64_t a, uint64_t w_ptr,
         !dk_tensor_dim(who, "c",     c_val,     &C) ||
         !dk_tensor_dim(who, "r",     r_val,     &R)) return TAG_BASE;
     if (C == 0 || (C % 256) != 0) {
-        char msg[96]; snprintf(msg, sizeof msg, "%s: c must be a positive multiple of 256", who);
+        char msg[96]; snprintf(msg, sizeof msg,
+            "%s: c must be a positive multiple of 256", who);
         return dk_ffi_err(msg);
     }
-    if (B == 0 || R == 0) { uint64_t* out0 = NULL; return dk_tensor_alloc(who, 0, &out0); }
+    if (B == 0 || R == 0) {
+        uint64_t* out = NULL;
+        return dk_tensor_alloc(who, 0, &out);      // empty in, empty out
+    }
     if (pa->len != B * C) {
         char msg[160]; snprintf(msg, sizeof msg,
-            "%s: a has %zu elements but batch*c = %zu * %zu = %zu", who, pa->len, B, C, B * C);
+            "%s: a has %zu elements but batch*c = %zu * %zu = %zu",
+            who, pa->len, B, C, B * C);
         return dk_ffi_err(msg);
     }
     if (!is_number(w_ptr)) return dk_ffi_err("tensor_matmul_q4: w_ptr must be a number");
-    const uint8_t* wp = (const uint8_t*)(uintptr_t)(uint64_t)as_number(w_ptr);
+    const uint8_t* wp = (const uint8_t*)(uintptr_t)dk_ffi_to_u64(w_ptr);
     if (!wp) return dk_ffi_err("tensor_matmul_q4: null weight pointer");
  
-    const size_t k_blocks = C / 256;
-    const size_t n_out    = B * R;
+    size_t k_blocks = C / 256;
+    size_t n_out    = B * R;                       // dims <= 2^31, so no size_t overflow
+    if (n_out > SIZE_MAX / sizeof(double) || B * C > SIZE_MAX / sizeof(float))
+        return dk_ffi_err("tensor_matmul_q4: output too large");
  
-    float*  fa  = (float*)malloc(B * C * sizeof(float));
-    double* acc = (double*)malloc(n_out * sizeof(double));
-    if (!fa || !acc) { free(fa); free(acc); return dk_ffi_err("tensor_matmul_q4: out of memory"); }
-    memset(acc, 0, n_out * sizeof(double));
-    for (size_t i = 0; i < B * C; i++) fa[i] = (float)as_number(pa->data[i]);
- 
-    float block[256];
-    for (size_t row = 0; row < R; row++) {
-        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ4KBlock);
-        for (size_t b = 0; b < k_blocks; b++) {
-            const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
-            if (!isfinite(dk_fp16_to_fp32(blk->d)) || !isfinite(dk_fp16_to_fp32(blk->dmin))) {
-                char msg[200]; snprintf(msg, sizeof msg,
-                    "%s: non-finite block scale at row %zu block %zu (weight is not Q4_K? "
-                    "Q6_K/Q4_0 tensor, or wrong data offset)", who, row, b);
-                free(fa); free(acc);
-                return dk_ffi_err(msg);
-            }
-            dk_q4k_dequant(blk, block);
-            for (size_t bi = 0; bi < B; bi++) {
-                const float* xb = fa + bi * C + b * 256;
-                double s = 0.0;
-                for (int i = 0; i < 256; i++) s += (double)block[i] * (double)xb[i];
-                acc[bi * R + row] += s;
-            }
-        }
+    float*  fa  = (float*)malloc(B * C * sizeof(float));      // unboxed activations
+    double* acc = (double*)calloc(n_out, sizeof(double));     // zeroed partial sums, [batch x r]
+    if (!fa || !acc) {
+        free(fa); free(acc);
+        return dk_ffi_err("tensor_matmul_q4: out of memory");
     }
-    free(fa);
+    for (size_t i = 0; i < B * C; i++) fa[i] = (float)as_number(pa->data[i]);
  
     uint64_t* out = NULL;
     uint64_t res = dk_tensor_alloc(who, n_out, &out);
-    if (res == TAG_BASE) { free(acc); return TAG_BASE; }
-    for (size_t i = 0; i < n_out; i++) out[i] = make_number(acc[i]);   // box once
-    free(acc);
+    if (res == TAG_BASE) { free(fa); free(acc); return TAG_BASE; }
+ 
+    float block[256];                                         // one dequantized block (1 KiB, stays in L1)
+    for (size_t row = 0; row < R; row++) {                    // weight output row
+        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ4KBlock);
+        for (size_t b = 0; b < k_blocks; b++) {               // 256-weight block, in ascending k order
+            const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
+            dk_q4k_dequant(blk, block);                       // dequantize ONCE
+            for (size_t bi = 0; bi < B; bi++)
+                acc[bi * R + row] += dk_dot256(block, fa + bi * C + b * 256);
+        }
+    }
+    for (size_t i = 0; i < n_out; i++) out[i] = make_number(acc[i]);   // box once, at the end
+    free(fa); free(acc);
     return res;
 }
 
@@ -4918,20 +5195,53 @@ uint64_t donky_tensor_matmul_q6(uint64_t a, uint64_t w_ptr,
     return res;
 }
 
-// ffi_peek_f32(ptr, n): memcpy n float32 values from ptr into a new Donky array.
-// This is the fast path for loading GGUF F32 embeddings without byte-by-byte peeking.
+// ------------------------------------------------------------------ donky_ffi_peek_f32
+// ffi_peek_f32(ptr, n): copy n float32 values from ptr into a new Donky array of f64.
+// Reads go through memcpy, so ptr need not be 4-byte aligned. A null/invalid ptr or a bad n THROWS
+// (it used to return null / an empty array, which hides a wrong tensor offset until much later).
+// There is no bounds check against the mapped file: the caller must pass a range inside the mapping.
 uint64_t donky_ffi_peek_f32(uint64_t ptr_val, uint64_t n_val) {
-    if (!is_number(ptr_val) || !is_number(n_val)) return TAG_BASE;
+    const char* who = "ffi_peek_f32";
+    char msg[96];
+    if (!is_number(ptr_val)) { snprintf(msg, sizeof msg, "%s: ptr must be a number, got %s", who, dk_type_name(ptr_val)); return dk_ffi_err(msg); }
+    if (!is_number(n_val))   { snprintf(msg, sizeof msg, "%s: n must be a number, got %s", who, dk_type_name(n_val));     return dk_ffi_err(msg); }
     double dn = as_number(n_val);
     if (!(dn >= 0.0) || dn > 1e9) return dk_ffi_err("ffi_peek_f32: n out of range");
     size_t n = (size_t)dn;
-    if (n == 0) return donky_alloc_array();
-    const float* src = (const float*)(uintptr_t)(uint64_t)as_number(ptr_val);
-    if (!src) return donky_alloc_array();
     uint64_t* out = NULL;
-    uint64_t r = dk_tensor_alloc("ffi_peek_f32", n, &out);
+    if (n == 0) return dk_tensor_alloc(who, 0, &out);
+    const unsigned char* src = (const unsigned char*)(uintptr_t)dk_ffi_to_u64(ptr_val);
+    if (!src) return dk_ffi_err("ffi_peek_f32: null pointer");
+    uint64_t r = dk_tensor_alloc(who, n, &out);
     if (r == TAG_BASE) return TAG_BASE;
-    for (size_t i = 0; i < n; i++) out[i] = make_number((double)src[i]);
+    for (size_t i = 0; i < n; i++) {
+        float f;
+        memcpy(&f, src + i * sizeof(float), sizeof f);
+        out[i] = make_number((double)f);
+    }
+    return r;
+}
+ 
+// ------------------------------------------------------------------ donky_tensor_stats  (OPTIONAL diagnostic, new)
+// tensor_stats(a) -> [n_nan, n_inf, min, max] over the array. min/max cover the FINITE elements only
+// (0, 0 if there are none). Meant for hunting where a NaN/inf first enters a forward pass.
+// OPTIONAL: needs registering as a 1-arg builtin.
+uint64_t donky_tensor_stats(uint64_t a) {
+    Array* pa;
+    if (!dk_tensor_view("tensor_stats", "a", a, &pa)) return TAG_BASE;
+    double mn = 0.0, mx = 0.0, nan_n = 0.0, inf_n = 0.0;
+    int seen = 0;
+    for (size_t i = 0; i < pa->len; i++) {
+        double x = as_number(pa->data[i]);
+        if (x != x) { nan_n += 1.0; continue; }
+        if (isinf(x)) { inf_n += 1.0; continue; }
+        if (!seen) { mn = mx = x; seen = 1; }
+        else { if (x < mn) mn = x; if (x > mx) mx = x; }
+    }
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc("tensor_stats", 4, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    out[0] = make_number(nan_n); out[1] = make_number(inf_n); out[2] = make_number(mn); out[3] = make_number(mx);
     return r;
 }
 
@@ -4950,6 +5260,207 @@ uint64_t donky_ffi_peek_str(uint64_t ptr_val, uint64_t n_val) {
     copy[n] = 0;
     ((GCHeader*)copy - 1)->type_tag = TAG_STRING;
     return TAG_BASE | (TAG_STRING << 48) | (uint64_t)copy;
+}
+
+// ---- Tokenizer primitives ---------------------------------------------------------------------
+
+#define DK_VOCAB_MAX_TOKENS  (1u << 24)     // 16M tokens: far above any real vocab
+#define DK_VOCAB_MAX_TOKLEN  65536u         // a longer "token" means we are reading at the wrong address
+
+static inline uint64_t dk_rd_u64le(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24)
+         | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+// ffi_peek_vocab(addr, n_tokens) -> array of n_tokens strings, vocab[id] = token text.
+// `addr` is an absolute address (number) of EITHER the first string of a GGUF string array
+// (u64 length + bytes, repeated) OR the array header in front of it (u32 element type = 8, u64 count);
+// the header form is recognised automatically when its count equals n_tokens.
+// There is no bounds check against the mapping (the address is all we get): a token length over 64 KiB
+// is treated as "wrong address" and throws, which catches nearly every misaligned start immediately.
+// A token containing a NUL byte reads back truncated at the NUL (Donky strings are C strings).
+uint64_t donky_ffi_peek_vocab(uint64_t addr_val, uint64_t n_val) {
+    const char* who = "ffi_peek_vocab";
+    char msg[160];
+    if (!is_number(addr_val)) { snprintf(msg, sizeof msg, "%s: addr must be a number, got %s", who, dk_type_name(addr_val)); return dk_ffi_err(msg); }
+    if (!is_number(n_val))    { snprintf(msg, sizeof msg, "%s: n_tokens must be a number, got %s", who, dk_type_name(n_val)); return dk_ffi_err(msg); }
+    double dn = as_number(n_val);
+    if (!(dn >= 0.0) || dn > (double)DK_VOCAB_MAX_TOKENS || dn != floor(dn)) {
+        snprintf(msg, sizeof msg, "%s: n_tokens must be a whole number in [0, %u]", who, DK_VOCAB_MAX_TOKENS);
+        return dk_ffi_err(msg);
+    }
+    size_t n = (size_t)dn;
+    const uint8_t* p = (const uint8_t*)(uintptr_t)dk_ffi_to_u64(addr_val);
+    if (!p) { snprintf(msg, sizeof msg, "%s: null address", who); return dk_ffi_err(msg); }
+
+    uint64_t av = donky_alloc_array();
+    Array* arr = (Array*)as_index(av);
+    if (n == 0) return av;
+    if (n > SIZE_MAX / sizeof(uint64_t) || !(arr->data = (uint64_t*)calloc(n, sizeof(uint64_t)))) {
+        arr->data = NULL;
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
+    arr->cap = n;                                   // len stays 0 and grows as slots are filled: the GC never sees a half-built slot
+
+    if ((uint32_t)dk_rd_u64le(p) == 8u && dk_rd_u64le(p + 4) == (uint64_t)n) p += 12;   // skip a GGUF array header
+
+    for (size_t i = 0; i < n; i++) {
+        uint64_t len = dk_rd_u64le(p);
+        if (len > DK_VOCAB_MAX_TOKLEN) {
+            snprintf(msg, sizeof msg,
+                "%s: token %zu has implausible length %llu: addr is not the start of the string array (pass the address of the first string or of the array header)",
+                who, i, (unsigned long long)len);
+            return dk_ffi_err(msg);
+        }
+        p += 8;
+        char* s = (char*)gc_malloc((size_t)len + 1);
+        memcpy(s, p, (size_t)len);
+        s[len] = 0;
+        ((GCHeader*)s - 1)->type_tag = TAG_STRING;
+        arr->data[i] = TAG_BASE | (TAG_STRING << 48) | (uint64_t)(uintptr_t)s;
+        arr->len = i + 1;
+        p += len;
+    }
+    return av;
+}
+
+// ---- tokenize_bpe ----
+typedef struct { const char* s; uint32_t len; uint32_t id; } DkTokEnt;      // s == NULL: empty slot
+
+#define DK_FNV_OFF   0xcbf29ce484222325ULL
+#define DK_FNV_PRIME 0x100000001b3ULL
+#define DK_TOK_MAXLEN 65535u
+
+static inline size_t dk_tok_slot(uint64_t h, int shift) { return (size_t)((h * 0x9E3779B97F4A7C15ULL) >> shift); }
+
+static const DkTokEnt* dk_tok_find(const DkTokEnt* tab, size_t mask, int shift, uint64_t h, const char* s, size_t len) {
+    for (size_t i = dk_tok_slot(h, shift);; i = (i + 1) & mask) {
+        const DkTokEnt* e = &tab[i];
+        if (!e->s) return NULL;
+        if (e->len == len && memcmp(e->s, s, len) == 0) return e;
+    }
+}
+
+// GPT-2 "bytes_to_unicode": printable bytes (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) map to themselves; every
+// other byte b maps to U+0100 + (its rank among those bytes), e.g. space -> U+0120 'Ġ', newline -> U+010A 'Ċ'.
+static uint16_t dk_gpt2_cp[256];
+static void dk_gpt2_init(void) {
+    if (dk_gpt2_cp[33]) return;                                  // already built (entry 33 is never 0)
+    unsigned n = 0;
+    for (unsigned b = 0; b < 256; b++) {
+        int printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+        dk_gpt2_cp[b] = (uint16_t)(printable ? b : 256 + n++);
+    }
+}
+
+// tokenize_bpe(text, vocab) -> array of token ids (numbers). Greedy longest match, left to right:
+// at each position take the longest vocab entry that equals the text there. NOT real BPE (no merge
+// ranks, no Llama-3 regex pre-split), so ids can differ from the reference tokenizer; it is an MVP.
+//  * Llama-3 / GPT-2 style vocabularies store text byte-level-mapped (space is "Ġ", not 0x20). If the
+//    vocab contains "Ġ" the text bytes are mapped the same way before matching, so " world" finds
+//    "Ġworld". Any other vocab is matched against the raw bytes.
+//  * If a duplicate token string appears, the lowest id wins. Empty tokens are ignored.
+//  * Special tokens (e.g. "<|begin_of_text|>") match when they appear in the text, which is how you
+//    put BOS in a prompt, and also means user text can inject control tokens.
+//  * A byte no token covers throws (silently dropping it would corrupt the prompt). With a byte-level
+//    vocab every byte is covered, so this only happens with a toy/raw vocab.
+// The lookup table is rebuilt on every call (~10 ms for a 128k vocab): tokenize a whole prompt per call.
+uint64_t donky_tokenize_bpe(uint64_t text_val, uint64_t vocab_val) {
+    const char* who = "tokenize_bpe";
+    char msg[192];
+    if (get_tag(text_val) != TAG_STRING) { snprintf(msg, sizeof msg, "%s: text must be a string, got %s", who, dk_type_name(text_val)); return dk_ffi_err(msg); }
+    if (get_tag(vocab_val) != TAG_ARRAY) { snprintf(msg, sizeof msg, "%s: vocab must be an array of strings, got %s", who, dk_type_name(vocab_val)); return dk_ffi_err(msg); }
+    const char* text = (const char*)as_index(text_val);
+    Array* vocab = (Array*)as_index(vocab_val);
+    size_t nv = vocab->len, tlen = strlen(text);
+    for (size_t i = 0; i < nv; i++) {
+        if (get_tag(vocab->data[i]) != TAG_STRING) {
+            snprintf(msg, sizeof msg, "%s: vocab[%zu] must be a string, got %s", who, i, dk_type_name(vocab->data[i]));
+            return dk_ffi_err(msg);
+        }
+    }
+    if (nv > 0xFFFFFFFEu) return dk_ffi_err("tokenize_bpe: vocab too large");
+
+    // Open-addressing table, load <= 0.5.
+    size_t cap = 16; int bits = 4;
+    while (cap < nv * 2 + 2) { cap <<= 1; bits++; }
+    int shift = 64 - bits;
+    DkTokEnt* tab = (DkTokEnt*)calloc(cap, sizeof(DkTokEnt));
+    uint32_t* maxlen_first = (uint32_t*)calloc(256, sizeof(uint32_t));
+    if (!tab || !maxlen_first) { free(tab); free(maxlen_first); return dk_ffi_err("tokenize_bpe: out of memory"); }
+    uint32_t maxlen = 0;
+    for (size_t i = 0; i < nv; i++) {
+        const char* s = (const char*)as_index(vocab->data[i]);
+        size_t len = strlen(s);
+        if (len == 0 || len > DK_TOK_MAXLEN) continue;
+        uint64_t h = DK_FNV_OFF;
+        for (size_t k = 0; k < len; k++) h = (h ^ (uint8_t)s[k]) * DK_FNV_PRIME;
+        size_t j = dk_tok_slot(h, shift);
+        int dup = 0;
+        for (;; j = (j + 1) & (cap - 1)) {
+            if (!tab[j].s) break;
+            if (tab[j].len == len && memcmp(tab[j].s, s, len) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;                                        // lowest id already stored
+        tab[j].s = s; tab[j].len = (uint32_t)len; tab[j].id = (uint32_t)i;
+        if (len > maxlen) maxlen = (uint32_t)len;
+        if (len > maxlen_first[(uint8_t)s[0]]) maxlen_first[(uint8_t)s[0]] = (uint32_t)len;
+    }
+
+    // Byte-level (GPT-2 / Llama-3) vocab? It contains "Ġ" = C4 A0.
+    int bytelevel = 0;
+    {
+        uint64_t h = (DK_FNV_OFF ^ 0xC4) * DK_FNV_PRIME; h = (h ^ 0xA0) * DK_FNV_PRIME;
+        bytelevel = dk_tok_find(tab, cap - 1, shift, h, "\xC4\xA0", 2) != NULL;
+    }
+    const char* t = text;
+    char* mapped = NULL;
+    size_t mlen = tlen;
+    if (bytelevel) {
+        dk_gpt2_init();
+        mapped = (char*)malloc(tlen * 2 + 1);
+        if (!mapped) { free(tab); free(maxlen_first); return dk_ffi_err("tokenize_bpe: out of memory"); }
+        size_t o = 0;
+        for (size_t i = 0; i < tlen; i++) {
+            unsigned cp = dk_gpt2_cp[(uint8_t)text[i]];
+            if (cp < 0x80) mapped[o++] = (char)cp;
+            else { mapped[o++] = (char)(0xC0 | (cp >> 6)); mapped[o++] = (char)(0x80 | (cp & 0x3F)); }   // cp < 0x800 always
+        }
+        mapped[o] = 0; mlen = o; t = mapped;
+    }
+
+    uint32_t* ids = (uint32_t*)malloc((tlen ? tlen : 1) * sizeof(uint32_t));       // <= 1 token per input byte
+    uint64_t* hs = (uint64_t*)malloc(((size_t)maxlen + 2) * sizeof(uint64_t));
+    if (!ids || !hs) { free(tab); free(maxlen_first); free(mapped); free(ids); free(hs); return dk_ffi_err("tokenize_bpe: out of memory"); }
+
+    size_t nids = 0, i = 0;
+    int ok = 1;
+    while (i < mlen) {
+        size_t maxl = maxlen_first[(uint8_t)t[i]];
+        if (maxl > mlen - i) maxl = mlen - i;
+        uint64_t h = DK_FNV_OFF;
+        for (size_t l = 1; l <= maxl; l++) { h = (h ^ (uint8_t)t[i + l - 1]) * DK_FNV_PRIME; hs[l] = h; }
+        size_t l = maxl;
+        const DkTokEnt* e = NULL;
+        for (; l >= 1; l--) { e = dk_tok_find(tab, cap - 1, shift, hs[l], t + i, l); if (e) break; }
+        if (!e) {
+            snprintf(msg, sizeof msg, "%s: no vocab entry matches byte 0x%02X at offset %zu%s", who, (uint8_t)t[i], i,
+                     bytelevel ? " (of the byte-level-mapped text)" : "");
+            ok = 0; break;
+        }
+        ids[nids++] = e->id;
+        i += l;
+    }
+    free(tab); free(maxlen_first); free(mapped); free(hs);
+    if (!ok) { free(ids); return dk_ffi_err(msg); }
+
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, nids, &out);
+    if (r == TAG_BASE) { free(ids); return TAG_BASE; }
+    for (size_t k = 0; k < nids; k++) out[k] = make_number((double)ids[k]);
+    free(ids);
+    return r;
 }
 
 // ---- hashing ----

@@ -1,0 +1,194 @@
+// lib/iphlp.donk — IP Helper API wrapper over iphlpapi.dll (pure Donky, typed FFI).
+//
+// Public API:
+//   get_adapters()           -> [ {name, if_index}, ... ]
+//   get_arp_table()          -> [ {ip, if_index, mac, state}, ... ]
+//   get_gateway_mac(if_index)-> mac string or null  (heuristic; see note)
+//   ping(host, count)        -> bool  (uses exec_wait; Win only)
+//
+// Struct layout notes (Windows 10/11 x64, stable through 24H2):
+//   IP_ADAPTER_ADDRESSES (first 56 bytes are what we read):
+//      0  Length (ULONG)
+//      8  IfIndex (DWORD)
+//     16  Next (IP_ADAPTER_ADDRESSES*)
+//     24  AdapterName (char*)
+//   MIB_IPNET_TABLE2 { ULONG NumEntries; MIB_IPNET_ROW2 Table[1]; }
+//   MIB_IPNET_ROW2 (112 bytes on Win10+):
+//      0   Address (SOCKADDR_INET, 28 bytes)
+//           +0  si_family (ADDRESS_FAMILY, u16): 2 = AF_INET, 23 = AF_INET6
+//           +2  si_port (u16) — always 0 in the ARP table
+//           +4  si_addr (u8[16]): IPv4 in bytes 0..3, IPv6 in bytes 0..15
+//     28  InterfaceIndex (ULONG)
+//     32  InterfaceLuid (ULONG64)
+//     40  PhysicalAddress (u8[32])
+//     72  PhysicalAddressLength (ULONG)
+//     76  State (ULONG): 0=Unreachable 1=Incomplete 2=Probe 3=Delay 4=Stale 5=Reachable 6=Permanent
+//     80  Flags (UCHAR)
+//
+// The gateway heuristic (ip ends in .1 or .254) is a known wart; netguard.donk
+// confirms with ping() before pinning, so a false positive is caught before it
+// produces a false ARP-alarm. v3.3.1 swaps it for GetBestRoute2.
+
+// ---------------------------------------------------------------- internals
+
+fn ip_fn(name) {
+    let key = "iphlp:" + name;
+    let cached = global_get(key);
+    if cached != null { return cached; }
+    let lib = dll_load("iphlpapi.dll");
+    if lib == 0 { throw "iphlp: could not load iphlpapi.dll"; }
+    let p = dll_sym(lib, name);
+    if p == 0 { throw "iphlp: iphlpapi.dll has no export " + name; }
+    global_set(key, p);
+    return p;
+}
+
+// Encode an ANSI C string as a NUL-terminated buffer. We pass Donky strings
+// directly to dll_call_sig('s') in most paths, but a few APIs (ping via
+// exec_wait) need the string as an argument, not as a C callee arg. Kept for
+// future callers that need to hand a raw char* to mem_write.
+fn _cstr_buf(s) {
+    let n = len(s)
+    let p = mem_alloc(n + 1)
+    for i in 0 .. n { ffi_poke(p + i, 1, byte_at(s, i)) }
+    ffi_poke(p + n, 1, 0)
+    return p
+}
+
+// ---------------------------------------------------------------- adapters
+
+fn get_adapters() {
+    // Two-pass: (1) ask for size, (2) allocate + ask again.
+    let size_ptr = mem_alloc(4);
+    ffi_poke(size_ptr, 4, 0);
+    // GAA_FLAG_INCLUDE_GATEWAYS(0x2)|SKIP_ANYCAST(0x4)|SKIP_MULTICAST(0x8)|SKIP_DNS_SERVER(0x10) = 0x1E
+    // Family 0 = AF_UNSPEC (both v4 and v6)
+    dll_call_sig(ip_fn("GetAdaptersAddresses"), "u", "uuuppp",
+                 [0, 30, 0, size_ptr, 0, 0]);
+    let need = ffi_peek(size_ptr, 4);
+    mem_free(size_ptr);
+    if need == 0 { return []; }
+
+    let buf = mem_alloc(need);
+    let size_ptr2 = mem_alloc(4);
+    ffi_poke(size_ptr2, 4, need);
+    let rc = dll_call_sig(ip_fn("GetAdaptersAddresses"), "u", "uuuppp",
+                          [0, 30, 0, size_ptr2, buf, 0]);
+    mem_free(size_ptr2);
+    if rc != 0 {
+        mem_free(buf);
+        throw "iphlp: GetAdaptersAddresses failed rc=" + str(rc);
+    }
+
+    let out = [];
+    let p = buf;
+    while p != 0 {
+        let len = ffi_peek(p, 4);
+        if len < 56 { break; }
+        let if_index = ffi_peek(p + 8, 4);
+        let name_ptr = ffi_peek(p + 24, 8);
+        let name = "";
+        if name_ptr != 0 {
+            // AdapterName is ASCII, NUL-terminated, max 260 bytes (MAX_ADAPTER_NAME_LENGTH + 4).
+            let raw = ffi_peek_str(name_ptr, 260);
+            // ffi_peek_str copies n bytes; trim at the first NUL we encounter.
+            let trimmed = "";
+            for i in 0 .. len(raw) {
+                if byte_at(raw, i) == 0 { break; }
+                trimmed = trimmed + substr(raw, i, i + 1);
+            }
+            name = trimmed;
+        }
+        push(out, { name: name, if_index: if_index });
+        p = ffi_peek(p + 16, 8);   // Next
+    }
+    // buf is intentionally not freed: name strings are copies made by
+    // ffi_peek_str, so freeing buf is safe, but the header and starts bitmap
+    // holding the allocation have no free-list entry of their own. We call
+    // get_adapters() at most a handful of times per session, so the leak is
+    // bounded. v3.3.1 adds a proper arena-free.
+    return out;
+}
+
+// ---------------------------------------------------------------- ARP
+
+fn get_arp_table() {
+    // PMIB_IPNET_TABLE2* — one pointer out.
+    let table_pp = mem_alloc(8);
+    ffi_poke(table_pp, 8, 0);
+    // Family 2 = AF_INET (IPv4 only; IPv6 is handled separately in v3.3.1).
+    let rc = dll_call_sig(ip_fn("GetIpNetTable2"), "u", "up",
+                          [2, table_pp]);
+    if rc != 0 {
+        mem_free(table_pp);
+        throw "iphlp: GetIpNetTable2 failed rc=" + str(rc);
+    }
+    let table = ffi_peek(table_pp, 8);
+    mem_free(table_pp);
+    if table == 0 { return []; }
+
+    let count = ffi_peek(table, 4);
+    let out = [];
+    let row_base = table + 8;         // NumEntries is 4 bytes; Table[] is 4-byte-aligned but MIB_IPNET_ROW2 is 8-byte aligned → pad to 8
+    let row_size = 112;
+    let i = 0;
+    while i < count {
+        let row = row_base + i * row_size;
+        let family = ffi_peek(row, 2);
+        let ip = "";
+        if family == 2 {
+            let a = ffi_peek(row + 4, 1);
+            let b = ffi_peek(row + 5, 1);
+            let c = ffi_peek(row + 6, 1);
+            let d = ffi_peek(row + 7, 1);
+            ip = str(a) + "." + str(b) + "." + str(c) + "." + str(d);
+        }
+        let if_index = ffi_peek(row + 28, 4);
+        let mac_len = ffi_peek(row + 72, 4);
+        let mac = "";
+        if mac_len > 0 && mac_len <= 8 {
+            let hexd = "0123456789ABCDEF";
+            let j = 0;
+            while j < mac_len {
+                let b = ffi_peek(row + 40 + j, 1);
+                mac = mac + substr(hexd, b / 16, b / 16 + 1) + substr(hexd, b % 16, b % 16 + 1);
+                if j + 1 < mac_len { mac = mac + "-"; }
+                j = j + 1;
+            }
+        }
+        push(out, { ip: ip, if_index: if_index, mac: mac, state: ffi_peek(row + 76, 4) });
+        i = i + 1;
+    }
+    dll_call_sig(ip_fn("FreeMibTable"), "v", "p", [table]);
+    return out;
+}
+
+// Heuristic: the gateway is the row on this interface whose IPv4 ends in
+// .1 or .254. Both are common; if both exist, .1 wins. Returns the MAC or
+// null. Callers MUST confirm with ping() before pinning (netguard.donk does).
+fn get_gateway_mac(if_index) {
+    let table = get_arp_table();
+    let cand_1 = null;
+    let cand_254 = null;
+    for row in table {
+        if row.if_index == if_index && row.mac != "" {
+            let parts = split(row.ip, ".");
+            if len(parts) == 4 {
+                let last = num(parts[3]);
+                if last == 1   && cand_1 == null   { cand_1 = row.mac; }
+                if last == 254 && cand_254 == null { cand_254 = row.mac; }
+            }
+        }
+    }
+    if cand_1 != null { return cand_1; }
+    return cand_254;
+}
+
+// ping(host, count): shells out to ping.exe via exec_wait. Returns true if
+// every probe got a reply. Non-throwing; on any failure returns false.
+fn ping(host, count) {
+    let r = exec_wait("ping", ["-n", str(count), "-w", "1000", host], 10000);
+    if r.code != 0 { return false; }
+    // ping.exe always exits 0 if it ran; success is signalled by "TTL=" in stdout.
+    return contains(r.stdout, "TTL=");
+}

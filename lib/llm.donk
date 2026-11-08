@@ -1,4 +1,5 @@
 import "transformer.donk";
+import "tokenizer.donk";
 // lib/llm.donk — LLM runner: GGUF metadata -> layer loop -> transformer block -> sampling.
 //
 // Depends on (all in STDLIB_BUILTINS, runtime_template.c):
@@ -359,6 +360,8 @@ fn llm_load(path) {
 
     // 6. Collect layer pointers off the tensor-data base.
     model["layers"] = llm_collect_layers(tensors, data_base);
+
+    tok_attach(model, mm["addr"]);
 
     return model;
 }
@@ -824,9 +827,27 @@ fn llm_generate(model, prompt_ids, n_tokens, temperature, top_k) {
     while step < n_tokens {
         let logits = llm_forward(model, ctx);
         let next = llm_sample(logits, temperature, top_k);
-        push(out, next);
-        push(ctx, next);
-        step = step + 1;
+        
+        let stops = tok_chat_stops(model);
+        let is_stop = false;
+        let s = 0;
+        while s < len(stops) {
+            if stops[s] == next { is_stop = true; }
+            s = s + 1;
+        }
+        if is_stop { 
+            step = n_tokens; 
+        } else {
+            push(out, next);
+            push(ctx, next);
+            step = step + 1;
+        }
     }
     return out;
+}
+
+fn llm_chat(model, user_prompt, n_tokens) {
+    let prompt_ids = tok_chat_prompt(model, user_prompt);
+    let generated = llm_generate(model, prompt_ids, n_tokens, 0.6, 40);
+    return tok_decode(model, generated);
 }

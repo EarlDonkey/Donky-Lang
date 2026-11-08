@@ -1,12 +1,26 @@
-// lib/winreg.donk — read-only Windows Registry wrapper over advapi32.dll (pure Donky, typed FFI).
+// lib/winreg.donk — Windows Registry wrapper over advapi32.dll (pure Donky, typed FFI).
+// v3.3.0-netguard: added write path (reg_write_string / reg_write_dword /
+// reg_delete_value) and reg_key_exists. Read path unchanged from v2.3.
 //
-// Public API:
-//   reg_open_key(hkey, subkey)      -> handle (number) or null
-//   reg_close_key(handle)           -> 0
-//   reg_read_string(handle, name)   -> string or null   (REG_SZ / REG_EXPAND_SZ only, < 1024 bytes)
-//   reg_enum_key(handle, index)     -> subkey name or null (null at ERROR_NO_MORE_ITEMS or on any error)
-//   get_installed_programs()        -> [ {name, version, publisher}, ... ]  (HKLM ...\Uninstall)
-//   get_installed_programs_all()    -> same, plus the 32-bit (WOW6432Node) view
+// Public API — READ:
+//   reg_open_key(hkey, subkey)          -> handle (number) or null
+//   reg_close_key(handle)               -> 0
+//   reg_read_string(handle, name)       -> string or null   (REG_SZ / REG_EXPAND_SZ only, < 1024 bytes)
+//   reg_enum_key(handle, index)         -> subkey name or null (null at ERROR_NO_MORE_ITEMS or on any error)
+//   reg_key_exists(hkey, subkey)        -> bool
+//   get_installed_programs()            -> [ {name, version, publisher}, ... ]  (HKLM ...\Uninstall)
+//   get_installed_programs_all()        -> same, plus the 32-bit (WOW6432Node) view
+//
+// Public API — WRITE (require Administrator / KEY_WRITE):
+//   reg_open_key_write(hkey, subkey)    -> handle or null
+//   reg_write_string(hkey, subkey, name, value)   -> true  (REG_SZ)
+//   reg_write_dword(hkey, subkey, name, value)    -> true  (REG_DWORD)
+//   reg_delete_value(hkey, subkey, name)          -> bool  (true if deleted or already absent)
+//
+// HKEY constants (pass these to any function above):
+//   HKEY_LOCAL_MACHINE   = 2147483650  (0x80000002)
+//   HKEY_CURRENT_USER    = 2147483649  (0x80000001)
+//   HKEY_CLASSES_ROOT    = 2147483648  (0x80000000)
 //
 // Notes:
 //   - Windows only. Programs that import this file must be built on Windows.
@@ -15,7 +29,8 @@
 //     file-level constants. Helpers cache resolved advapi32 symbols with global_get/global_set,
 //     under keys prefixed "winreg:".
 //   - dll_call_sig type letters: p pointer, s char*, u uint32. HKEYs and out-pointers are "p".
-//   - Registry status codes are LONG; they are declared "u" and only compared against 0 and 259.
+//   - Registry status codes are LONG; they are declared "u" and only compared against 0 / 2 / 259.
+//   - A / ANSI variants are used throughout; every identifier NetGuard writes is ASCII.
 
 // ---------------------------------------------------------------- internals
 
@@ -32,7 +47,7 @@ fn wr_fn(name) {
     return p;
 }
 
-// ---------------------------------------------------------------- basic helpers
+// ---------------------------------------------------------------- basic helpers (READ)
 
 // RegOpenKeyExA(hKey, lpSubKey, ulOptions=0, samDesired=KEY_READ, phkResult)
 fn reg_open_key(hkey, subkey) {
@@ -55,6 +70,14 @@ fn reg_close_key(handle) {
         dll_call_sig(wr_fn("RegCloseKey"), "u", "p", [handle]);
     }
     return 0;
+}
+
+// Convenience: does this key exist and is it readable? Non-throwing.
+fn reg_key_exists(hkey, subkey) {
+    let h = reg_open_key(hkey, subkey)
+    if h == null { return false }
+    reg_close_key(h)
+    return true
 }
 
 // ---------------------------------------------------------------- string reading
@@ -105,7 +128,7 @@ fn reg_enum_key(handle, index) {
     return result;
 }
 
-// ---------------------------------------------------------------- high-level API
+// ---------------------------------------------------------------- high-level READ
 
 // Appends one {name, version, publisher} map per Uninstall subkey that has a DisplayName.
 fn wr_scan_uninstall(view_path, out) {
@@ -144,4 +167,69 @@ fn get_installed_programs_all() {
     wr_scan_uninstall("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", result);
     wr_scan_uninstall("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall", result);
     return result;
+}
+
+// ---------------------------------------------------------------- basic helpers (WRITE)
+//
+// The write path uses KEY_READ | KEY_WRITE (0x20006 = 131078) rather than
+// KEY_ALL_ACCESS. Key creation is NOT included: if the subkey does not exist,
+// reg_write_string will throw. NetGuard only ever writes to keys that exist
+// by default (NetworkAddress lives under an existing adapter class key;
+// NameServer lives under an existing interface key), so this is deliberate.
+
+// RegOpenKeyExA(hKey, lpSubKey, ulOptions=0, samDesired=KEY_READ|KEY_WRITE, phkResult)
+fn reg_open_key_write(hkey, subkey) {
+    let out = mem_alloc(8);
+    ffi_poke(out, 8, 0);
+    let rc = dll_call_sig(wr_fn("RegOpenKeyExA"), "u", "psuup",
+                          [hkey, subkey, 0, 131078, out]);   // 131078 = 0x20006
+    let handle = null;
+    if rc == 0 {
+        let h = ffi_peek(out, 8);
+        if h != 0 { handle = h; }
+    }
+    mem_free(out);
+    return handle;
+}
+
+// RegSetValueExA(hKey, lpValueName, Reserved=0, dwType=REG_SZ(1), lpData, cbData)
+// Type string "psuusu": p=HKEY, s=name, u=reserved, u=type, s=data, u=cb.
+// cbData is byte length INCLUDING the NUL terminator.
+fn reg_write_string(hkey, subkey, value_name, value) {
+    let h = reg_open_key_write(hkey, subkey);
+    if h == null {
+        throw "winreg: reg_write_string could not open " + subkey + " (elevated? key exists?)";
+    }
+    let cb = len(value) + 1;
+    let rc = dll_call_sig(wr_fn("RegSetValueExA"), "u", "psuusu",
+                          [h, value_name, 0, 1, value, cb]);
+    reg_close_key(h);
+    if rc != 0 {
+        throw "winreg: reg_write_string failed rc=" + str(rc) + " at " + subkey + "\\" + value_name;
+    }
+    return true;
+}
+
+// RegSetValueExA with dwType=REG_DWORD(4). Type string "psuupu":
+// p=HKEY, s=name, u=reserved, u=type, p=data-ptr, u=cb. The value is 4 bytes LE.
+fn reg_write_dword(hkey, subkey, value_name, value) {
+    let h = reg_open_key_write(hkey, subkey);
+    if h == null { throw "winreg: reg_write_dword could not open " + subkey; }
+    let p = mem_alloc(4);
+    ffi_poke(p, 4, value);
+    let rc = dll_call_sig(wr_fn("RegSetValueExA"), "u", "psuupu",
+                          [h, value_name, 0, 4, p, 4]);
+    mem_free(p);
+    reg_close_key(h);
+    if rc != 0 { throw "winreg: reg_write_dword failed rc=" + str(rc); }
+    return true;
+}
+
+// RegDeleteValueA(hKey, lpValueName). 2 = ERROR_FILE_NOT_FOUND -> treat as success.
+fn reg_delete_value(hkey, subkey, value_name) {
+    let h = reg_open_key_write(hkey, subkey);
+    if h == null { return false; }
+    let rc = dll_call_sig(wr_fn("RegDeleteValueA"), "u", "ps", [h, value_name]);
+    reg_close_key(h);
+    return rc == 0 || rc == 2;
 }

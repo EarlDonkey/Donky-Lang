@@ -166,7 +166,7 @@ fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
                 args.push(format!("-L{}", lib.to_string_lossy().replace('\\', "/")));
             }
         }
-        for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32"] {
+        for l in ["-lws2_32", "-lpsapi", "-lm", "-lwinhttp", "-lgdi32", "-lole32", "-loleaut32", "-luuid", "-lshell32", "-lbcrypt"] {
             args.push(l.to_string());
         }
         // -Bstatic => only libffi.a is considered, so the exe never needs libffi-8.dll.
