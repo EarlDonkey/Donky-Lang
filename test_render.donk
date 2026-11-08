@@ -1,0 +1,24 @@
+import "lib/world.donk";
+
+print("Generating 512x256 world...");
+let world = world_new(512, 256, 42);
+world_generate(world);
+print("World size: " + str(world["width"]) + "x" + str(world["height"]));
+
+print("Allocating render buffer...");
+let vw = 512;
+let vh = 256;
+let vbuf = mem_alloc(vw * vh * 4);
+
+print("Rendering...");
+world_render(world, 0, 0, vw, vh, vbuf);
+
+print("Writing raw RGBA to world.rgba...");
+let bytes = [];
+let i = 0;
+while i < vw * vh * 4 {
+    push(bytes, ffi_peek(vbuf + i, 1));
+    i = i + 1;
+}
+sys_write_binary("world.rgba", bytes);
+print("Wrote " + str(len(bytes)) + " bytes");

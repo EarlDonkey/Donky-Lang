@@ -1,0 +1,32 @@
+import "lib/llm.donk";
+
+let model = llm_load("model.gguf");
+let ids = tok_chat_prompt(model, "Hello");
+print("Prompt length: " + str(len(ids)));
+
+print("--- correctness ---");
+let diff = llm_kv_selfcheck(model, ids);
+print("max |cached - uncached| logit: " + str(diff));
+if diff < 0.00001 {
+    print("PASS: cache is correct");
+} else {
+    print("FAIL: cache disagrees with llm_forward");
+}
+
+print("--- timing: llm_forward (uncached) ---");
+let t0 = now_ms();
+let _ = llm_forward(model, ids);
+let t1 = now_ms();
+print("  " + str(t1 - t0) + " ms for " + str(len(ids)) + " tokens");
+
+print("--- timing: llm_generate_cached (KV cache) ---");
+let t2 = now_ms();
+let _ = llm_generate_cached(model, ids, 10, 0.6, 40);
+let t3 = now_ms();
+print("  " + str(t3 - t2) + " ms for 10 generated tokens");
+
+print("--- timing: llm_generate (uncached) ---");
+let t4 = now_ms();
+let _ = llm_generate(model, ids, 10, 0.6, 40);
+let t5 = now_ms();
+print("  " + str(t5 - t4) + " ms for 10 generated tokens");

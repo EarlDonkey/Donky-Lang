@@ -1,0 +1,54 @@
+// lib/world.donk — 2D block world management.
+// The world state is a raw mem_alloc'd byte buffer, not a Donky array.
+// Each block is one byte. Block IDs match the C palette.
+
+fn world_new(width, height, seed) {
+    let nbytes = width * height;
+    let ptr = mem_alloc(nbytes);
+    if ptr == 0 { throw "world_new: mem_alloc(" + str(nbytes) + ") failed"; }
+    let w = {};
+    w["ptr"]    = ptr;
+    w["width"]  = width;
+    w["height"] = height;
+    w["seed"]   = seed;
+    w["tick"]   = 0;
+    return w;
+}
+
+fn world_generate(world) {
+    let chunk = 128;
+    let x = 0;
+    while x < world["width"] {
+        let y = 0;
+        while y < world["height"] {
+            print("world_gen chunk at " + str(x) + "," + str(y));
+            world_gen(world["ptr"], world["width"], world["height"],
+                      world["seed"], x, y);
+            y = y + chunk;
+        }
+        x = x + chunk;
+    }
+    return world;
+}
+
+print("World width: " + str(world["width"]) + " height: " + str(world["height"]));
+
+fn world_render(world, cam_x, cam_y, view_w, view_h, view_ptr) {
+    world_mesh(world["ptr"], world["width"], world["height"],
+               cam_x, cam_y, view_w, view_h, view_ptr);
+    return view_ptr;
+}
+
+fn world_tick(world) {
+    world["tick"] = world["tick"] + 1;
+    return world;
+}
+
+fn world_block(world, x, y) {
+    if x < 0 || x >= world["width"] || y < 0 || y >= world["height"] { return 0; }
+    return ffi_peek(world["ptr"] + y * world["width"] + x, 1);
+}
+
+fn world_set_block(world, x, y, id) {
+    return world_set(world["ptr"], world["width"], world["height"], x, y, id);
+}

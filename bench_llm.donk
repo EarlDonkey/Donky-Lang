@@ -1,0 +1,474 @@
+// tests/bench_llm.donk -- benchmark + regression guard for the LLM path.
+//
+// WHAT THE OPTIMIZATIONS ARE (runtime_template.c, "dk_simd_mt" block):
+//   1. each Q4_K/Q6_K weight block is dequantized ONCE per call and dotted against every batch row
+//   2. AVX2+FMA dot product, chosen at run time (DONKY_NO_AVX2=1 forces the scalar path)
+//   3. fork/join row parallelism over the output rows (DONKY_THREADS=1..64, default min(8, CPUs));
+//      results are bit-identical for any thread count
+//
+// HOW THIS FILE PROVES THEM (no baseline needed for 1-3; a baseline run is needed for 4):
+//   1. KERNEL ACCURACY   tensor_matmul_q4 vs an independent per-row reference (ffi_peek_q4_row + a
+//                        double-precision dot in Donky). Fails if the SIMD/threaded kernel is wrong.
+//   2. BATCH AMORTIZATION time(batch=16) / time(batch=1) must be well below 16. If dequantization
+//                        were repeated per batch row the ratio would be ~16.
+//   3. END-TO-END        llm_forward returns vocab_size finite logits and is deterministic: every
+//                        timed run is bit-identical to the first (cold) run.
+//   4. SPEEDUP           the optimizations are switched by env vars the runtime reads ONCE per
+//                        process, so before/after needs two runs. Save a baseline, then compare:
+//
+//        DONKY_NO_AVX2=1 DONKY_THREADS=1 DONKY_BENCH_OUT=base.json ./donky_app      (baseline)
+//        DONKY_BENCH_BASELINE=base.json DONKY_BENCH_MIN_GEMM_SPEEDUP=2 ./donky_app  (optimized)
+//
+//      or run the baseline with an older build of the runtime. Baseline and optimized runs must use
+//      the same model, prompt and batch size; the comparison refuses otherwise.
+//
+// MEASURED REFERENCE (native C harness, same kernels, synthetic [8192 x 2048] Q4_K matrix, 1 vCPU
+// Xeon 2.1 GHz with AVX2; your numbers will differ, these only justify the default thresholds):
+//   batch 1 : 16-19 ms (AVX2)   24 ms (scalar)
+//   batch 16: 43-47 ms (AVX2)  161-170 ms (scalar)      -> ratio 2.5 (AVX2) / 7 (scalar), linear = 16
+//   AVX2 vs scalar at batch 16: about 3.7x.  Error vs reference: 1.5e-8 (AVX2), 1e-16 (scalar),
+//   measured relative to the sum of |terms|.  Thread speedup could not be measured on one core.
+//
+// ENVIRONMENT (all optional)
+//   DONKY_BENCH_MODEL           path to the GGUF file                      (default model.gguf)
+//   DONKY_BENCH_REQUIRE=1       a missing model FAILS instead of SKIPping
+//   DONKY_BENCH_ITERS           timed warm llm_forward runs                (default 3)
+//   DONKY_BENCH_GEN             tokens for llm_generate                    (default 5)
+//   DONKY_BENCH_BATCH           the "large batch" for the GEMM ratio       (default 16)
+//   DONKY_BENCH_OUT             write the results (JSON) to this file
+//   DONKY_BENCH_BASELINE        compare against a results file written by DONKY_BENCH_OUT
+//   DONKY_BENCH_MIN_SPEEDUP     forward-pass speedup required vs baseline  (default 1.0)
+//   DONKY_BENCH_MIN_GEMM_SPEEDUP GEMM speedup required vs baseline         (default 1.0)
+//   DONKY_BENCH_MAX_FORWARD_MS  absolute ceiling on the best forward time  (default off)
+//   DONKY_BENCH_MIN_TOKS        absolute floor on generate tokens/sec      (default off)
+//
+// NOTES
+//   - now_ms() is GetTickCount64 on Windows (about 15 ms ticks), so short operations are timed over
+//     many repetitions and only second-scale operations are timed singly.
+//   - The first llm_forward is "cold": it pages the mmap'd weights in from disk. It is reported
+//     but never used for speed numbers.
+//   - llm_generate has no KV cache: every new token re-runs the whole context, and sampling
+//     (llm_sample, top-k by repeated scan) is plain Donky. Its tokens/sec is therefore NOT the
+//     kernel's throughput; the sampling cost is measured separately so you can see the split.
+//   - Exits 1 if any check fails, so `donky test` reports it. Run it from the repo root.
+//   - Top-level `let` is invisible inside functions, so everything lives in functions.
+
+import "lib/llm.donk";
+
+// ---------------------------------------------------------------- small helpers
+
+fn bench_env_num(name, dflt) {
+    let v = sys_getenv(name);
+    if v == null { return dflt; }
+    if len(v) == 0 { return dflt; }
+    return num(v);
+}
+
+fn bench_env_str(name, dflt) {
+    let v = sys_getenv(name);
+    if v == null { return dflt; }
+    if len(v) == 0 { return dflt; }
+    return v;
+}
+
+fn bench_r2(x) { return floor(x * 100.0 + 0.5) / 100.0; }
+
+// Prints one PASS/FAIL line and counts failures (a global, because functions cannot see top-level lets).
+fn bench_check(label, ok, detail) {
+    if ok {
+        print("  [PASS] " + label + ": " + detail);
+    } else {
+        print("  [FAIL] " + label + ": " + detail);
+        global_set("bench_fails", global_get("bench_fails") + 1);
+    }
+    return ok;
+}
+
+fn bench_sorted(xs) {
+    let s = [];
+    let i = 0;
+    while i < len(xs) {
+        push(s, xs[i]);
+        i = i + 1;
+    }
+    i = 1;
+    while i < len(s) {
+        let v = s[i];
+        let j = i - 1;
+        while j >= 0 && s[j] > v {
+            s[j + 1] = s[j];
+            j = j - 1;
+        }
+        s[j + 1] = v;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn bench_median(xs) {
+    let s = bench_sorted(xs);
+    return s[floor(len(s) / 2)];
+}
+
+fn bench_min(xs) {
+    let s = bench_sorted(xs);
+    return s[0];
+}
+
+// true if every element is a finite number (NaN and +-inf both fail v - v == 0).
+fn bench_all_finite(xs) {
+    let n = len(xs);
+    let i = 0;
+    while i < n {
+        let v = xs[i];
+        if type(v) != "number" { return false; }
+        if !(v - v == 0.0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bench_same(a, b) {
+    if len(a) != len(b) { return false; }
+    let n = len(a);
+    let i = 0;
+    while i < n {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Deterministic activations in [-1, 1] (multiples of 0.01); the seed changes the pattern.
+fn bench_acts(n, seed) {
+    let out = [];
+    let i = 0;
+    while i < n {
+        push(out, ((i * 37 + seed * 101) % 201 - 100) / 100.0);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- kernel benchmarks
+
+// First 2D Q4_K tensor of block 0 -> {name, ptr, c, r}, or null if the model has none.
+// dims[0] is the contracted dimension c, dims[1] the output width r (see llm.donk).
+fn bench_find_q4(model) {
+    let tensors = model["tensors"];
+    let names = ["blk.0.ffn_up.weight", "blk.0.ffn_gate.weight", "blk.0.attn_q.weight",
+                 "blk.0.attn_output.weight", "blk.0.attn_k.weight"];
+    let i = 0;
+    while i < len(names) {
+        let t = tensors[names[i]];
+        if t != null {
+            if t["type"] == 12 {
+                let dims = t["dims"];
+                if len(dims) == 2 {
+                    if dims[0] % 256 == 0 {
+                        let found = {};
+                        found["name"] = names[i];
+                        found["ptr"] = model["weight_blob"] + t["data_offset"];
+                        found["c"] = dims[0];
+                        found["r"] = dims[1];
+                        return found;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+// Worst |kernel - reference| / sum|terms| over a spread of rows and a 4-row batch.
+// The reference dequantizes one row with ffi_peek_q4_row and does the dot in double precision, so it
+// is independent of the SIMD dot product and of the threading (it shares the dequantizer).
+// Measured natively: 1.5e-8 with AVX2, 1e-16 scalar. The kernel rounds activations to float32 and
+// the AVX2 path accumulates in float, so allow 1e-4: far above rounding, far below any real bug.
+fn bench_accuracy(ptr, c, r) {
+    let batch = 4;
+    let a = bench_acts(c * batch, 3);
+    let out = tensor_matmul_q4(a, ptr, batch, c, r);
+    if type(out) != "array" { throw "bench: tensor_matmul_q4 did not return an array"; }
+    if len(out) != batch * r { throw "bench: tensor_matmul_q4 returned " + str(len(out)) + " values, expected " + str(batch * r); }
+    let n_chk = 12;
+    if r < n_chk { n_chk = r; }
+    let worst = 0.0;
+    let j = 0;
+    while j < n_chk {
+        let row = floor(j * r / n_chk);
+        let w = ffi_peek_q4_row(ptr, row, c);
+        let bi = 0;
+        while bi < batch {
+            let s = 0.0;
+            let l1 = 0.0;
+            let k = 0;
+            while k < c {
+                let t = w[k] * a[bi * c + k];
+                s = s + t;
+                if t < 0 { l1 = l1 - t; } else { l1 = l1 + t; }
+                k = k + 1;
+            }
+            let d = out[bi * r + row] - s;
+            if d < 0 { d = 0.0 - d; }
+            let e = d / (l1 + 0.000000000000000000000000000001);
+            if e > worst { worst = e; }
+            bi = bi + 1;
+        }
+        j = j + 1;
+    }
+    return worst;
+}
+
+// Average ms per call. One warm-up call (faults in the mmap'd weights), then the repetition count is
+// doubled until the timed block lasts >= 300 ms, so the coarse Windows tick cannot distort it.
+fn bench_gemm_ms(a, ptr, wtype, batch, c, r) {
+    tf_matmul_auto(a, ptr, wtype, batch, c, r);
+    gc();
+    let reps = 1;
+    while true {
+        let t0 = now_ms();
+        let i = 0;
+        while i < reps {
+            tf_matmul_auto(a, ptr, wtype, batch, c, r);
+            i = i + 1;
+        }
+        let dt = now_ms() - t0;
+        if dt >= 300 || reps >= 512 {
+            gc();
+            return dt / reps;
+        }
+        reps = reps * 2;
+    }
+    return 0.0;
+}
+
+// Same idea for llm_sample, the pure-Donky part of generation.
+fn bench_sample_ms(logits) {
+    llm_sample(logits, 0.6, 40);
+    gc();
+    let reps = 1;
+    while true {
+        let t0 = now_ms();
+        let i = 0;
+        while i < reps {
+            llm_sample(logits, 0.6, 40);
+            i = i + 1;
+        }
+        let dt = now_ms() - t0;
+        if dt >= 300 || reps >= 512 {
+            gc();
+            return dt / reps;
+        }
+        reps = reps * 2;
+    }
+    return 0.0;
+}
+
+// ---------------------------------------------------------------- the benchmark
+
+fn bench_main() {
+    global_set("bench_fails", 0);
+    let model_path = bench_env_str("DONKY_BENCH_MODEL", "model.gguf");
+    let iters      = floor(bench_env_num("DONKY_BENCH_ITERS", 3));
+    let gen_n      = floor(bench_env_num("DONKY_BENCH_GEN", 5));
+    let batch_hi   = floor(bench_env_num("DONKY_BENCH_BATCH", 16));
+    if iters < 1 { iters = 1; }
+    if batch_hi < 2 { batch_hi = 2; }
+
+    if !file_exists(model_path) {
+        if bench_env_num("DONKY_BENCH_REQUIRE", 0) != 0 {
+            print("FAIL: model not found: " + model_path + " (DONKY_BENCH_REQUIRE is set)");
+            sys_exit(1);
+        }
+        print("SKIP: model not found: " + model_path + "  (set DONKY_BENCH_MODEL, or DONKY_BENCH_REQUIRE=1 to fail)");
+        return 0;
+    }
+
+    print("== Donky LLM benchmark ==");
+    print("model:  " + model_path);
+    print("config: DONKY_THREADS=" + bench_env_str("DONKY_THREADS", "(auto: min(8, CPUs))")
+          + "  DONKY_NO_AVX2=" + bench_env_str("DONKY_NO_AVX2", "(unset: AVX2+FMA when the CPU has it)"));
+
+    let res = {};
+    let t_load0 = now_ms();
+    let model = llm_load(model_path);
+    let load_ms = now_ms() - t_load0;
+    print("loaded in " + str(load_ms) + " ms: " + str(model["n_layers"]) + " layers, n_embd "
+          + str(model["n_embd"]) + ", vocab " + str(model["vocab_size"]));
+    res["load_ms"] = load_ms;
+
+    // ---- [1/3] GEMM kernel on real weights -------------------------------------------------
+    print("");
+    print("[1/3] Q4_K GEMM kernel on real weights");
+    let q = bench_find_q4(model);
+    if q == null {
+        print("  SKIP: block 0 has no 2D Q4_K tensor, so the kernel checks have nothing to run on");
+    } else {
+        let kc = q["c"];
+        let kr = q["r"];
+        let kp = q["ptr"];
+        print("  tensor " + q["name"] + "  [r=" + str(kr) + " x c=" + str(kc) + "]");
+
+        let kerr = bench_accuracy(kp, kc, kr);
+        bench_check("accuracy vs reference", kerr <= 0.0001, "worst error " + str(kerr) + " of sum|terms| (limit 0.0001)");
+
+        let a1 = bench_acts(kc, 1);
+        let aB = bench_acts(kc * batch_hi, 2);
+        let g1 = bench_gemm_ms(a1, kp, 12, 1, kc, kr);
+        let gB = bench_gemm_ms(aB, kp, 12, batch_hi, kc, kr);
+        let ratio = gB / g1;
+        let w_bytes = kr * (kc / 256) * 144;
+        print("  batch 1 : " + str(bench_r2(g1)) + " ms   (" + str(bench_r2(w_bytes / 1000000000.0 / (g1 / 1000.0))) + " GB/s of quantized weights)");
+        print("  batch " + str(batch_hi) + ": " + str(bench_r2(gB)) + " ms   ("
+              + str(bench_r2(2.0 * batch_hi * kr * kc / 1000000000.0 / (gB / 1000.0))) + " GFLOP/s)");
+        bench_check("batch amortization", ratio <= 0.75 * batch_hi,
+                    "time(batch " + str(batch_hi) + ") / time(batch 1) = " + str(bench_r2(ratio))
+                    + " (limit " + str(0.75 * batch_hi) + "; " + str(batch_hi) + " would mean no reuse)");
+        res["gemm_tensor"] = q["name"];
+        res["gemm_c"] = kc;
+        res["gemm_r"] = kr;
+        res["gemm_batch"] = batch_hi;
+        res["gemm_b1_ms"] = g1;
+        res["gemm_hi_ms"] = gB;
+        res["gemm_ratio"] = ratio;
+        res["gemm_err"] = kerr;
+    }
+
+    // ---- [2/3] end-to-end forward ----------------------------------------------------------
+    print("");
+    print("[2/3] llm_forward on the chat prompt");
+    let prompt = tok_chat_prompt(model, "Hello");
+    let n_prompt = len(prompt);
+    print("  prompt length: " + str(n_prompt) + " tokens");
+
+    let t_cold0 = now_ms();
+    let logits = llm_forward(model, prompt);
+    let cold_ms = now_ms() - t_cold0;
+    print("  cold (pages weights in; not used for speed): " + str(cold_ms) + " ms");
+
+    bench_check("logits shape", type(logits) == "array" && len(logits) == model["vocab_size"],
+                "len " + str(len(logits)) + ", vocab " + str(model["vocab_size"]));
+    bench_check("logits finite", bench_all_finite(logits), "no NaN / inf");
+
+    let times = [];
+    let deterministic = true;
+    let it = 0;
+    while it < iters {
+        gc();
+        let t0 = now_ms();
+        let lg = llm_forward(model, prompt);
+        let dt = now_ms() - t0;
+        push(times, dt);
+        if !bench_same(lg, logits) { deterministic = false; }
+        it = it + 1;
+    }
+    gc();
+    bench_check("deterministic", deterministic, "all " + str(iters) + " warm runs bit-identical to the cold run");
+
+    let fwd_min = bench_min(times);
+    let fwd_med = bench_median(times);
+    let top1 = llm_greedy(logits);
+    print("  warm forward: best " + str(fwd_min) + " ms, median " + str(fwd_med) + " ms over " + str(iters) + " runs");
+    print("  prefill: " + str(bench_r2(n_prompt / (fwd_min / 1000.0))) + " tokens/sec  (" + str(bench_r2(fwd_min / n_prompt)) + " ms/token)");
+    res["n_prompt"] = n_prompt;
+    res["cold_ms"] = cold_ms;
+    res["forward_ms"] = fwd_min;
+    res["forward_median_ms"] = fwd_med;
+    res["top1"] = top1;
+
+    // ---- [3/3] generation ------------------------------------------------------------------
+    print("");
+    print("[3/3] llm_generate (" + str(gen_n) + " tokens, temperature 0.6, top-k 40)");
+    let sample_ms = bench_sample_ms(logits);
+    gc();
+    let t_gen0 = now_ms();
+    let gen = llm_generate(model, prompt, gen_n, 0.6, 40);
+    let gen_ms = now_ms() - t_gen0;
+    gc();
+    let n_gen = len(gen);
+    print("  generated " + str(n_gen) + " tokens in " + str(gen_ms) + " ms");
+    let toks = 0.0;
+    if n_gen > 0 && gen_ms > 0 {
+        toks = n_gen / (gen_ms / 1000.0);
+        print("  tokens/sec: " + str(bench_r2(toks)) + "  (" + str(bench_r2(gen_ms / n_gen)) + " ms/token)");
+        print("  llm_sample alone: " + str(bench_r2(sample_ms)) + " ms/call  -> "
+              + str(bench_r2(100.0 * n_gen * sample_ms / gen_ms)) + "% of generate is sampling (plain Donky)");
+        print("  note: no KV cache, so each token re-runs the whole context");
+    } else {
+        print("  tokens/sec: n/a (the model stopped immediately or the clock did not advance)");
+    }
+    res["gen_tokens"] = n_gen;
+    res["gen_ms"] = gen_ms;
+    res["gen_toks_per_sec"] = toks;
+    res["sample_ms"] = sample_ms;
+
+    // ---- absolute thresholds (optional) ----------------------------------------------------
+    print("");
+    print("[checks]");
+    let max_fwd = bench_env_num("DONKY_BENCH_MAX_FORWARD_MS", 0);
+    if max_fwd > 0 {
+        bench_check("forward ceiling", fwd_min <= max_fwd, str(fwd_min) + " ms <= " + str(max_fwd) + " ms");
+    }
+    let min_toks = bench_env_num("DONKY_BENCH_MIN_TOKS", 0);
+    if min_toks > 0 {
+        bench_check("generate floor", toks >= min_toks, str(bench_r2(toks)) + " tokens/sec >= " + str(min_toks));
+    }
+
+    // ---- baseline comparison (optional; this is the before/after proof) --------------------
+    let base_path = bench_env_str("DONKY_BENCH_BASELINE", "");
+    if len(base_path) > 0 {
+        let raw = read_file(base_path);
+        let base = null;
+        if type(raw) == "string" { base = json_decode(raw); }
+        if type(base) != "map" || json_error() != "" {
+            bench_check("baseline", false, "cannot read a results file at " + base_path);
+        } else {
+            let comparable = base["n_prompt"] == n_prompt && base["gemm_batch"] == res["gemm_batch"]
+                             && base["gemm_c"] == res["gemm_c"] && base["gemm_r"] == res["gemm_r"];
+            bench_check("baseline comparable", comparable, "same prompt length, GEMM tensor shape and batch size");
+            if comparable {
+                let fwd_speed = base["forward_ms"] / fwd_min;
+                let min_fwd = bench_env_num("DONKY_BENCH_MIN_SPEEDUP", 1.0);
+                bench_check("forward speedup", fwd_speed >= min_fwd,
+                            str(bench_r2(fwd_speed)) + "x vs baseline (" + str(base["forward_ms"]) + " ms -> " + str(fwd_min) + " ms), need >= " + str(min_fwd) + "x");
+                let gemm_speed = base["gemm_hi_ms"] / res["gemm_hi_ms"];
+                let min_gemm = bench_env_num("DONKY_BENCH_MIN_GEMM_SPEEDUP", 1.0);
+                bench_check("GEMM speedup (batch " + str(batch_hi) + ")", gemm_speed >= min_gemm,
+                            str(bench_r2(gemm_speed)) + "x vs baseline (" + str(bench_r2(base["gemm_hi_ms"])) + " ms -> " + str(bench_r2(res["gemm_hi_ms"])) + " ms), need >= " + str(min_gemm) + "x");
+                bench_check("same top-1 token", base["top1"] == top1,
+                            "baseline " + str(base["top1"]) + ", now " + str(top1)
+                            + " (a flip can be a near-tie from AVX2 rounding; a regression if it is large)");
+            }
+        }
+    }
+
+    // ---- machine-readable output -----------------------------------------------------------
+    print("");
+    print("BENCH_JSON " + json_encode(res));
+    let out_path = bench_env_str("DONKY_BENCH_OUT", "");
+    if len(out_path) > 0 {
+        if write_file(out_path, json_encode(res)) {
+            print("wrote " + out_path);
+        } else {
+            bench_check("write results", false, "could not write " + out_path);
+        }
+    }
+
+    let fails = global_get("bench_fails");
+    if fails == 0 {
+        print("RESULT: PASS");
+    } else {
+        print("RESULT: FAIL (" + str(fails) + " check(s) failed)");
+        sys_exit(1);
+    }
+    return 0;
+}
+
+try {
+    bench_main();
+} catch e {
+    print("BENCH ERROR: " + str(e));
+    sys_exit(1);
+}

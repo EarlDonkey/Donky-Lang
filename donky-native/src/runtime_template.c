@@ -4587,6 +4587,39 @@ uint64_t donky_tensor_rope(uint64_t a, uint64_t pos_val) {
     return r;
 }
 
+// tensor_rope_base(a, pos, base): same as tensor_rope, but with a configurable base
+// frequency. Llama-3 uses base 500000, whereas Llama-2/Mistral use 10000. Positional
+// embeddings computed with the wrong base produce subtly degraded outputs (not garbage,
+// just less accurate reasoning on longer contexts).
+uint64_t donky_tensor_rope_base(uint64_t a, uint64_t pos_val, uint64_t base_val) {
+    const char* who = "tensor_rope_base";
+    Array* pa;
+    if (!dk_tensor_view(who, "a", a, &pa)) return TAG_BASE;
+    if (!is_number(pos_val) || pos_val == TAG_BASE) return dk_ffi_err("tensor_rope_base: pos must be a number");
+    if (!is_number(base_val) || base_val == TAG_BASE) return dk_ffi_err("tensor_rope_base: base must be a number");
+    double posd = as_number(pos_val);
+    double base = as_number(base_val);
+    if (!(posd >= 0.0) || posd != floor(posd)) return dk_ffi_err("tensor_rope_base: pos must be a non-negative whole number");
+    if (!(base > 0.0)) return dk_ffi_err("tensor_rope_base: base must be positive");
+    size_t n = pa->len;
+    if (n & 1) return dk_ffi_err("tensor_rope_base: vector length must be even");
+    if (n == 0) { uint64_t* out = NULL; return dk_tensor_alloc(who, 0, &out); }
+    uint64_t* out = NULL;
+    uint64_t r = dk_tensor_alloc(who, n, &out);
+    if (r == TAG_BASE) return TAG_BASE;
+    double step = pow(base, -2.0 / (double)n);
+    double theta = posd;
+    for (size_t i = 0; i < n; i += 2) {
+        double c = cos(theta), s = sin(theta);
+        double x0 = as_number(pa->data[i]);
+        double x1 = as_number(pa->data[i + 1]);
+        out[i]     = make_number(x0 * c - x1 * s);
+        out[i + 1] = make_number(x0 * s + x1 * c);
+        theta *= step;
+    }
+    return r;
+}
+
 // ------------------------------------------------------------------ donky_tensor_attention
 // tensor_attention(q, k, v, seq, d): single-head causal self-attention, flat row-major.
 //     S[t][u] = dot(Q[t], K[u]) / sqrt(d)   for u <= t   (u > t is masked: contributes exactly 0)
@@ -4652,6 +4685,162 @@ uint64_t donky_tensor_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t seq
     }
     free(srow); free(orow);
     return r;
+}
+
+// tensor_attention_decode(q, kc, vc, n_pos, n_heads, n_heads_kv, d_head):
+//   Single-token causal attention. The query is the newest token; all cached
+//   positions are visible (no mask). Grouped-query: query head h reads KV head
+//   floor(h / (n_heads / n_heads_kv)).
+//   q   [n_heads * d_head]              flat
+//   kc  [n_pos * n_heads_kv * d_head]   flat (RoPE already applied)
+//   vc  [n_pos * n_heads_kv * d_head]   flat
+//   Returns [n_heads * d_head] flat.
+//
+// Uses AVX2 for the Q·K dot product and the P·V accumulation (dk_dot_f32 /
+// dk_axpy_f32, defined with the other SIMD helpers further down); without
+// AVX2 it falls back to the same double-accumulator scalar path as dk_dot256.
+// The two-phase loop (all scores, then the weighted sum) unboxes each cached
+// K/V row exactly once even when several query heads share a KV head.
+//
+// n_pos == 0 is legal: no cached keys means nothing to attend to, so the
+// result is a zero vector (the query is scaled by 0).
+static double dk_dot_f32(const float* a, const float* b, size_t n);          // defined with the SIMD helpers
+static void   dk_axpy_f32(float alpha, const float* x, float* y, size_t n);  // defined with the SIMD helpers
+
+uint64_t donky_tensor_attention_decode(uint64_t q, uint64_t kc, uint64_t vc,
+                                       uint64_t n_pos_val, uint64_t n_heads_val,
+                                       uint64_t n_heads_kv_val, uint64_t d_head_val) {
+    const char* who = "tensor_attention_decode";
+    Array* pq; Array* pkc; Array* pvc;
+    size_t n_pos, n_heads, n_heads_kv, d_head;
+    char msg[200];
+    if (!dk_tensor_view(who, "q",  q,  &pq)  ||
+        !dk_tensor_view(who, "kc", kc, &pkc) ||
+        !dk_tensor_view(who, "vc", vc, &pvc)) return TAG_BASE;
+    if (!dk_tensor_dim(who, "n_pos",      n_pos_val,      &n_pos)      ||
+        !dk_tensor_dim(who, "n_heads",    n_heads_val,    &n_heads)    ||
+        !dk_tensor_dim(who, "n_heads_kv", n_heads_kv_val, &n_heads_kv) ||
+        !dk_tensor_dim(who, "d_head",     d_head_val,     &d_head))    return TAG_BASE;
+
+    // n_heads*d_head and n_pos*n_heads_kv*d_head must not overflow size_t.
+    if (n_heads != 0 && d_head > SIZE_MAX / n_heads) {
+        snprintf(msg, sizeof msg, "%s: n_heads * d_head is too large", who);
+        return dk_ffi_err(msg);
+    }
+    size_t out_n = n_heads * d_head;
+    if (n_heads_kv != 0 && d_head > SIZE_MAX / n_heads_kv) {
+        snprintf(msg, sizeof msg, "%s: n_heads_kv * d_head is too large", who);
+        return dk_ffi_err(msg);
+    }
+    size_t kv_dim = n_heads_kv * d_head;
+    if (n_pos != 0 && kv_dim > SIZE_MAX / n_pos) {
+        snprintf(msg, sizeof msg, "%s: n_pos * n_heads_kv * d_head is too large", who);
+        return dk_ffi_err(msg);
+    }
+    size_t kv_n = n_pos * kv_dim;
+    // n_heads * n_pos floats for the score table.
+    if (n_pos != 0 && n_heads > (SIZE_MAX / sizeof(float)) / n_pos) {
+        snprintf(msg, sizeof msg, "%s: n_heads * n_pos is too large", who);
+        return dk_ffi_err(msg);
+    }
+
+    if (out_n == 0) { uint64_t* out = NULL; return dk_tensor_alloc(who, 0, &out); }
+    if (n_heads_kv == 0) {
+        snprintf(msg, sizeof msg, "%s: n_heads_kv must be positive", who);
+        return dk_ffi_err(msg);
+    }
+    if (n_heads % n_heads_kv != 0) {
+        snprintf(msg, sizeof msg,
+                 "%s: n_heads (%zu) must be a multiple of n_heads_kv (%zu)",
+                 who, n_heads, n_heads_kv);
+        return dk_ffi_err(msg);
+    }
+    if (pq->len != out_n) {
+        snprintf(msg, sizeof msg,
+                 "%s: q has %zu elements but n_heads * d_head = %zu * %zu = %zu",
+                 who, pq->len, n_heads, d_head, out_n);
+        return dk_ffi_err(msg);
+    }
+    if (pkc->len != kv_n || pvc->len != kv_n) {
+        snprintf(msg, sizeof msg,
+                 "%s: kc/vc must each have n_pos * n_heads_kv * d_head = %zu elements (got %zu/%zu)",
+                 who, kv_n, pkc->len, pvc->len);
+        return dk_ffi_err(msg);
+    }
+
+    // No cached positions: attend to nothing, so every output element is 0.
+    if (n_pos == 0) { uint64_t* out = NULL; return dk_tensor_alloc(who, out_n, &out); }
+
+    // Scratch: the query unboxed once, one score per (head, position), and one
+    // K and one V row (d_head floats each) unboxed per cached position, plus a
+    // float accumulator for the P·V weighted sum.
+    float* fq     = (float*)malloc(out_n * sizeof(float));
+    float* scores = (float*)malloc(n_heads * n_pos * sizeof(float));
+    float* krow   = (float*)malloc(d_head * sizeof(float));
+    float* vrow   = (float*)malloc(d_head * sizeof(float));
+    float* facc   = (float*)calloc(out_n, sizeof(float));   // all-zero
+    if (!fq || !scores || !krow || !vrow || !facc) {
+        free(fq); free(scores); free(krow); free(vrow); free(facc);
+        snprintf(msg, sizeof msg, "%s: out of memory", who);
+        return dk_ffi_err(msg);
+    }
+    for (size_t i = 0; i < out_n; i++) fq[i] = (float)as_number(pq->data[i]);
+
+    const size_t group = n_heads / n_heads_kv;
+    const double scale = 1.0 / sqrt((double)d_head);
+
+    // Phase 1: Q·K logits. Each cached K row is unboxed once and reused by the
+    // `group` query heads that share its KV head. scores[h * n_pos + p].
+    for (size_t p = 0; p < n_pos; p++) {
+        for (size_t kvh = 0; kvh < n_heads_kv; kvh++) {
+            const size_t base = (p * n_heads_kv + kvh) * d_head;
+            for (size_t j = 0; j < d_head; j++) krow[j] = (float)as_number(pkc->data[base + j]);
+            for (size_t g = 0; g < group; g++) {
+                const size_t h = kvh * group + g;
+                const double dot = dk_dot_f32(fq + h * d_head, krow, d_head);
+                scores[h * n_pos + p] = (float)(dot * scale);
+            }
+        }
+    }
+
+    // Softmax per query head (max subtracted, so exp never overflows).
+    for (size_t h = 0; h < n_heads; h++) {
+        float* row = scores + h * n_pos;
+        float mx = row[0];
+        for (size_t p = 1; p < n_pos; p++) if (row[p] > mx) mx = row[p];
+        double sum = 0.0;
+        for (size_t p = 0; p < n_pos; p++) {
+            const float e = (float)exp((double)row[p] - (double)mx);
+            row[p] = e;
+            sum += e;
+        }
+        const float inv = (float)(1.0 / sum);
+        for (size_t p = 0; p < n_pos; p++) row[p] *= inv;
+    }
+
+    // Phase 2: P·V. Each cached V row is unboxed once and FMA'd into every query
+    // head that shares its KV head.
+    for (size_t p = 0; p < n_pos; p++) {
+        for (size_t kvh = 0; kvh < n_heads_kv; kvh++) {
+            const size_t base = (p * n_heads_kv + kvh) * d_head;
+            for (size_t j = 0; j < d_head; j++) vrow[j] = (float)as_number(pvc->data[base + j]);
+            for (size_t g = 0; g < group; g++) {
+                const size_t h = kvh * group + g;
+                dk_axpy_f32(scores[h * n_pos + p], vrow, facc + h * d_head, d_head);
+            }
+        }
+    }
+
+    // Box the float accumulator into the Donky result (NaN gets canonicalized by make_number).
+    uint64_t* out = NULL;
+    uint64_t res = dk_tensor_alloc(who, out_n, &out);
+    if (res == TAG_BASE) {
+        free(fq); free(scores); free(krow); free(vrow); free(facc);
+        return TAG_BASE;
+    }
+    for (size_t i = 0; i < out_n; i++) out[i] = make_number((double)facc[i]);
+    free(fq); free(scores); free(krow); free(vrow); free(facc);
+    return res;
 }
 
 // tensor_silu(a): x * sigmoid(x) = x / (1 + exp(-x)), element-wise.
@@ -5015,10 +5204,12 @@ uint64_t donky_ffi_peek_q4_row(uint64_t ptr_val, uint64_t row_id_val, uint64_t n
 }
 
 // ------------------------------------------------------------------ donky_tensor_matmul_q4  [+ dk_dot256]
-// 256-element dot product of a dequantized block against an activation slice. Four independent
-// double accumulators keep the FP adds independent and stay deterministic. Measured: only ~10-15% faster than one
-// chain on a 4096x4096 projection (dequantisation dominates), so don't expect more from this alone.
-static inline double dk_dot256(const float* w, const float* x) {
+// ==== BEGIN dk_simd_mt (SIMD dot product + fork/join row parallelism for the GEMM kernels) ====
+
+// 256-element dot product of a dequantized block against an activation slice.
+//
+// Scalar path: four independent double accumulators (deterministic, double precision).
+static double dk_dot256_scalar(const float* w, const float* x) {
     double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
     for (int i = 0; i < 256; i += 4) {
         s0 += (double)w[i]     * (double)x[i];
@@ -5028,6 +5219,240 @@ static inline double dk_dot256(const float* w, const float* x) {
     }
     return (s0 + s1) + (s2 + s3);
 }
+
+// AVX2+FMA path: 8 float multiply-adds per instruction. target("avx2,fma") enables the instructions for
+// this one function only (no -mavx2 build flag), and dk_use_avx2() checks the CPU at run time, so a single
+// runtime.o still runs on CPUs without AVX2. x86 with GCC/Clang only; other targets use the scalar path.
+// Accumulation is in float (8 lanes x 32 steps, then one float horizontal sum): about 1e-6 relative error per
+// block against the double path, and results can differ in the last bits between AVX2 and non-AVX2 machines.
+// Set DONKY_NO_AVX2=1 to force the scalar path (bit-identical results everywhere).
+#if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
+#define DK_HAVE_AVX2_PATH 1
+#include <immintrin.h>
+
+__attribute__((target("avx2,fma")))
+static double dk_dot256_avx2(const float* w, const float* x) {
+    __m256 sum = _mm256_setzero_ps();
+    for (int i = 0; i < 256; i += 8) {
+        __m256 vw = _mm256_loadu_ps(w + i);
+        __m256 vx = _mm256_loadu_ps(x + i);
+        sum = _mm256_fmadd_ps(vw, vx, sum);
+    }
+    // Horizontal sum of the 8 floats in 'sum'
+    __m128 low = _mm256_castps256_ps128(sum);
+    __m128 high = _mm256_extractf128_ps(sum, 1);
+    __m128 sum128 = _mm_add_ps(low, high);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    return (double)_mm_cvtss_f32(sum128);
+}
+
+static int dk_use_avx2(void) {
+    static int cached = -1;                       // every thread computes the same value, so a relaxed race is harmless
+    int v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (v < 0) {
+        __builtin_cpu_init();
+        v = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) ? 1 : 0;
+        const char* off = getenv("DONKY_NO_AVX2");
+        if (off && off[0] && off[0] != '0') v = 0;
+        __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+#endif
+
+static inline double dk_dot256(const float* w, const float* x) {
+#ifdef DK_HAVE_AVX2_PATH
+    if (dk_use_avx2()) return dk_dot256_avx2(w, x);
+#endif
+    return dk_dot256_scalar(w, x);
+}
+
+// General float dot product and scaled add, for kernels whose length is not the
+// fixed 256 of a quant block (tensor_attention_decode uses d_head: 128 for
+// Llama-3-8B). Same scheme as dk_dot256: AVX2+FMA 8-wide when the CPU has it
+// and n >= 8, otherwise a plain loop; DONKY_NO_AVX2=1 forces the scalar path.
+static double dk_dot_f32_scalar(const float* a, const float* b, size_t n) {
+    double s = 0.0;
+    for (size_t i = 0; i < n; i++) s += (double)a[i] * (double)b[i];
+    return s;
+}
+
+#ifdef DK_HAVE_AVX2_PATH
+__attribute__((target("avx2,fma")))
+static double dk_dot_f32_avx2(const float* a, const float* b, size_t n) {
+    __m256 sum = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_fmadd_ps(va, vb, sum);
+    }
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    double tail = (double)_mm_cvtss_f32(s);
+    for (; i < n; i++) tail += (double)a[i] * (double)b[i];   // n % 8 remainder
+    return tail;
+}
+#endif
+
+static double dk_dot_f32(const float* a, const float* b, size_t n) {
+#ifdef DK_HAVE_AVX2_PATH
+    if (n >= 8 && dk_use_avx2()) return dk_dot_f32_avx2(a, b, n);
+#endif
+    return dk_dot_f32_scalar(a, b, n);
+}
+
+static void dk_axpy_f32_scalar(float alpha, const float* x, float* y, size_t n) {
+    for (size_t i = 0; i < n; i++) y[i] += alpha * x[i];
+}
+
+#ifdef DK_HAVE_AVX2_PATH
+__attribute__((target("avx2,fma")))
+static void dk_axpy_f32_avx2(float alpha, const float* x, float* y, size_t n) {
+    const __m256 va = _mm256_set1_ps(alpha);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vy = _mm256_loadu_ps(y + i);
+        __m256 vx = _mm256_loadu_ps(x + i);
+        vy = _mm256_fmadd_ps(va, vx, vy);
+        _mm256_storeu_ps(y + i, vy);
+    }
+    for (; i < n; i++) y[i] += alpha * x[i];                  // n % 8 remainder
+}
+#endif
+
+static void dk_axpy_f32(float alpha, const float* x, float* y, size_t n) {
+#ifdef DK_HAVE_AVX2_PATH
+    if (n >= 8 && dk_use_avx2()) { dk_axpy_f32_avx2(alpha, x, y, n); return; }
+#endif
+    dk_axpy_f32_scalar(alpha, x, y, n);
+}
+
+// ---- fork/join over output rows -------------------------------------------------------------------
+// The kernels below write acc[bi * R + row]; each row belongs to exactly one thread, so there is no
+// sharing, no locking, and every element is still summed in ascending block order: results do not
+// depend on the thread count. Workers touch only malloc'd buffers and the (read-only) weights. They
+// never allocate Donky objects, never throw, and never call the GC, so they are safe next to the
+// Donky task pool. Needs gcc/clang (__sync/__atomic builtins), like the rest of the runtime build.
+#ifdef _WIN32
+#define DK_PAR_RET unsigned __stdcall
+#define DK_PAR_OK  0
+#else
+#define DK_PAR_RET void*
+#define DK_PAR_OK  NULL
+#endif
+#define DK_PAR_MAX 64              // also WaitForMultipleObjects' limit; we join one handle at a time anyway
+
+typedef void (*DkRowFn)(void* ctx, size_t row_start, size_t row_end);
+typedef struct { DkRowFn fn; void* ctx; size_t row_start, row_end; } DkParTask;
+
+static DK_PAR_RET dk_par_trampoline(void* p) {
+    DkParTask* t = (DkParTask*)p;
+    t->fn(t->ctx, t->row_start, t->row_end);
+    return DK_PAR_OK;
+}
+
+// Threads to use: DONKY_THREADS if set (1..64), else min(8, logical CPUs).
+static int dk_gemm_max_threads(void) {
+    static int cached = 0;
+    int v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (v > 0) return v;
+    const char* env = getenv("DONKY_THREADS");
+    int n = env ? atoi(env) : 0;
+    if (n <= 0) {
+#ifdef _WIN32
+        SYSTEM_INFO si; GetSystemInfo(&si); n = (int)si.dwNumberOfProcessors;
+#else
+        long c = sysconf(_SC_NPROCESSORS_ONLN); n = c > 0 ? (int)c : 1;
+#endif
+        if (n > 8) n = 8;
+    }
+    if (n < 1) n = 1;
+    if (n > DK_PAR_MAX) n = DK_PAR_MAX;
+    __atomic_store_n(&cached, n, __ATOMIC_RELAXED);
+    return n;
+}
+
+// Starting a thread costs tens of microseconds, so small matrices stay on the calling thread:
+// each thread must get at least DK_GEMM_MIN_BLOCKS_PER_THREAD (dequantize + dot) block-steps.
+#define DK_GEMM_MIN_BLOCKS_PER_THREAD 2048
+static int dk_gemm_threads(size_t R, size_t k_blocks) {
+    int nt = dk_gemm_max_threads();
+    if (nt < 2) return 1;
+    size_t by_work = (R * k_blocks) / DK_GEMM_MIN_BLOCKS_PER_THREAD;
+    if ((size_t)nt > R) nt = (int)R;
+    if ((size_t)nt > by_work) nt = (int)by_work;
+    return nt < 1 ? 1 : nt;
+}
+
+// Runs fn over rows [0, R) split into nt contiguous ranges. The calling thread takes the last range, so
+// only nt-1 threads are created; if a thread cannot be created its range runs on the caller instead, so the
+// work is always completed.
+static void dk_par_rows(DkRowFn fn, void* ctx, size_t R, int nt) {
+    if (nt > DK_PAR_MAX) nt = DK_PAR_MAX;
+    if (nt <= 1 || R < 2) { fn(ctx, 0, R); return; }
+    if ((size_t)nt > R) nt = (int)R;
+
+    DkParTask tasks[DK_PAR_MAX];
+    int started[DK_PAR_MAX];
+#ifdef _WIN32
+    HANDLE th[DK_PAR_MAX];
+#else
+    pthread_t th[DK_PAR_MAX];
+#endif
+    for (int i = 0; i < nt; i++) {
+        tasks[i].fn = fn;
+        tasks[i].ctx = ctx;
+        tasks[i].row_start = (size_t)(((uint64_t)i * R) / (uint64_t)nt);
+        tasks[i].row_end   = (size_t)(((uint64_t)(i + 1) * R) / (uint64_t)nt);
+        started[i] = 0;
+    }
+    for (int i = 0; i < nt - 1; i++) {
+#ifdef _WIN32
+        uintptr_t h = _beginthreadex(NULL, 0, dk_par_trampoline, &tasks[i], 0, NULL);
+        if (h) { th[i] = (HANDLE)h; started[i] = 1; }
+#else
+        if (pthread_create(&th[i], NULL, dk_par_trampoline, &tasks[i]) == 0) started[i] = 1;
+#endif
+    }
+    fn(ctx, tasks[nt - 1].row_start, tasks[nt - 1].row_end);
+    for (int i = 0; i < nt - 1; i++) {
+        if (!started[i]) { fn(ctx, tasks[i].row_start, tasks[i].row_end); continue; }
+#ifdef _WIN32
+        WaitForSingleObject(th[i], INFINITE);
+        CloseHandle(th[i]);
+#else
+        pthread_join(th[i], NULL);
+#endif
+    }
+}
+
+// Q4_K worker: output rows [row_start, row_end) of the GEMM (this is the old loop body, unchanged).
+typedef struct {
+    const uint8_t* wp;      // Q4_K weights, [R rows x k_blocks blocks]
+    const float*   fa;      // activations, [B x C]
+    double*        acc;     // partial sums, [B x R]; this worker only writes columns row_start..row_end-1
+    size_t B, C, R, k_blocks;
+} DkQ4Ctx;
+
+static void dk_q4_rows(void* p, size_t row_start, size_t row_end) {
+    const DkQ4Ctx* a = (const DkQ4Ctx*)p;
+    float block[256];                                         // one dequantized block (1 KiB, stays in L1)
+    for (size_t row = row_start; row < row_end; row++) {      // weight output row
+        const uint8_t* rowp = a->wp + row * a->k_blocks * sizeof(DkQ4KBlock);
+        for (size_t b = 0; b < a->k_blocks; b++) {            // 256-weight block, in ascending k order
+            const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
+            dk_q4k_dequant(blk, block);                       // dequantize ONCE
+            for (size_t bi = 0; bi < a->B; bi++)
+                a->acc[bi * a->R + row] += dk_dot256(block, a->fa + bi * a->C + b * 256);
+        }
+    }
+}
+// ==== END dk_simd_mt ====
  
 // tensor_matmul_q4(a, w_ptr, batch, c, r): GEMM of a [batch x c] f64 activation matrix against an
 // [r x c] Q4_K weight matrix (row-major, c a multiple of 256). Returns [batch x r] row-major:
@@ -5081,16 +5506,9 @@ uint64_t donky_tensor_matmul_q4(uint64_t a, uint64_t w_ptr,
     uint64_t res = dk_tensor_alloc(who, n_out, &out);
     if (res == TAG_BASE) { free(fa); free(acc); return TAG_BASE; }
  
-    float block[256];                                         // one dequantized block (1 KiB, stays in L1)
-    for (size_t row = 0; row < R; row++) {                    // weight output row
-        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ4KBlock);
-        for (size_t b = 0; b < k_blocks; b++) {               // 256-weight block, in ascending k order
-            const DkQ4KBlock* blk = (const DkQ4KBlock*)(rowp + b * sizeof(DkQ4KBlock));
-            dk_q4k_dequant(blk, block);                       // dequantize ONCE
-            for (size_t bi = 0; bi < B; bi++)
-                acc[bi * R + row] += dk_dot256(block, fa + bi * C + b * 256);
-        }
-    }
+    DkQ4Ctx ctx = { wp, fa, acc, B, C, R, k_blocks };
+    dk_par_rows(dk_q4_rows, &ctx, R, dk_gemm_threads(R, k_blocks));   // rows split across threads
+
     for (size_t i = 0; i < n_out; i++) out[i] = make_number(acc[i]);   // box once, at the end
     free(fa); free(acc);
     return res;
@@ -5130,6 +5548,49 @@ static void dk_q6k_dequant(const DkQ6KBlock* blk, float* dst) {
         dst += 128; ql += 64; qh += 32; sc += 8;
     }
 }
+
+// ==== BEGIN dk_q6_mt ====
+// Q6_K worker. Unlike Q4 it can fail (a non-finite block scale means the data is not Q6_K / wrong offset),
+// and a worker must not throw or allocate Donky objects, so it records the lowest failing
+// (row * k_blocks + block) index with an atomic min and the caller reports it after the join. That is the same
+// block the serial loop stopped at, whatever the thread count.
+typedef struct {
+    const uint8_t* wp;
+    const float*   fa;
+    double*        acc;
+    size_t B, C, R, k_blocks;
+    uint64_t       bad_idx;          // UINT64_MAX = no bad block
+} DkQ6Ctx;
+
+static void dk_atomic_min_u64(uint64_t* p, uint64_t v) {
+    uint64_t cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    while (v < cur) {
+        if (__atomic_compare_exchange_n(p, &cur, v, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    }
+}
+
+static void dk_q6_rows(void* p, size_t row_start, size_t row_end) {
+    DkQ6Ctx* a = (DkQ6Ctx*)p;
+    float block[256];
+    for (size_t row = row_start; row < row_end; row++) {
+        const uint8_t* rowp = a->wp + row * a->k_blocks * sizeof(DkQ6KBlock);
+        for (size_t b = 0; b < a->k_blocks; b++) {
+            const DkQ6KBlock* blk = (const DkQ6KBlock*)(rowp + b * sizeof(DkQ6KBlock));
+            if (!isfinite(dk_fp16_to_fp32(blk->d))) {
+                dk_atomic_min_u64(&a->bad_idx, (uint64_t)row * a->k_blocks + b);
+                return;                                   // this row range is poisoned; the caller reports it
+            }
+            dk_q6k_dequant(blk, block);
+            for (size_t bi = 0; bi < a->B; bi++) {
+                const float* xb = a->fa + bi * a->C + b * 256;
+                double s = 0.0;
+                for (int i = 0; i < 256; i++) s += (double)block[i] * (double)xb[i];
+                a->acc[bi * a->R + row] += s;
+            }
+        }
+    }
+}
+// ==== END dk_q6_mt ====
  
 // tensor_matmul_q6(a, w_ptr, batch, c, r): same contract as tensor_matmul_q4, for Q6_K weights
 //   out[i*r + j] = sum_k a[i*c + k] * dequant(W[j*c + k])      W: [r rows x c cols], c % 256 == 0
@@ -5165,26 +5626,14 @@ uint64_t donky_tensor_matmul_q6(uint64_t a, uint64_t w_ptr,
     memset(acc, 0, n_out * sizeof(double));
     for (size_t i = 0; i < B * C; i++) fa[i] = (float)as_number(pa->data[i]);
  
-    float block[256];
-    for (size_t row = 0; row < R; row++) {
-        const uint8_t* rowp = wp + row * k_blocks * sizeof(DkQ6KBlock);
-        for (size_t b = 0; b < k_blocks; b++) {
-            const DkQ6KBlock* blk = (const DkQ6KBlock*)(rowp + b * sizeof(DkQ6KBlock));
-            if (!isfinite(dk_fp16_to_fp32(blk->d))) {
-                char msg[200]; snprintf(msg, sizeof msg,
-                    "%s: non-finite block scale at row %zu block %zu (weight is not Q6_K, "
-                    "or wrong data offset)", who, row, b);
-                free(fa); free(acc);
-                return dk_ffi_err(msg);
-            }
-            dk_q6k_dequant(blk, block);
-            for (size_t bi = 0; bi < B; bi++) {
-                const float* xb = fa + bi * C + b * 256;
-                double s = 0.0;
-                for (int i = 0; i < 256; i++) s += (double)block[i] * (double)xb[i];
-                acc[bi * R + row] += s;
-            }
-        }
+    DkQ6Ctx ctx = { wp, fa, acc, B, C, R, k_blocks, UINT64_MAX };
+    dk_par_rows(dk_q6_rows, &ctx, R, dk_gemm_threads(R, k_blocks));   // rows split across threads
+    if (ctx.bad_idx != UINT64_MAX) {
+        char msg[200]; snprintf(msg, sizeof msg,
+            "%s: non-finite block scale at row %zu block %zu (weight is not Q6_K, "
+            "or wrong data offset)", who, (size_t)(ctx.bad_idx / k_blocks), (size_t)(ctx.bad_idx % k_blocks));
+        free(fa); free(acc);
+        return dk_ffi_err(msg);
     }
     free(fa);
     uint64_t* out = NULL;
@@ -5461,6 +5910,232 @@ uint64_t donky_tokenize_bpe(uint64_t text_val, uint64_t vocab_val) {
     for (size_t k = 0; k < nids; k++) out[k] = make_number((double)ids[k]);
     free(ids);
     return r;
+}
+// ============================================================================
+// Voxel world: byte grid in mem_alloc memory, not a Donky array.
+// ============================================================================
+
+#define BLK_AIR      0
+#define BLK_DIRT     1
+#define BLK_STONE    2
+#define BLK_GRASS    3
+#define BLK_WATER    4
+#define BLK_SAND     5
+#define BLK_GRAVEL   6
+#define BLK_ORE_IRON 7
+#define BLK_ORE_GOLD 8
+#define DK_NUM_BLOCKS 9
+
+#define DK_CHUNK     128
+
+static const uint32_t DK_PALETTE[9] = {
+    0x00000000,  // 0 air
+    0xFF6B4A2E,  // 1 dirt
+    0xFF5A5A64,  // 2 stone
+    0xFF3E8B3E,  // 3 grass
+    0x80468ECC,  // 4 water
+    0xFFD8C48B,  // 5 sand
+    0xFF8B6E4B,  // 6 gravel
+    0xFFC08C4A,  // 7 iron ore
+    0xFFFFD700,  // 8 gold ore
+};
+
+// Deterministic 2D hash in [0, 1).
+static inline double dk_world_rand(int x, int y, uint32_t seed) {
+    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + seed * 2246822519u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h = h ^ (h >> 16);
+    return (double)h / 4294967296.0;
+}
+
+// Bilinear-interpolated value noise in [0, 1).
+static inline double dk_world_noise(double fx, double fy, uint32_t seed) {
+    int x0 = (int)floor(fx), y0 = (int)floor(fy);
+    double tx = fx - x0, ty = fy - y0;
+    double n00 = dk_world_rand(x0,     y0,     seed);
+    double n10 = dk_world_rand(x0 + 1, y0,     seed);
+    double n01 = dk_world_rand(x0,     y0 + 1, seed);
+    double n11 = dk_world_rand(x0 + 1, y0 + 1, seed);
+    double nx0 = n00 + (n10 - n00) * tx;
+    double nx1 = n01 + (n11 - n01) * tx;
+    return nx0 + (nx1 - nx0) * ty;
+}
+
+// Fractal (4-octave) noise in [0, 1).
+static inline double dk_world_fbm(double fx, double fy, uint32_t seed) {
+    double total = 0.0, amp = 1.0, freq = 1.0, norm = 0.0;
+    for (int i = 0; i < 4; i++) {
+        total += dk_world_noise(fx * freq, fy * freq, seed + i * 9176u) * amp;
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return total / norm;
+}
+
+uint64_t donky_world_gen(uint64_t ptr_val, uint64_t width_val, uint64_t height_val,
+                         uint64_t seed_val, uint64_t chunk_x_val, uint64_t chunk_y_val) {
+    const char* who = "world_gen";
+    if (!is_number(ptr_val) || !is_number(width_val) || !is_number(height_val)
+        || !is_number(seed_val) || !is_number(chunk_x_val) || !is_number(chunk_y_val)) {
+        return dk_ffi_err("world_gen: all arguments must be numbers");
+    }
+    int width = (int)as_number(width_val);
+    int height = (int)as_number(height_val);
+    uint32_t seed = (uint32_t)as_number(seed_val);
+    int cx = (int)as_number(chunk_x_val);
+    int cy = (int)as_number(chunk_y_val);
+    if (width <= 0 || height <= 0) return dk_ffi_err("world_gen: width/height must be positive");
+    if (cx < 0 || cx >= width || cy < 0 || cy >= height) return make_number(0.0);
+
+    uint8_t* grid = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!grid) return dk_ffi_err("world_gen: null pointer");
+
+    int x_end = cx + DK_CHUNK; if (x_end > width)  x_end = width;
+    int y_end = cy + DK_CHUNK; if (y_end > height) y_end = height;
+
+    double sea_level = height * 0.5;
+    double surface_base = height * 0.35;
+    double surface_amp = height * 0.25;
+
+    for (int y = cy; y < y_end; y++) {
+        for (int x = cx; x < x_end; x++) {
+            double n = dk_world_fbm(x * 0.02, 0.0, seed);
+            int surface_y = (int)(surface_base + (n - 0.5) * surface_amp * 2.0);
+            if (surface_y < 1) surface_y = 1;
+            if (surface_y > height - 2) surface_y = height - 2;
+
+            uint8_t block = BLK_AIR;
+            if (y < surface_y - 3)        block = BLK_AIR;
+            else if (y < surface_y)       block = BLK_GRASS;
+            else if (y < surface_y + 4)   block = BLK_DIRT;
+            else                          block = BLK_STONE;
+
+            if (block == BLK_STONE) {
+                double c = dk_world_fbm(x * 0.06, y * 0.06, seed + 100u);
+                if (c > 0.62) block = BLK_AIR;
+            }
+            if (block == BLK_STONE && y > surface_y + 20) {
+                double o = dk_world_fbm(x * 0.1, y * 0.1, seed + 200u);
+                if (o > 0.75) {
+                    double g = dk_world_fbm(x * 0.1, y * 0.1, seed + 300u);
+                    block = (g > 0.5) ? BLK_ORE_GOLD : BLK_ORE_IRON;
+                }
+            }
+            if ((block == BLK_GRASS || block == BLK_DIRT)
+                && y >= (int)sea_level - 2 && y <= (int)sea_level + 2) {
+                block = BLK_SAND;
+            }
+            if (block == BLK_AIR && y > (int)sea_level) {
+                block = BLK_WATER;
+            }
+
+            grid[y * width + x] = block;
+        }
+    }
+    return make_number(1.0);
+}
+
+// ----------------------------------------------------------------- world_mesh
+// world_mesh(ptr, width, height, cam_x, cam_y, view_w, view_h, out_ptr) -> pixels written
+// Fills out_ptr[0..view_w*view_h*4) with RGBA. Blocks outside the grid render
+// as stone; rows fully above the grid render as black. Colors come from
+// DK_PALETTE via a per-block uint32 lookup (autovectorized by the compiler; a
+// memcpy-of-uniform-rows fast path would need a scan to prove uniformity and
+// is not implemented — see the handoff note).
+uint64_t donky_world_mesh(uint64_t ptr_val, uint64_t width_val, uint64_t height_val,
+                          uint64_t cam_x_val, uint64_t cam_y_val,
+                          uint64_t view_w_val, uint64_t view_h_val, uint64_t out_ptr_val) {
+    const char* who = "world_mesh";
+    char msg[128];
+    if (!is_number(ptr_val) || !is_number(out_ptr_val))
+        return dk_ffi_err("world_mesh: ptr and out_ptr must be numbers");
+    if (!is_number(width_val) || !is_number(height_val) ||
+        !is_number(cam_x_val) || !is_number(cam_y_val) ||
+        !is_number(view_w_val) || !is_number(view_h_val))
+        return dk_ffi_err("world_mesh: width, height, cam_x, cam_y, view_w, view_h must be numbers");
+    double dw = as_number(width_val), dh = as_number(height_val);
+    double dvw = as_number(view_w_val), dvh = as_number(view_h_val);
+    if (!(dw >= 1.0) || dw > 1.0e7 || !(dh >= 1.0) || dh > 1.0e7 ||
+        !(dvw >= 1.0) || dvw > 1.0e7 || !(dvh >= 1.0) || dvh > 1.0e7)
+        return dk_ffi_err("world_mesh: width, height, view_w, view_h must be whole numbers in [1, 1e7]");
+    if (dvw != floor(dvw) || dvh != floor(dvh))
+        return dk_ffi_err("world_mesh: view_w/view_h must be whole numbers");
+    size_t W = (size_t)dw, H = (size_t)dh, VW = (size_t)dvw, VH = (size_t)dvh;
+
+    long long camx = (long long)as_number(cam_x_val);
+    long long camy = (long long)as_number(cam_y_val);
+
+    const uint8_t* grid = (const uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    uint8_t* out = (uint8_t*)(uintptr_t)(uint64_t)as_number(out_ptr_val);
+    if (!grid || !out) return dk_ffi_err("world_mesh: null grid or out buffer");
+
+    // Lookup table: 256 uint32 entries, indexed by block id (only 0..8 are used;
+    // every other block id in the grid is treated as stone by world_set, so it
+    // cannot appear here, but init the tail defensively to opaque black).
+    uint32_t lut[256];
+    for (int i = 0; i < 256; i++) lut[i] = (i < DK_NUM_BLOCKS) ? DK_PALETTE[i] : 0xFF000000u;
+
+    size_t pixels = 0;
+    for (size_t py = 0; py < VH; py++) {
+        long long wy = camy + (long long)py;
+        uint8_t* out_row = out + py * VW * 4;
+        if (wy < 0 || wy >= (long long)H) {
+            // Row outside the grid: solid black.
+            for (size_t px = 0; px < VW; px++) {
+                out_row[px * 4 + 0] = 0;
+                out_row[px * 4 + 1] = 0;
+                out_row[px * 4 + 2] = 0;
+                out_row[px * 4 + 3] = 0xFF;
+            }
+            pixels += VW;
+            continue;
+        }
+        const uint8_t* row = grid + (size_t)wy * W;
+        for (size_t px = 0; px < VW; px++) {
+            long long wx = camx + (long long)px;
+            uint8_t blk;
+            if (wx < 0 || wx >= (long long)W) blk = BLK_STONE;
+            else                             blk = row[(size_t)wx];
+            uint32_t c = lut[blk];
+            out_row[px * 4 + 0] = (uint8_t)(c        & 0xFF);
+            out_row[px * 4 + 1] = (uint8_t)((c >> 8) & 0xFF);
+            out_row[px * 4 + 2] = (uint8_t)((c >> 16) & 0xFF);
+            out_row[px * 4 + 3] = (uint8_t)((c >> 24) & 0xFF);
+        }
+        pixels += VW;
+    }
+    return make_number((double)pixels);
+}
+
+// ------------------------------------------------------------------ world_set
+// world_set(ptr, width, height, x, y, block_id) -> 1 on success, 0 on out-of-bounds
+// or an invalid block id. Called per edit, so it does not throw on the
+// ordinary "user clicked outside the map" / "block id out of range" cases:
+// 0 is the documented, expected return value there. It throws only on a null
+// address or a non-number argument, which are programming errors, not data.
+uint64_t donky_world_set(uint64_t ptr_val, uint64_t width_val, uint64_t height_val,
+                         uint64_t x_val, uint64_t y_val, uint64_t block_val) {
+    if (!is_number(ptr_val) || !is_number(width_val) || !is_number(height_val) ||
+        !is_number(x_val) || !is_number(y_val) || !is_number(block_val))
+        return dk_ffi_err("world_set: ptr, width, height, x, y, block must be numbers");
+    uint8_t* grid = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!grid) return dk_ffi_err("world_set: null grid");
+    double dw = as_number(width_val), dh = as_number(height_val);
+    if (!(dw >= 1.0) || dw > 1.0e7 || dw != floor(dw) ||
+        !(dh >= 1.0) || dh > 1.0e7 || dh != floor(dh))
+        return dk_ffi_err("world_set: width/height must be whole numbers in [1, 1e7]");
+    size_t W = (size_t)dw, H = (size_t)dh;
+    double dx = as_number(x_val), dy = as_number(y_val);
+    double db = as_number(block_val);
+    if (!(dx == floor(dx)) || !(dy == floor(dy)) || !(db == floor(db)))
+        return make_number(0.0);           // non-integer coordinates or id: "outside" by contract
+    long long xx = (long long)dx, yy = (long long)dy;
+    long long bid = (long long)db;
+    if (xx < 0 || xx >= (long long)W || yy < 0 || yy >= (long long)H) return make_number(0.0);
+    if (bid < 0 || bid >= DK_NUM_BLOCKS)                             return make_number(0.0);
+    grid[(size_t)yy * W + (size_t)xx] = (uint8_t)bid;
+    return make_number(1.0);
 }
 
 // ---- hashing ----

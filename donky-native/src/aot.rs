@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 90] = [    
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 95] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -121,6 +121,11 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 90] = [
     ("exec_wait",     "donky_exec_wait",     3),
     ("ffi_peek_vocab", "donky_ffi_peek_vocab", 2),
     ("tokenize_bpe", "donky_tokenize_bpe", 2),
+    ("tensor_rope_base", "donky_tensor_rope_base", 3),
+    ("tensor_attention_decode", "donky_tensor_attention_decode", 7),
+    ("world_gen",   "donky_world_gen",   6),   // ptr, w, h, seed, chunk_x, chunk_y
+    ("world_mesh",  "donky_world_mesh",  8),   // ptr, w, h, cam_x, cam_y, vw, vh, out_ptr
+    ("world_set",   "donky_world_set",   6),   // ptr, w, h, x, y, block
 ];
 
 #[derive(Clone, Copy)]
@@ -156,7 +161,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 90], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 95], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -257,7 +262,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 90] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 95] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });

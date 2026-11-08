@@ -163,7 +163,7 @@ fn tf_rms_norm_rows(x, gamma, rows, d, eps) {
 //   cos/sin are accepted for signature compatibility but IGNORED:
 //   tensor_rope(a, pos) computes sin/cos internally (base 10000).
 // For each (pos, head) the d_head-vector is rotated in place by tensor_rope.
-fn rope(x, cos, sin, seq_len, n_heads, d_head) {
+fn rope(x, cos, sin, seq_len, n_heads, d_head, rope_base) {
     tf_check_int("seq_len", seq_len, 1);
     tf_check_int("n_heads", n_heads, 1);
     tf_check_int("d_head", d_head, 1);
@@ -180,7 +180,7 @@ fn rope(x, cos, sin, seq_len, n_heads, d_head) {
             let base = (p * n_heads + h) * d_head;
             let vec = tf_slice(x, base, d_head);
             // tensor_rope(vec, pos) — pos is the token index p.
-            let rotated = tensor_rope(vec, p);
+            let rotated = tensor_rope_base(vec, p, rope_base);
             tf_extend(out, rotated);
             h = h + 1;
         }

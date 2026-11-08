@@ -14,6 +14,8 @@ import "tokenizer.donk";
 //   tensor_matmul_q4(a, w_ptr, batch, c, r)   Q4_K GEMM: a is [batch x c],
 //                                                 W is [r x c] row-major, c % 256 == 0
 //   tensor_matmul_q6(a, w_ptr, batch, c, r)   same contract for Q6_K weights (GGML type 14)
+//   tensor_attention_decode(q, kc, vc, n_pos, n_heads, n_heads_kv, d_head)
+//                                             one-query multi-head GQA attention over the KV cache
 //   tensor_rms_norm(a)                        (via lib/transformer.donk)
 //   tensor_rope(a, pos)                       (via lib/transformer.donk)
 //   tensor_attention(q,k,v,seq,d)             (via lib/transformer.donk)
@@ -42,7 +44,12 @@ import "tokenizer.donk";
 // Public API:
 //   llm_load(path)                                 -> model map
 //   llm_forward(model, token_ids)                  -> logits (flat, vocab_size)
-//   llm_generate(model, prompt_ids, n, temp, topk) -> array of new token ids
+//   llm_generate(model, prompt_ids, n, temp, topk) -> array of new token ids (no cache; re-runs the prompt)
+//   llm_kv_new(model)                              -> empty KV cache
+//   llm_forward_cached(model, id, cache, position) -> logits for ONE new token (appends to the cache)
+//   llm_prefill(model, ids, cache)                 -> logits after feeding ids through the cache
+//   llm_generate_cached(model, prompt_ids, n, temp, topk) -> array of new token ids (uses the KV cache)
+//   llm_kv_selfcheck(model, ids)                   -> max |cached - uncached| logit difference
 //   llm_greedy(logits)                             -> token id (argmax)
 //   llm_sample(logits, temperature, top_k)         -> token id
 //
@@ -329,6 +336,8 @@ fn llm_load(path) {
     model["weight_blob"]     = data_base;
     model["weight_blob_len"] = len;
     model["eps"]             = 0.00001;   // Llama-3 rms_norm_eps (tensor_rms_norm hardcodes the same 1e-5)
+    model["rope_base"]       = meta["rope_base"];
+    if model["rope_base"] == null { model["rope_base"] = 10000.0; }
 
     // 4. Re-walk the tensor table from the mmap'd file base (read_gguf_metadata
     //    does not return it). Each entry's data_offset stays section-relative.
@@ -598,8 +607,8 @@ fn llm_forward(model, token_ids) {
         let v = tf_matmul_auto(hn, L["attn_v"], L["attn_v_type"], n, n_embd, n_heads_kv * d_head);
 
         // RoPE (cos/sin args are ignored; tensor_rope computes them).
-        q = rope(q, null, null, n, n_heads, d_head);
-        k = rope(k, null, null, n, n_heads_kv, d_head);
+        q = rope(q, null, null, n, n_heads, d_head, model["rope_base"]);
+        k = rope(k, null, null, n, n_heads_kv, d_head, model["rope_base"]);
 
         // Causal multi-head attention.
         let attn = attention(q, k, v, n, n_heads, n_heads_kv, d_head);
@@ -807,8 +816,8 @@ fn llm_sample(logits, temperature, top_k) {
 // ---------------------------------------------------------------- generation
 //
 // llm_generate(model, prompt_ids, n_tokens, temperature, top_k) -> new token ids.
-// Re-runs the full forward pass for every new token (no KV cache; see the
-// caveat in the header comment).
+// Re-runs the full forward pass for every new token (no KV cache). Use
+// llm_generate_cached (below) for the fast path.
 fn llm_generate(model, prompt_ids, n_tokens, temperature, top_k) {
     if type(prompt_ids) != "array" || len(prompt_ids) == 0 {
         throw "llm_generate: prompt_ids must be a non-empty array";
@@ -846,8 +855,267 @@ fn llm_generate(model, prompt_ids, n_tokens, temperature, top_k) {
     return out;
 }
 
+// Chat uses the KV cache. To fall back to the uncached path, call llm_generate here instead.
 fn llm_chat(model, user_prompt, n_tokens) {
     let prompt_ids = tok_chat_prompt(model, user_prompt);
-    let generated = llm_generate(model, prompt_ids, n_tokens, 0.6, 40);
+    let generated = llm_generate_cached(model, prompt_ids, n_tokens, 0.6, 40);
     return tok_decode(model, generated);
+}
+
+// ---------------------------------------------------------------- KV cache
+//
+// Real KV cache: each decoded token costs ONE token's worth of matmuls instead of re-running the whole
+// prompt. kv_cache is a map:
+//   "len"          number of tokens already cached (== the next position)
+//   "is_empty"     true until the first token is processed
+//   "layer_<i>_k"  flat array [len x (n_heads_kv * d_head)], RoPE already applied to the keys
+//   "layer_<i>_v"  flat array [len x (n_heads_kv * d_head)]
+// Keys are stored AFTER rope, so they are never re-rotated. The cache is only valid for the model and
+// prompt that built it; if llm_forward_cached throws midway, discard the cache (it may be half-updated).
+//
+// tensor_attention (C) needs q_len == k_len and a single head, so it cannot do 1-query-vs-N-keys.
+// llm_attend_one below does the multi-head / grouped-query attention for one query token (C kernel), and
+// llm_rope_heads rotates at an explicit position (the `rope` wrapper in transformer.donk always starts at 0).
+
+fn llm_kv_new(model) {
+    if type(model) != "map" { throw "llm_kv_new: model must be a map from llm_load"; }
+    let cache = {};
+    cache["len"] = 0;
+    cache["is_empty"] = true;
+    let li = 0;
+    while li < model["n_layers"] {
+        cache["layer_" + str(li) + "_k"] = [];
+        cache["layer_" + str(li) + "_v"] = [];
+        li = li + 1;
+    }
+    return cache;
+}
+
+// RoPE every head of a flat [n_h * d_head] vector at token position `pos` with frequency base `base`
+// (model["rope_base"], 500000 for Llama-3). Interleaved pairs (x[2i], x[2i+1]), same convention as the
+// C tensor_rope: theta_i = pos * base^(-2i/d_head). The cos/sin table is built once and shared by all heads.
+fn llm_rope_heads(vec, n_h, d_head, pos, base) {
+    let half = floor(d_head / 2);
+    let cs = [];
+    let sn = [];
+    let step = pow(base, -2.0 / d_head);
+    let theta = pos * 1.0;
+    let pi = 0;
+    while pi < half {
+        push(cs, cos(theta));
+        push(sn, sin(theta));
+        theta = theta * step;
+        pi = pi + 1;
+    }
+    let out = [];
+    let h = 0;
+    while h < n_h {
+        let off = h * d_head;
+        let pj = 0;
+        while pj < half {
+            let x0 = vec[off + 2 * pj];
+            let x1 = vec[off + 2 * pj + 1];
+            push(out, x0 * cs[pj] - x1 * sn[pj]);
+            push(out, x0 * sn[pj] + x1 * cs[pj]);
+            pj = pj + 1;
+        }
+        h = h + 1;
+    }
+    return out;
+}
+
+// Attention of ONE query token against n_pos cached positions (the query is the newest token, so every
+// cached position is visible: no mask needed). Implemented by the C kernel tensor_attention_decode.
+//   q   flat [n_heads * d_head]         (RoPE applied)
+//   kc  flat [n_pos * n_heads_kv * d_head],  vc same
+// Grouped-query: query head h reads kv head floor(h / (n_heads / n_heads_kv)).
+// Returns flat [n_heads * d_head].
+fn llm_attend_one(q, kc, vc, n_pos, n_heads, n_heads_kv, d_head) {
+    return tensor_attention_decode(q, kc, vc, n_pos, n_heads, n_heads_kv, d_head);
+}
+
+// Embedding row for one token id (same lookup llm_forward does).
+fn llm_embed_one(model, id) {
+    let n_embd = model["n_embd"];
+    if type(id) != "number" || id < 0 || id >= model["vocab_size"] || id != floor(id) {
+        throw "llm_forward_cached: token id " + str(id) + " out of range";
+    }
+    let tok = model["token_embd"];
+    let tok_ptr = model["weight_blob"] + tok["data_offset"];
+    let row = null;
+    if tok["type"] == 0 {
+        row = ffi_peek_f32(tok_ptr + id * n_embd * 4.0, n_embd);
+    } else if tok["type"] == 12 {
+        row = ffi_peek_q4_row(tok_ptr, id, n_embd);
+    } else {
+        throw "llm: unsupported token_embd type " + str(tok["type"]);
+    }
+    if type(row) != "array" || len(row) != n_embd {
+        throw "llm_forward_cached: failed to read embedding row for token " + str(id);
+    }
+    return row;
+}
+
+// llm_forward_cached(model, token_id, kv_cache, position) -> logits (flat, vocab_size)
+// Processes exactly ONE new token at `position`, which must equal kv_cache["len"] (positions are
+// sequential; the cache is appended to, never rewritten). Same math as llm_forward with n = 1.
+fn llm_forward_cached(model, token_id, kv_cache, position) {
+    if type(model) != "map" { throw "llm_forward_cached: model must be a map from llm_load"; }
+    if type(kv_cache) != "map" { throw "llm_forward_cached: kv_cache must come from llm_kv_new"; }
+    if type(position) != "number" || position != floor(position) || position < 0 {
+        throw "llm_forward_cached: position must be a non-negative whole number";
+    }
+    if position != kv_cache["len"] {
+        throw "llm_forward_cached: position " + str(position) + " but the cache holds " + str(kv_cache["len"]) + " tokens";
+    }
+    let n_embd     = model["n_embd"];
+    let n_heads    = model["n_heads"];
+    let n_heads_kv = model["n_heads_kv"];
+    let d_head     = model["d_head"];
+    let n_ff       = model["n_ff"];
+    let n_layers   = model["n_layers"];
+    let eps        = model["eps"];
+    let vocab_size = model["vocab_size"];
+    let data_base  = model["weight_blob"];
+    let kv_dim     = n_heads_kv * d_head;
+    let rope_base  = model["rope_base"];
+    if rope_base == null { rope_base = 10000.0; }
+
+    let x = llm_embed_one(model, token_id);
+    let layers = model["layers"];
+
+    let li = 0;
+    while li < n_layers {
+        let L = layers[li];
+        let kc = kv_cache["layer_" + str(li) + "_k"];
+        let vc = kv_cache["layer_" + str(li) + "_v"];
+        if len(kc) != position * kv_dim || len(vc) != position * kv_dim {
+            throw "llm_forward_cached: kv_cache layer " + str(li) + " is inconsistent (discard it and start over)";
+        }
+
+        // attention sub-block
+        let gamma_a = llm_read_f32_vec(L["attn_norm"], data_base, n_embd);
+        let hn = rms_norm(x, gamma_a, eps);
+        let q = tf_matmul_auto(hn, L["attn_q"], L["attn_q_type"], 1, n_embd, n_embd);
+        let k = tf_matmul_auto(hn, L["attn_k"], L["attn_k_type"], 1, n_embd, kv_dim);
+        let v = tf_matmul_auto(hn, L["attn_v"], L["attn_v_type"], 1, n_embd, kv_dim);
+        q = llm_rope_heads(q, n_heads, d_head, position, rope_base);
+        k = llm_rope_heads(k, n_heads_kv, d_head, position, rope_base);
+
+        let i = 0;
+        while i < kv_dim {
+            push(kc, k[i]);
+            push(vc, v[i]);
+            i = i + 1;
+        }
+        let attn = llm_attend_one(q, kc, vc, position + 1, n_heads, n_heads_kv, d_head);
+        let proj = tf_matmul_auto(attn, L["attn_output"], L["attn_output_type"], 1, n_embd, n_embd);
+        let h1 = [];
+        let i1 = 0;
+        while i1 < n_embd {
+            push(h1, x[i1] + proj[i1]);
+            i1 = i1 + 1;
+        }
+
+        // feed-forward sub-block
+        let gamma_f = llm_read_f32_vec(L["ffn_norm"], data_base, n_embd);
+        let hn2 = rms_norm(h1, gamma_f, eps);
+        let gate = tf_matmul_auto(hn2, L["ffn_gate"], L["ffn_gate_type"], 1, n_embd, n_ff);
+        let up   = tf_matmul_auto(hn2, L["ffn_up"],   L["ffn_up_type"],   1, n_embd, n_ff);
+        let gs = silu(gate);
+        let act = [];
+        let i2 = 0;
+        while i2 < n_ff {
+            push(act, gs[i2] * up[i2]);
+            i2 = i2 + 1;
+        }
+        let down = tf_matmul_auto(act, L["ffn_down"], L["ffn_down_type"], 1, n_ff, n_embd);
+        let h2 = [];
+        let i3 = 0;
+        while i3 < n_embd {
+            push(h2, h1[i3] + down[i3]);
+            i3 = i3 + 1;
+        }
+        x = h2;
+        li = li + 1;
+    }
+
+    kv_cache["len"] = position + 1;
+    kv_cache["is_empty"] = false;
+
+    let out_gamma = llm_read_f32_vec(
+        data_base + model["output_norm"]["data_offset"], data_base, n_embd);
+    let final_norm = rms_norm(x, out_gamma, eps);
+    let out_info = model["output"];
+    let out_ptr  = data_base + out_info["data_offset"];
+    if out_info["type"] == 0 {
+        let w = ffi_peek_f32(out_ptr, vocab_size * n_embd);
+        if type(w) != "array" || len(w) != vocab_size * n_embd {
+            throw "llm_forward_cached: ffi_peek_f32 failed for the F32 output matrix";
+        }
+        return tensor_matmul_f32(final_norm, w, 1, n_embd, vocab_size);
+    }
+    return tf_matmul_auto(final_norm, out_ptr, out_info["type"], 1, n_embd, vocab_size);
+}
+
+// Feed prompt_ids through the cache one token at a time; returns the logits after the last one.
+fn llm_prefill(model, prompt_ids, kv_cache) {
+    if type(prompt_ids) != "array" || len(prompt_ids) == 0 {
+        throw "llm_prefill: prompt_ids must be a non-empty array";
+    }
+    let logits = null;
+    let i = 0;
+    while i < len(prompt_ids) {
+        logits = llm_forward_cached(model, prompt_ids[i], kv_cache, kv_cache["len"]);
+        i = i + 1;
+    }
+    return logits;
+}
+
+// Same contract as llm_generate, but O(1 token) of matmuls per new token after the prompt.
+fn llm_generate_cached(model, prompt_ids, n_tokens, temperature, top_k) {
+    if type(n_tokens) != "number" || n_tokens < 0 || n_tokens != floor(n_tokens) {
+        throw "llm_generate_cached: n_tokens must be a non-negative whole number";
+    }
+    let cache = llm_kv_new(model);
+    let logits = llm_prefill(model, prompt_ids, cache);
+    let stops = tok_chat_stops(model);
+    let out = [];
+    let step = 0;
+    while step < n_tokens {
+        let next = llm_sample(logits, temperature, top_k);
+        let is_stop = false;
+        let s = 0;
+        while s < len(stops) {
+            if stops[s] == next { is_stop = true; }
+            s = s + 1;
+        }
+        if is_stop {
+            step = n_tokens;
+        } else {
+            push(out, next);
+            step = step + 1;
+            if step < n_tokens {
+                logits = llm_forward_cached(model, next, cache, cache["len"]);
+            }
+        }
+    }
+    return out;
+}
+
+// Correctness check: max |cached - uncached| over the logits for the same ids. Expect ~1e-6 or less
+// (the two paths do the same math); anything bigger means the cached path disagrees with llm_forward.
+fn llm_kv_selfcheck(model, ids) {
+    let full = llm_forward(model, ids);
+    let cache = llm_kv_new(model);
+    let part = llm_prefill(model, ids, cache);
+    let worst = 0.0;
+    let i = 0;
+    while i < len(full) {
+        let d = full[i] - part[i];
+        if d < 0 { d = 0.0 - d; }
+        if d > worst { worst = d; }
+        i = i + 1;
+    }
+    return worst;
 }
