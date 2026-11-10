@@ -1,0 +1,197 @@
+// examples/world/server.donk — World + agents server.
+// Routes: /  /worldinfo  /tick  /agents_count  /frame.rgba  /place  /smite
+import "lib/world.donk";
+
+let VIEW_W = 512;
+let VIEW_H = 256;
+
+let world = world_new(VIEW_W, VIEW_H, 42);
+world_generate(world);
+agents_init(world, 200);
+global_set("world", world);
+
+let view_ptr = mem_alloc(VIEW_W * VIEW_H * 4);
+if view_ptr == 0 { throw "view buffer alloc failed"; }
+
+fn respond(client, status, mime, body) {
+    let resp = "HTTP/1.1 " + status + "\r\n"
+             + "Content-Type: " + mime + "\r\n"
+             + "Content-Length: " + str(len(body)) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Connection: close\r\n"
+             + "\r\n"
+             + body;
+    tcp_write(client, resp);
+    tcp_close(client);
+    return null;
+}
+
+fn respond_bytes(client, status, mime, ptr, n) {
+    let head = "HTTP/1.1 " + status + "\r\n"
+             + "Content-Type: " + mime + "\r\n"
+             + "Content-Length: " + str(n) + "\r\n"
+             + "Cache-Control: no-store\r\n"
+             + "Connection: close\r\n"
+             + "\r\n";
+    tcp_write(client, head);
+    tcp_write_bytes(client, ptr, n);
+    tcp_close(client);
+    return null;
+}
+
+fn read_request(client) {
+    let buf = "";
+    while len(buf) < 8192 {
+        let chunk = tcp_read(client, 4096);
+        if len(chunk) == 0 { return buf; }
+        buf = buf + chunk;
+        if contains(buf, "\r\n\r\n") { return buf; }
+    }
+    return buf;
+}
+
+fn request_path(raw) {
+    let lines = split(raw, "\r\n");
+    if len(lines) == 0 { return "/"; }
+    let parts = split(lines[0], " ");
+    if len(parts) < 2 { return "/"; }
+    return split(parts[1], "?")[0];
+}
+
+// Query string of the request line -> map of strings ("GET /p?x=1&y=2 HTTP/1.1" -> {x: "1", y: "2"}).
+fn query_map(raw) {
+    let m = {};
+    let parts = split(raw, " ");
+    if len(parts) < 2 { return m; }
+    let halves = split(parts[1], "?");
+    if len(halves) < 2 { return m; }
+    let pairs = split(halves[1], "&");
+    let i = 0;
+    while i < len(pairs) {
+        let kv = split(pairs[i], "=");
+        if len(kv) == 2 { m[kv[0]] = kv[1]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// Number from a query parameter, or `dflt` when it is missing or not a number.
+fn qnum(m, key, dflt) {
+    let v = m[key];
+    if v == null { return dflt; }
+    let n = num(v);
+    if n != n { return dflt; }
+    return n;
+}
+
+fn srv_clamp(v, lo, hi) {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn handle_client(client) {
+    let world = global_get("world");
+    let raw = read_request(client);
+    if len(raw) == 0 { tcp_close(client); return null; }
+    let path = request_path(raw);
+
+    if path == "/" || path == "/index.html" {
+        let html = read_file("examples/world/index.html");
+        if html == null { html = "<h1>index.html missing</h1>"; }
+        respond(client, "200 OK", "text/html; charset=utf-8", html);
+        return null;
+    }
+
+    if path == "/worldinfo" {
+        let m = {};
+        m["width"]  = world["width"];
+        m["height"] = world["height"];
+        m["seed"]   = world["seed"];
+        m["tick"]   = world["tick"];
+        m["agents"] = agents_alive(world);
+        respond(client, "200 OK", "application/json", json_encode(m));
+        return null;
+    }
+
+    if path == "/tick" {
+        let t = world_tick(world);
+        let m = {};
+        m["physics_changed"] = t["physics_changed"];
+        m["agents_moved"]    = t["agents_moved"];
+        m["tick"]            = t["tick"];
+        m["agents"]          = agents_alive(world);
+        respond(client, "200 OK", "application/json", json_encode(m));
+        return null;
+    }
+    if path == "/agents_count" {
+        let m = {};
+        m["alive"] = agents_alive(world);
+        m["tick"]  = world["tick"];
+        respond(client, "200 OK", "application/json", json_encode(m));
+        return null;
+    }
+
+    // /frame.rgba?cx=&cy=&w=&h= renders a w x h window of the world whose top-left cell is (cx, cy).
+    // With no parameters it is the whole world. The window is clamped into the world.
+    if path == "/frame.rgba" {
+        let q = query_map(raw);
+        let vw = floor(srv_clamp(qnum(q, "w", VIEW_W), 16, VIEW_W));
+        let vh = floor(srv_clamp(qnum(q, "h", VIEW_H), 8, VIEW_H));
+        let cx = floor(srv_clamp(qnum(q, "cx", 0), 0, VIEW_W - vw));
+        let cy = floor(srv_clamp(qnum(q, "cy", 0), 0, VIEW_H - vh));
+        world_render(world, cx, cy, vw, vh, view_ptr);
+        respond_bytes(client, "200 OK", "application/octet-stream", view_ptr, vw * vh * 4);
+        return null;
+    }
+
+    // /place?x=&y=&b=  puts block b (0..8) at cell (x, y).
+    if path == "/place" {
+        let q = query_map(raw);
+        let px = floor(qnum(q, "x", -1));
+        let py = floor(qnum(q, "y", -1));
+        let pb = floor(qnum(q, "b", 1));
+        if px < 0 || px >= VIEW_W || py < 0 || py >= VIEW_H || pb < 0 || pb > 8 {
+            respond(client, "400 Bad Request", "application/json", "{\"placed\":0}");
+            return null;
+        }
+        let ok = world_set_block(world, px, py, pb);
+        let m = {};
+        m["placed"] = ok;
+        respond(client, "200 OK", "application/json", json_encode(m));
+        return null;
+    }
+
+    // /smite?x=&y=  kills every live agent within 5 cells of (x, y). The agent turns into a body on
+    // the next tick and is removed 15 ticks after that. Replies {"killed": n}.
+    if path == "/smite" {
+        let q = query_map(raw);
+        if q["x"] == null || q["y"] == null {
+            respond(client, "400 Bad Request", "application/json", "{\"killed\":0}");
+            return null;
+        }
+        let killed = agents_smite(world, qnum(q, "x", -1000), qnum(q, "y", -1000), 5);
+        let m = {};
+        m["killed"] = killed;
+        respond(client, "200 OK", "application/json", json_encode(m));
+        return null;
+    }
+
+    respond(client, "404 Not Found", "text/plain", "not found: " + path);
+    return null;
+}
+
+fn start_server(port) {
+    let srv = tcp_listen(port);
+    if srv < 0 { print("listen failed on port " + str(port)); return null; }
+    print("world server on http://localhost:" + str(port) + "/");
+    while true {
+        let c = tcp_accept(srv);
+        if c < 0 { sleep(20); }
+        else { spawn(handle_client, c); }
+    }
+    return null;
+}
+
+spawn(start_server, 8083);
+gui_webview("http://localhost:8083/");

@@ -1,0 +1,91 @@
+// tests/test_smite.donk
+// Spawns agents on a 64x32 world and checks the smite lifecycle:
+//   spawn on solid ground -> smite -> DEAD body on the next tick (task 5) -> body stays for
+//   DEAD_TICKS (15) more ticks -> slot removed (task -1) -> smiting that spot again kills nothing.
+// Also checks that world_tick reports physics and agent movement as separate numbers.
+
+import "lib/world.donk";
+
+let W = 64;
+let H = 32;
+let N = 20;
+
+print("test_smite: building " + str(W) + "x" + str(H) + " world, " + str(N) + " agents");
+
+let world = world_new(W, H, 42);
+world_generate(world);
+agents_init(world, N);
+
+// ---- 1. everyone is alive and starts standing on something solid ----
+let alive0 = agents_alive(world);
+if alive0 != N {
+    throw "test_smite: expected " + str(N) + " alive after init, got " + str(alive0);
+}
+let i = 0;
+while i < N {
+    let sx = agent_x(world, i);
+    let sy = agent_y(world, i);
+    if sx < 0 || sx >= W || sy < 0 || sy >= H {
+        throw "test_smite: agent " + str(i) + " spawned out of bounds at (" + str(sx) + "," + str(sy) + ")";
+    }
+    if sy < H - 1 {
+        if world_block(world, sx, sy + 1) == 0 {
+            throw "test_smite: agent " + str(i) + " spawned in mid-air at (" + str(sx) + "," + str(sy) + ")";
+        }
+    }
+    i = i + 1;
+}
+
+// ---- 2. smiting an empty spot kills nothing ----
+let nothing = agents_smite(world, -100, -100, 5);
+if nothing != 0 { throw "test_smite: smite far outside the world killed " + str(nothing); }
+
+// ---- 3. smite agent 0 (aim at its body centre, 3 cells above its feet) ----
+let tx = agent_x(world, 0);
+let ty = agent_y(world, 0);
+let killed = agents_smite(world, tx, ty - 3, 2);
+if killed < 1 { throw "test_smite: smite on top of agent 0 killed " + str(killed); }
+
+// agents_kill only sets hp = 0: nobody is a body yet, so the alive count has not changed.
+let alive_mid = agents_alive(world);
+if alive_mid != N { throw "test_smite: alive changed before the next tick: " + str(alive_mid); }
+
+// ---- 4. lifecycle: DEAD after 1 tick, still DEAD at tick 16, removed at tick 17 ----
+let t = 1;
+while t <= 17 {
+    let r = world_tick(world);
+    if type(r["physics_changed"]) != "number" || type(r["agents_moved"]) != "number" {
+        throw "test_smite: world_tick must return numbers for physics_changed and agents_moved";
+    }
+    if t == 1 {
+        if agent_task(world, 0) != 5 {
+            throw "test_smite: agent 0 should be DEAD (5) one tick after the smite, task=" + str(agent_task(world, 0));
+        }
+        let alive1 = agents_alive(world);
+        if alive1 != N - killed {
+            throw "test_smite: expected " + str(N - killed) + " alive after the smite tick, got " + str(alive1);
+        }
+    }
+    if t == 16 {
+        if agent_task(world, 0) != 5 {
+            throw "test_smite: agent 0 body vanished early (tick " + str(t) + "), task=" + str(agent_task(world, 0));
+        }
+    }
+    if t == 17 {
+        if agent_task(world, 0) != -1 {
+            throw "test_smite: agent 0 should be removed (-1) 17 ticks after the smite, task=" + str(agent_task(world, 0));
+        }
+    }
+    t = t + 1;
+}
+
+// ---- 5. a removed agent cannot be smitten again, and the survivors are untouched ----
+let again = agents_smite(world, tx, ty - 3, 2);
+if again != 0 { throw "test_smite: smiting a removed agent's spot killed " + str(again); }
+let alive_end = agents_alive(world);
+if alive_end != N - killed {
+    throw "test_smite: expected " + str(N - killed) + " survivors, got " + str(alive_end);
+}
+
+print("PASS: smote " + str(killed) + " of " + str(N) + " agents; body shown 16 ticks, then removed; " +
+      str(alive_end) + " alive");

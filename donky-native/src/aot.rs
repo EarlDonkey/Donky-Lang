@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 95] = [    
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 103] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -126,6 +126,14 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 95] = [
     ("world_gen",   "donky_world_gen",   6),   // ptr, w, h, seed, chunk_x, chunk_y
     ("world_mesh",  "donky_world_mesh",  8),   // ptr, w, h, cam_x, cam_y, vw, vh, out_ptr
     ("world_set",   "donky_world_set",   6),   // ptr, w, h, x, y, block
+    ("world_physics", "donky_world_physics", 4),
+    ("tcp_write_bytes", "donky_tcp_write_bytes", 3),
+    ("agents_new",         "donky_agents_new",         1),
+    ("agents_tick",        "donky_agents_tick",        6),
+    ("agents_render",      "donky_agents_render",      9),
+    ("agents_count_alive", "donky_agents_count_alive", 2),
+    ("agents_kill",        "donky_agents_kill",        3),   // 3, not 2: added count
+    ("agents_place_on_surface", "donky_agents_place_on_surface", 5),
 ];
 
 #[derive(Clone, Copy)]
@@ -161,7 +169,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 95], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 103], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -262,7 +270,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 95] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 103] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });

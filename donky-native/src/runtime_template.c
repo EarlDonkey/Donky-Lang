@@ -2588,6 +2588,25 @@ uint64_t donky_tcp_write(uint64_t client_val, uint64_t data_val) {
     return make_number((double)total);
 }
 
+// tcp_write_bytes(client, ptr, len): send len raw bytes from a mem_alloc'd
+// buffer. Returns bytes sent, or -1 on error. Use this for /frame.rgba;
+// tcp_write is for text/JSON only.
+uint64_t donky_tcp_write_bytes(uint64_t client_val, uint64_t ptr_val, uint64_t len_val) {
+    SOCKET c = dk_socket_from_id(client_val);
+    if (c == INVALID_SOCKET || !is_number(ptr_val) || !is_number(len_val)) return make_number(-1.0);
+    const char* data = (const char*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!data) return make_number(-1.0);
+    long long want = (long long)as_number(len_val);
+    if (want <= 0) return make_number(0.0);
+    int total = 0, len = (int)want;
+    while (total < len) {
+        int n = send(c, data + total, len - total, 0);
+        if (n <= 0) return make_number(-1.0);
+        total += n;
+    }
+    return make_number((double)total);
+}
+
 uint64_t donky_tcp_close(uint64_t client_val) {
     int id = (int)as_number(client_val);
     if (id > 0 && id <= DK_MAX_SOCK) {
@@ -6136,6 +6155,672 @@ uint64_t donky_world_set(uint64_t ptr_val, uint64_t width_val, uint64_t height_v
     if (bid < 0 || bid >= DK_NUM_BLOCKS)                             return make_number(0.0);
     grid[(size_t)yy * W + (size_t)xx] = (uint8_t)bid;
     return make_number(1.0);
+}
+
+// ============================================================================
+// world_physics(ptr, width, height, frame) -> cells_changed
+// One cellular-automaton tick over the byte grid, modified in place.
+//
+//   * Only runs on even frames (frame & 1 == 0). Odd frames change nothing.
+//   * Scans bottom-up (y from height-2 down to 0) so a falling block moves one
+//     cell per tick and is not re-processed in the same pass.
+//   * Sand / gravel: swap down into BLK_AIR.
+//   * Water: swap down into BLK_AIR, else slide left into BLK_AIR, else right
+//     into BLK_AIR. Slides happen in place, so a drop has priority over a slide.
+//   * Out-of-bounds is treated as solid: blocks never fall off the grid.
+//   * Return value is the number of cells whose contents changed.
+//
+// Throws on a null pointer, or on width/height that are non-positive or not whole
+// numbers. (A null grid or an absurd size is a programming error, not user data,
+// so it throws; the ordinary "nothing moved" case returns 0 without throwing.)
+//
+// KNOWN LIMITATION (design, not a bug): each cell is examined once per tick in
+// bottom-up order, so horizontal water flow is one cell per tick in a fixed scan
+// direction. Two water cells cannot swap, and a column of water is nudged down
+// one cell before it is nudged sideways, so it meanders down a slope rather than
+// spreading as a flat front. That is what "chunky Minecraft feel" looks like at
+// this level of fidelity; a real fluid sim is a different function.
+uint64_t donky_world_physics(uint64_t ptr_val, uint64_t width_val, uint64_t height_val, uint64_t frame_val) {
+    const char* who = "world_physics";
+    if (!is_number(ptr_val) || !is_number(width_val) || !is_number(height_val) || !is_number(frame_val))
+        return dk_ffi_err("world_physics: ptr, width, height, frame must be numbers");
+    uint8_t* grid = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!grid) return dk_ffi_err("world_physics: null grid");
+    double dw = as_number(width_val), dh = as_number(height_val);
+    if (!(dw >= 1.0) || dw > 1.0e7 || dw != floor(dw) ||
+        !(dh >= 1.0) || dh > 1.0e7 || dh != floor(dh))
+        return dk_ffi_err("world_physics: width/height must be whole numbers in [1, 1e7]");
+    size_t W = (size_t)dw, H = (size_t)dh;
+
+    // Frame gate: odd frames do no work. `frame` is taken modulo 2 so a caller can
+    // pass a wrapped tick counter without surprises.
+    long long frame = (long long)as_number(frame_val);
+    if (frame & 1) return make_number(0.0);
+
+    // Nothing to do on a 1-row or 1-column grid: no cell can fall or slide.
+    if (H < 2) return make_number(0.0);
+
+    size_t changed = 0;
+
+    // Bottom-up: row y ranges over [0, H-2). (The last row has nothing below it.)
+    // Descending size_t would loop forever at 0, so iterate with a signed index.
+    for (long long y = (long long)H - 2; y >= 0; y--) {
+        uint8_t* row  = grid + (size_t)y       * W;
+        uint8_t* below = grid + (size_t)(y + 1) * W;
+        for (size_t x = 0; x < W; x++) {
+            uint8_t blk = row[x];
+
+            // Falling blocks: sand and gravel drop into air below.
+            if ((blk == BLK_SAND || blk == BLK_GRAVEL) && below[x] == BLK_AIR) {
+                below[x] = blk;
+                row[x]   = BLK_AIR;
+                changed++;
+                continue;               // this cell is now air; do not also try to slide it
+            }
+
+            // Water: down if possible, else left into air, else right into air.
+            // "Left" is the -x neighbor of the same row; "right" is +x.
+            if (blk == BLK_WATER) {
+                if (below[x] == BLK_AIR) {
+                    below[x] = BLK_WATER;
+                    row[x]   = BLK_AIR;
+                    changed++;
+                    continue;
+                }
+                if (x > 0 && row[x - 1] == BLK_AIR) {
+                    row[x - 1] = BLK_WATER;
+                    row[x]     = BLK_AIR;
+                    changed++;
+                    continue;
+                }
+                if (x + 1 < W && row[x + 1] == BLK_AIR) {
+                    row[x + 1] = BLK_WATER;
+                    row[x]     = BLK_AIR;
+                    changed++;
+                    continue;
+                }
+            }
+        }
+    }
+    return make_number((double)changed);
+}
+
+// ============================================================================
+// Agent table: 40 bytes per agent in a mem_alloc'd buffer, edited in place.
+// ============================================================================
+//   offset  field      type     notes
+//   0       x          int32    current tile (column)
+//   4       y          int32    current tile (row)
+//   8       vx         int32    -1 / 0 / 1
+//   12      vy         int32    -1 / 0 / 1
+//   16      hp         int32    100 at spawn
+//   20      age        int32    ticks lived
+//   24      task       int32    0=wander 1=gather 2=build 3=idle 4=flee 5=dead -1=removed
+//   28      target_x   int32    destination column, or -1
+//   32      target_y   int32    destination row, or -1
+//   36      carry      int32    block id held, 0 for none
+//
+// The buffer is mmap/VirtualAlloc, NOT the GC. Free it with mem_free(ptr, count*40).
+// Struct is read/written with byte offsets, so alignment/padding cannot bite:
+// there is no struct in C, just #define offsets used as `buf + i*40 + DK_AG_*`.
+
+#define DK_AG_X        0
+#define DK_AG_Y        4
+#define DK_AG_VX       8
+#define DK_AG_VY       12
+#define DK_AG_HP       16
+#define DK_AG_AGE      20
+#define DK_AG_TASK     24
+#define DK_AG_TARGET_X 28
+#define DK_AG_TARGET_Y 32
+#define DK_AG_CARRY    36
+#define DK_AG_SIZE     40
+
+#define DK_AG_WANDER   0
+#define DK_AG_GATHER   1
+#define DK_AG_BUILD    2
+#define DK_AG_IDLE     3
+#define DK_AG_FLEE     4
+#define DK_AG_DEAD     5
+#define DK_AG_REMOVED  (-1)
+
+// How many ticks a dead body stays on screen before task flips to -1.
+#define DK_AG_DEAD_TICKS 15
+// How many ticks of idle before the agent wanders again.
+#define DK_AG_IDLE_TICKS 100
+
+// Field accessors (buf is `uint8_t*`, i is the agent index, off is a DK_AG_* offset).
+static inline int32_t dk_ag_get(const uint8_t* buf, size_t i, size_t off) {
+    int32_t v; memcpy(&v, buf + i * DK_AG_SIZE + off, sizeof v); return v;
+}
+static inline void dk_ag_set(uint8_t* buf, size_t i, size_t off, int32_t v) {
+    memcpy(buf + i * DK_AG_SIZE + off, &v, sizeof v);
+}
+
+// The block ids used for terrain checks (solid = not air, not water, not carried).
+static inline int dk_ag_is_solid(uint8_t b) {
+    return b != BLK_AIR && b != BLK_WATER;
+}
+// These are the block ids gather can pick up.
+static inline int dk_ag_is_gatherable(uint8_t b) {
+    return b == BLK_DIRT || b == BLK_SAND;
+}
+// Small deterministic RNG, seeded by agent index and tick, so the same seed and
+// the same calls produce the same agents (for tests / replays). Different from
+// dk_world_rand so agents do not track the world noise.
+static inline uint32_t dk_ag_rand(uint32_t agent, uint32_t tick) {
+    uint32_t h = agent * 2654435761u + tick * 40503u;
+    h ^= h >> 16; h *= 0x7feb352du;
+    h ^= h >> 15; h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+// ------------------------------------------------------------------ agents_new
+// agents_new(count) -> pointer (number) | throws
+// Allocates count * 40 bytes via mem_alloc and returns the address. Each agent is
+// placed at a random air tile in the upper half of "the world", hp = 100, task =
+// WANDER, age = 0, vx = vy = 0, carry = 0, target = -1. There is no world yet at
+// this point, so "air" is not checked: agents spawn in open air above a 512x256
+// world and fall under agents_tick gravity. Throws on count <= 0.
+uint64_t donky_agents_new(uint64_t count_val) {
+    const char* who = "agents_new";
+    if (!is_number(count_val)) return dk_ffi_err("agents_new: count must be a number");
+    double dc = as_number(count_val);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
+        return dk_ffi_err("agents_new: count must be a whole number in [1, 1e7]");
+    size_t count = (size_t)dc;
+    if (count > SIZE_MAX / DK_AG_SIZE) return dk_ffi_err("agents_new: count is too large");
+    size_t bytes = count * DK_AG_SIZE;
+
+    // Use mem_alloc so the caller can mem_free the same size later.
+    // (This calls into the runtime, not the GC.)
+    uint64_t ptr = donky_mem_alloc(make_number((double)bytes));
+    // donky_mem_alloc returns TAG_BASE on failure, and 0.0 on OOM; check both.
+    if (ptr == TAG_BASE) return TAG_BASE;                // exception already pending
+    if (!is_number(ptr) || as_number(ptr) == 0.0) {
+        return dk_ffi_err("agents_new: mem_alloc returned null (out of memory)");
+    }
+    uint8_t* buf = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr);
+
+    // Place agents at random positions in a loose 512x128 box, above any world
+    // height we know about. This is deliberately not tied to a specific world size:
+    // the acceptance test is 512x256, but the function takes no world dimensions,
+    // so "the upper half" is a fixed 512x128 region. If you spawn against a world
+    // wider than 512, the right edge will be empty until agents wander into it.
+    for (size_t i = 0; i < count; i++) {
+        uint32_t r = dk_ag_rand((uint32_t)i, 1);
+        int32_t x = (int32_t)(r % 512);
+        int32_t y = (int32_t)((r >> 16) % 128);
+        dk_ag_set(buf, i, DK_AG_X,        x);
+        dk_ag_set(buf, i, DK_AG_Y,        y);
+        dk_ag_set(buf, i, DK_AG_VX,       0);
+        dk_ag_set(buf, i, DK_AG_VY,       0);
+        dk_ag_set(buf, i, DK_AG_HP,       100);
+        dk_ag_set(buf, i, DK_AG_AGE,      0);
+        dk_ag_set(buf, i, DK_AG_TASK,     DK_AG_WANDER);
+        dk_ag_set(buf, i, DK_AG_TARGET_X, -1);
+        dk_ag_set(buf, i, DK_AG_TARGET_Y, -1);
+        dk_ag_set(buf, i, DK_AG_CARRY,    0);
+    }
+    return ptr;
+}
+
+// ------------------------------------------------------------------ agents_kill
+// agents_kill(ptr, index) -> 1 on success, 0 on out-of-bounds or a null buffer.
+// Sets the agent's hp to 0. The next agents_tick will see hp <= 0, mark it DEAD,
+// and after DK_AG_DEAD_TICKS more ticks flip it to REMOVED (-1). Returns 0 rather
+// than throwing for the ordinary "kill index out of bounds" case, matching world_set.
+uint64_t donky_agents_kill(uint64_t ptr_val, uint64_t index_val, uint64_t count_val) {
+    if (!is_number(ptr_val) || !is_number(index_val) || !is_number(count_val))
+        return dk_ffi_err("agents_kill: ptr, index, count must be numbers");
+    uint8_t* buf = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!buf) return dk_ffi_err("agents_kill: null agent buffer");
+    double di = as_number(index_val), dc = as_number(count_val);
+    if (!(di >= 0.0) || di != floor(di)) return make_number(0.0);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
+        return dk_ffi_err("agents_kill: count must be a whole number in [1, 1e7]");
+    size_t count = (size_t)dc, i = (size_t)di;
+    if (i >= count) return make_number(0.0);
+    dk_ag_set(buf, i, DK_AG_HP, 0);
+    return make_number(1.0);
+}
+
+// ---------------------------------------------------------- agents_count_alive
+// agents_count_alive(ptr, count) -> how many agents have task >= 0 and task != DEAD.
+// A dead body (task == 5) or a removed slot (task == -1) is not alive. Throws on a
+// null buffer or a bad count.
+uint64_t donky_agents_count_alive(uint64_t ptr_val, uint64_t count_val) {
+    if (!is_number(ptr_val) || !is_number(count_val))
+        return dk_ffi_err("agents_count_alive: ptr and count must be numbers");
+    const uint8_t* buf = (const uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    if (!buf) return dk_ffi_err("agents_count_alive: null agent buffer");
+    double dc = as_number(count_val);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
+        return dk_ffi_err("agents_count_alive: count must be a whole number in [1, 1e7]");
+    size_t count = (size_t)dc;
+    size_t alive = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t t = dk_ag_get(buf, i, DK_AG_TASK);
+        if (t >= 0 && t != DK_AG_DEAD) alive++;
+    }
+    return make_number((double)alive);
+}
+
+// ------------------------------------------------------------------ agents_tick
+// agents_tick(ptr, count, world_ptr, world_w, world_h, frame) -> moved_count
+// One simulation step. For each agent:
+//   1. task == -1: skip entirely (slot is free).
+//   2. task == DEAD (5): increment age; after DK_AG_DEAD_TICKS more ticks set task = -1.
+//      Dead agents do not move.
+//   3. hp <= 0 and not already dead: set task = DEAD, keep the body in place.
+//   4. Otherwise run the task: age++, decision step, then gravity.
+// Returns the number of agents that moved (dead→removed transitions and kills do
+// not count as moves).
+//
+// Throws on null pointers, a bad count, or world dims that are not whole numbers
+// >= 1. The agent buffer and the world buffer must both be mem_alloc'd; they are
+// read/written by byte offset and never touched by the GC.
+uint64_t donky_agents_tick(uint64_t ptr_val, uint64_t count_val,
+                          uint64_t world_ptr_val, uint64_t world_w_val, uint64_t world_h_val,
+                          uint64_t frame_val) {
+    const char* who = "agents_tick";
+    char msg[160];
+    if (!is_number(ptr_val) || !is_number(count_val) || !is_number(world_ptr_val) ||
+        !is_number(world_w_val) || !is_number(world_h_val) || !is_number(frame_val))
+        return dk_ffi_err("agents_tick: all arguments must be numbers");
+    uint8_t*       buf   = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    const uint8_t* world = (const uint8_t*)(uintptr_t)(uint64_t)as_number(world_ptr_val);
+    if (!buf)   return dk_ffi_err("agents_tick: null agent buffer");
+    if (!world) return dk_ffi_err("agents_tick: null world buffer");
+    double dc = as_number(count_val), dw = as_number(world_w_val), dh = as_number(world_h_val);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
+        return dk_ffi_err("agents_tick: count must be a whole number in [1, 1e7]");
+    if (!(dw >= 1.0) || dw > 1.0e7 || dw != floor(dw) ||
+        !(dh >= 1.0) || dh > 1.0e7 || dh != floor(dh))
+        return dk_ffi_err("agents_tick: world_w/world_h must be whole numbers in [1, 1e7]");
+    size_t count = (size_t)dc, W = (size_t)dw, H = (size_t)dh;
+    uint32_t tick = (uint32_t)(int64_t)as_number(frame_val);
+
+    size_t moved = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        int32_t task = dk_ag_get(buf, i, DK_AG_TASK);
+
+        // Removed slot: nothing to do.
+        if (task == DK_AG_REMOVED) continue;
+
+        // Dead body: age it, then remove after DK_AG_DEAD_TICKS.
+        if (task == DK_AG_DEAD) {
+            int32_t a = dk_ag_get(buf, i, DK_AG_AGE);
+            if (a >= DK_AG_DEAD_TICKS) dk_ag_set(buf, i, DK_AG_TASK, DK_AG_REMOVED);
+            else                       dk_ag_set(buf, i, DK_AG_AGE, a + 1);
+            continue;
+        }
+
+        // Kill check: a live agent whose hp reached 0 becomes DEAD, body kept.
+        if (dk_ag_get(buf, i, DK_AG_HP) <= 0) {
+            dk_ag_set(buf, i, DK_AG_TASK, DK_AG_DEAD);
+            dk_ag_set(buf, i, DK_AG_AGE, 0);           // reuse age as "ticks dead"
+            continue;
+        }
+
+        int32_t x = dk_ag_get(buf, i, DK_AG_X);
+        int32_t y = dk_ag_get(buf, i, DK_AG_Y);
+        int32_t age = dk_ag_get(buf, i, DK_AG_AGE) + 1;
+        dk_ag_set(buf, i, DK_AG_AGE, age);
+
+        // Clamp into the world before any further step: an agent that walked off the
+        // edge in a previous tick is pushed back in rather than left out-of-bounds.
+        if (x < 0) x = 0;
+        if (x >= (int32_t)W) x = (int32_t)W - 1;
+        if (y < 0) y = 0;
+        if (y >= (int32_t)H) y = (int32_t)H - 1;
+
+        int32_t old_x = x, old_y = y;
+
+        // ---- decision step per task ---------------------------------------
+        switch (task) {
+            case DK_AG_WANDER: {
+                // Random direction; step only into air with ground under the target.
+                uint32_t r = dk_ag_rand((uint32_t)i, tick);
+                int32_t dx = (int32_t)(r % 3) - 1;     // -1, 0, +1
+                int32_t dy = 0;
+                int32_t tx = x + dx;
+                int32_t ty = y;
+                if (tx < 0) tx = 0;
+                if (tx >= (int32_t)W) tx = (int32_t)W - 1;
+                // Step if the target is air (water is walkable in this pass).
+                uint8_t tgt = world[(size_t)ty * W + (size_t)tx];
+                if (tgt == BLK_AIR || tgt == BLK_WATER) {
+                    if (tx != x) { x = tx; }
+                    // Remember the horizontal velocity for the renderer / next tick.
+                    dk_ag_set(buf, i, DK_AG_VX, dx);
+                } else if (dx != 0 && y > 0 &&
+                           (world[(size_t)(y - 1) * W + (size_t)tx] == BLK_AIR ||
+                            world[(size_t)(y - 1) * W + (size_t)tx] == BLK_WATER) &&
+                           (world[(size_t)(y - 1) * W + (size_t)x]  == BLK_AIR ||
+                            world[(size_t)(y - 1) * W + (size_t)x]  == BLK_WATER)) {
+                    // One-cell step: climb it.
+                    x = tx;
+                    y = y - 1;
+                    dk_ag_set(buf, i, DK_AG_VX, dx);
+                } else {
+                    // Blocked: remember the attempt so the next tick re-rolls.
+                    dk_ag_set(buf, i, DK_AG_VX, 0);
+                }
+                break;
+            }
+            case DK_AG_GATHER: {
+                int32_t carry = dk_ag_get(buf, i, DK_AG_CARRY);
+                if (carry == 0) {
+                    // Pick up an adjacent gatherable block. Try N, S, E, W.
+                    static const int8_t NX[4] = { 0,  0,  1, -1 };
+                    static const int8_t NY[4] = { 1, -1,  0,  0 };
+                    int picked = 0;
+                    for (int k = 0; k < 4 && !picked; k++) {
+                        int32_t gx = x + NX[k];
+                        int32_t gy = y + NY[k];
+                        if (gx < 0 || gx >= (int32_t)W || gy < 0 || gy >= (int32_t)H) continue;
+                        uint8_t b = world[(size_t)gy * W + (size_t)gx];
+                        if (dk_ag_is_gatherable(b)) {
+                            dk_ag_set(buf, i, DK_AG_CARRY, (int32_t)b);
+                            // Clear the world cell. Safe: world is const-qualified in
+                            // signature only to remind us it is read-shared; this
+                            // function is meant to edit the world.
+                            ((uint8_t*)world)[(size_t)gy * W + (size_t)gx] = BLK_AIR;
+                            picked = 1;
+                        }
+                    }
+                    if (!picked) {
+                        // Nothing to pick up: walk one cell left.
+                        if (x > 0) x -= 1;
+                    }
+                } else {
+                    // Carrying something: walk one cell left until an edge,
+                    // then drop and go idle.
+                    if (x > 0) x -= 1;
+                    else {
+                        // Drop carried block into the world (or keep it if the
+                        // destination is solid — do not overwrite terrain).
+                        if (world[(size_t)y * W] == BLK_AIR)
+                            ((uint8_t*)world)[(size_t)y * W] = (uint8_t)carry;
+                        dk_ag_set(buf, i, DK_AG_CARRY, 0);
+                        dk_ag_set(buf, i, DK_AG_TASK,  DK_AG_IDLE);
+                        dk_ag_set(buf, i, DK_AG_AGE,   0);       // idle timer
+                    }
+                }
+                break;
+            }
+            case DK_AG_IDLE: {
+                // Stand still. After DK_AG_IDLE_TICKS ticks, wander again.
+                int32_t carry = dk_ag_get(buf, i, DK_AG_CARRY);
+                if (carry != 0) {
+                    // If we somehow arrived here carrying, drop and stay.
+                    if (world[(size_t)y * W + (size_t)x] == BLK_AIR)
+                        ((uint8_t*)world)[(size_t)y * W + (size_t)x] = (uint8_t)carry;
+                    dk_ag_set(buf, i, DK_AG_CARRY, 0);
+                }
+                if (age >= DK_AG_IDLE_TICKS) {
+                    dk_ag_set(buf, i, DK_AG_TASK, DK_AG_WANDER);
+                    dk_ag_set(buf, i, DK_AG_AGE,  0);
+                }
+                break;
+            }
+            case DK_AG_BUILD:
+            case DK_AG_FLEE:
+                // Stubs: no build or flee for MVP. Fall through to wander-like idle.
+                break;
+            default:
+                // Unknown task: reset to wander.
+                dk_ag_set(buf, i, DK_AG_TASK, DK_AG_WANDER);
+                break;
+        }
+
+        // ---- gravity: after the task step, fall one cell if air is below ----
+        int32_t below_y = y + 1;
+        if (below_y < (int32_t)H) {
+            uint8_t below = world[(size_t)below_y * W + (size_t)x];
+            if (below == BLK_AIR) {
+                y = below_y;
+                dk_ag_set(buf, i, DK_AG_VY, 1);
+            } else {
+                dk_ag_set(buf, i, DK_AG_VY, 0);
+            }
+        }
+
+        // ---- commit the (possibly moved) position --------------------------
+        if (x != old_x || y != old_y) moved++;
+        dk_ag_set(buf, i, DK_AG_X, x);
+        dk_ag_set(buf, i, DK_AG_Y, y);
+    }
+
+    return make_number((double)moved);
+}
+
+// ------------------------------------------------------------------ agents_render
+// Paints every non-removed agent into the RGBA buffer (same buffer as world_mesh, on top).
+//
+//   LIVE: an upright 5x7 figure (head, torso/arms, legs) with a 1-pixel black outline.
+//         Torso colour = current task:
+//           wander cyan   gather lime   idle yellow   build orange   flee magenta
+//   DEAD: a prone grey 7x2 body under a red X marker, fading over DK_AG_DEAD_TICKS.
+// (wx, wy) is the agent's FEET cell: the sprite stands in the air cells above it.
+#define DK_AG_COL_WANDER  0xFFFFE500u    // bright cyan
+#define DK_AG_COL_GATHER  0xFF14FF39u    // lime
+#define DK_AG_COL_IDLE    0xFF00E6FFu    // yellow
+#define DK_AG_COL_BUILD   0xFF008CFFu    // orange
+#define DK_AG_COL_FLEE    0xFFC040FFu    // magenta
+#define DK_AG_COL_DEAD    0xFF9A9A9Au    // grey body
+#define DK_AG_COL_SKIN    0xFFB1DCFFu    // head
+#define DK_AG_COL_LEGS    0xFF3C2828u
+#define DK_AG_COL_MARK    0xFF3030FFu    // red X over a dead agent
+#define DK_AG_COL_OUTLINE 0xFF000000u
+
+static const char* const DK_AG_SPR_LIVE[7] = {
+    ".HHH.",
+    ".HHH.",
+    "BBBBB",
+    "BBBBB",
+    "BBBBB",
+    ".L.L.",
+    ".L.L.",
+};
+static const char* const DK_AG_SPR_DEAD[6] = {
+    "..X.X..",
+    "...X...",
+    "..X.X..",
+    ".......",
+    "HGGGGGG",
+    "GGGGGGG",
+};
+
+static inline void dk_ag_px(uint8_t* out, size_t VW, size_t VH,
+                            long long px, long long py, uint32_t c, int alpha /* 0..256 */) {
+    if (px < 0 || py < 0 || (size_t)px >= VW || (size_t)py >= VH) return;
+    uint8_t* p = out + ((size_t)py * VW + (size_t)px) * 4;
+    uint32_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+    if (alpha >= 256) {
+        p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b; p[3] = 0xFF;
+        return;
+    }
+    float sa = (float)alpha / 256.0f;
+    float da = (float)p[3] / 255.0f;
+    float oa = sa + da * (1.0f - sa);
+    if (oa <= 0.0f) return;
+    float k = da * (1.0f - sa);
+    p[0] = (uint8_t)((r * sa + p[0] * k) / oa + 0.5f);
+    p[1] = (uint8_t)((g * sa + p[1] * k) / oa + 0.5f);
+    p[2] = (uint8_t)((b * sa + p[2] * k) / oa + 0.5f);
+    p[3] = (uint8_t)(oa * 255.0f + 0.5f);
+}
+
+static void dk_ag_draw_mask(uint8_t* out, size_t VW, size_t VH, long long sx, long long sy,
+                            const char* const* rows, int nrows, int ncols,
+                            uint32_t body_col, int alpha) {
+    int cx = ncols / 2;
+    for (int ry = -1; ry <= nrows; ry++) {
+        for (int rx = -1; rx <= ncols; rx++) {
+            int filled = (ry >= 0 && ry < nrows && rx >= 0 && rx < ncols && rows[ry][rx] != '.');
+            if (filled) continue;
+            int touch = 0;
+            for (int dy = -1; dy <= 1 && !touch; dy++)
+                for (int dx = -1; dx <= 1 && !touch; dx++) {
+                    int yy = ry + dy, xx = rx + dx;
+                    if (yy >= 0 && yy < nrows && xx >= 0 && xx < ncols && rows[yy][xx] != '.') touch = 1;
+                }
+            if (touch)
+                dk_ag_px(out, VW, VH, sx + (rx - cx), sy + (ry - (nrows - 1)), DK_AG_COL_OUTLINE, alpha);
+        }
+    }
+    for (int ry = 0; ry < nrows; ry++) {
+        for (int rx = 0; rx < ncols; rx++) {
+            char ch = rows[ry][rx];
+            uint32_t c;
+            switch (ch) {
+                case '.': continue;
+                case 'H': c = (body_col == DK_AG_COL_DEAD) ? 0xFFC8C8C8u : DK_AG_COL_SKIN; break;
+                case 'L': c = DK_AG_COL_LEGS; break;
+                case 'X': c = DK_AG_COL_MARK; break;
+                default:  c = body_col; break;
+            }
+            dk_ag_px(out, VW, VH, sx + (rx - cx), sy + (ry - (nrows - 1)), c, alpha);
+        }
+    }
+}
+
+uint64_t donky_agents_render(uint64_t ptr_val, uint64_t count_val, uint64_t out_ptr_val,
+                             uint64_t out_w_val, uint64_t out_h_val,
+                             uint64_t cam_x_val, uint64_t cam_y_val) {
+    const char* who = "agents_render";
+    if (!is_number(ptr_val) || !is_number(count_val) || !is_number(out_ptr_val) ||
+        !is_number(out_w_val) || !is_number(out_h_val) ||
+        !is_number(cam_x_val) || !is_number(cam_y_val))
+        return dk_ffi_err("agents_render: all arguments must be numbers");
+    const uint8_t* buf = (const uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    uint8_t* out = (uint8_t*)(uintptr_t)(uint64_t)as_number(out_ptr_val);
+    if (!buf || !out) return dk_ffi_err("agents_render: null buffer");
+    double dc = as_number(count_val), dvw = as_number(out_w_val), dvh = as_number(out_h_val);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
+        return dk_ffi_err("agents_render: count must be a whole number in [1, 1e7]");
+    if (!(dvw >= 1.0) || dvw > 1.0e7 || dvw != floor(dvw) ||
+        !(dvh >= 1.0) || dvh > 1.0e7 || dvh != floor(dvh))
+        return dk_ffi_err("agents_render: out_w/out_h must be whole numbers in [1, 1e7]");
+    size_t count = (size_t)dc, VW = (size_t)dvw, VH = (size_t)dvh;
+    long long camx = (long long)as_number(cam_x_val);
+    long long camy = (long long)as_number(cam_y_val);
+
+    size_t drawn = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t task = dk_ag_get(buf, i, DK_AG_TASK);
+        if (task == DK_AG_REMOVED) continue;
+        long long sx = (long long)dk_ag_get(buf, i, DK_AG_X) - camx;
+        long long sy = (long long)dk_ag_get(buf, i, DK_AG_Y) - camy;
+        if (sx < -6 || sy < -2 || sx >= (long long)VW + 6 || sy >= (long long)VH + 9)
+            continue;
+
+        if (task == DK_AG_DEAD) {
+            int32_t age = dk_ag_get(buf, i, DK_AG_AGE);
+            if (age < 0) age = 0;
+            if (age > DK_AG_DEAD_TICKS) age = DK_AG_DEAD_TICKS;
+            int alpha = 256 - (age * 256) / (DK_AG_DEAD_TICKS + 1);
+            dk_ag_draw_mask(out, VW, VH, sx, sy, DK_AG_SPR_DEAD, 6, 7, DK_AG_COL_DEAD, alpha);
+        } else {
+            uint32_t c;
+            switch (task) {
+                case DK_AG_GATHER: c = DK_AG_COL_GATHER; break;
+                case DK_AG_IDLE:   c = DK_AG_COL_IDLE;   break;
+                case DK_AG_BUILD:  c = DK_AG_COL_BUILD;  break;
+                case DK_AG_FLEE:   c = DK_AG_COL_FLEE;   break;
+                default:           c = DK_AG_COL_WANDER; break;
+            }
+            dk_ag_draw_mask(out, VW, VH, sx, sy, DK_AG_SPR_LIVE, 7, 5, c, 256);
+        }
+        drawn++;
+    }
+    return make_number((double)drawn);
+}
+
+// ------------------------------------------------------ agents_place_on_surface
+// agents_place_on_surface(ptr, count, world_ptr, world_w, world_h) -> placed_count
+// Drops each agent onto the terrain: for the agent's column x, scan from the top
+// of the world down until the first solid cell is found, and place the agent one
+// cell above it (y = solid_row - 1). If the column is entirely air (no solid cell),
+// place the agent at the top row of the world (y = 0). Agents outside the world's
+// horizontal bounds are clamped into [0, world_w-1] first, so this function is safe
+// to call on a population whose x was set by some other means.
+//
+// What this does NOT do:
+//   * It does not check that the agent's own cell is air; y = solid_row - 1 already
+//     guarantees air above a solid cell (there is no terrain with a solid block
+//     floating over another solid block without air between them in this world
+//     model), and the case solid_row == 0 falls back to the entirely-air path.
+//   * It does not repair agents whose y is already in bounds; it always re-scans
+//     the column. Placement is idempotent: calling it twice on the same world
+//     yields the same positions.
+//   * It does not touch hp, age, task, carry, vx, vy, or targets. It only sets
+//     x (clamped) and y (to the surface).
+//
+// Returns the number of agents whose (x, y) changed, so callers can tell "placed
+// on terrain" from "already there". Throws on a null agent buffer or world
+// buffer, or on a bad count / world size.
+uint64_t donky_agents_place_on_surface(uint64_t ptr_val,       // 1
+                                       uint64_t count_val,     // 2
+                                       uint64_t world_ptr_val, // 3
+                                       uint64_t world_w_val,   // 4
+                                       uint64_t world_h_val)   // 5
+{
+    const char* who = "agents_place_on_surface";
+    char msg[160];
+    if (!is_number(ptr_val) || !is_number(count_val) || !is_number(world_ptr_val) ||
+        !is_number(world_w_val) || !is_number(world_h_val))
+        return dk_ffi_err("agents_place_on_surface: all arguments must be numbers");
+    uint8_t*       buf   = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
+    const uint8_t* world = (const uint8_t*)(uintptr_t)(uint64_t)as_number(world_ptr_val);
+    if (!buf)   return dk_ffi_err("agents_place_on_surface: null agent buffer");
+    if (!world) return dk_ffi_err("agents_place_on_surface: null world buffer");
+    double dc = as_number(count_val), dw = as_number(world_w_val), dh = as_number(world_h_val);
+    if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc)) {
+        snprintf(msg, sizeof msg, "%s: count must be a whole number in [1, 1e7]", who);
+        return dk_ffi_err(msg);
+    }
+    if (!(dw >= 1.0) || dw > 1.0e7 || dw != floor(dw) ||
+        !(dh >= 1.0) || dh > 1.0e7 || dh != floor(dh)) {
+        snprintf(msg, sizeof msg, "%s: world_w/world_h must be whole numbers in [1, 1e7]", who);
+        return dk_ffi_err(msg);
+    }
+    size_t count = (size_t)dc, W = (size_t)dw, H = (size_t)dh;
+
+    size_t changed = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t task = dk_ag_get(buf, i, DK_AG_TASK);
+        if (task == DK_AG_REMOVED) continue;         // do not reposition a free slot
+
+        int32_t x = dk_ag_get(buf, i, DK_AG_X);
+        if (x < 0) x = 0;
+        if (x >= (int32_t)W) x = (int32_t)W - 1;
+        int32_t old_x = dk_ag_get(buf, i, DK_AG_X);
+        int32_t old_y = dk_ag_get(buf, i, DK_AG_Y);
+
+        // Scan the column from the top down. First solid cell row = `solid_row`.
+        // y = solid_row - 1 puts the agent on top of it. If we reach row 0 with
+        // no solid cell, the column is all air; place the agent at row 0.
+        int32_t solid_row = -1;
+        for (int32_t r = 0; r < (int32_t)H; r++) {
+            uint8_t b = world[(size_t)r * W + (size_t)x];
+            if (dk_ag_is_solid(b)) { solid_row = r; break; }
+        }
+        int32_t y = (solid_row < 0) ? 0 : (solid_row - 1);
+        if (y < 0) y = 0;                                    // column starts solid at row 0
+        if (y >= (int32_t)H) y = (int32_t)H - 1;             // safety clamp; cannot happen in practice
+
+        dk_ag_set(buf, i, DK_AG_X, x);
+        dk_ag_set(buf, i, DK_AG_Y, y);
+        dk_ag_set(buf, i, DK_AG_VX, 0);                      // standing, not moving
+        dk_ag_set(buf, i, DK_AG_VY, 0);
+        if (x != old_x || y != old_y) changed++;
+    }
+    return make_number((double)changed);
 }
 
 // ---- hashing ----

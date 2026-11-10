@@ -1,0 +1,59 @@
+// tests/test_agents_render.donk
+// Creates a 64x64 world, places 10 agents on the surface,
+// renders, and counts non-background pixels.
+
+import "lib/world.donk";
+
+let W = 64;
+let H = 64;
+let N = 10;
+
+print("test_agents_render: building " + str(W) + "x" + str(H) + " world");
+
+let world = world_new(W, H, 42);
+world_generate(world);
+agents_init(world, N);
+
+// Place all N agents inside the viewport so they actually render.
+// Spread them along x = 5, 11, 17, ...; put them just above the surface.
+let i = 0;
+while i < N {
+    let x = 5 + i * 5;
+    if x >= W { x = W - 1; }
+    let y = 0;
+    while y < H && world_block(world, x, y) == 0 { y = y + 1; }
+    if y >= H { y = H - 1; }
+    if y > 0 { y = y - 1; }   // one cell above the surface
+    ffi_poke(world["agents_ptr"] + i * 40 + 0, 4, x);
+    ffi_poke(world["agents_ptr"] + i * 40 + 4, 4, y);
+    i = i + 1;
+}
+
+// Allocate a 64x64x4 RGBA buffer, pre-fill with a sentinel background,
+// then render agents only (no world_mesh, per the dispatch).
+let buf = mem_alloc(W * H * 4);
+if buf == 0 { throw "test_agents_render: mem_alloc failed"; }
+let j = 0;
+while j < W * H * 4 { ffi_poke(buf + j, 1, 0x01); j = j + 1; }   // sentinel 0x01
+
+// Draw agents on top (no world render).
+agents_render(world["agents_ptr"], world["agents_n"], buf, W, H, 0, 0);
+
+// Count distinct pixels that are NOT the sentinel. "Distinct" here means
+// "position differs from any pixel we started with", which is just
+// "pixel != sentinel", since the whole buffer started at the sentinel.
+let nonzero = 0;
+j = 0;
+while j < W * H {
+    let b = ffi_peek(buf + j * 4 + 0, 1);   // R channel of pixel j
+    if b != 0x01 { nonzero = nonzero + 1; }
+    j = j + 1;
+}
+
+// 10 agents × 2×3 = up to 60 pixels; overlaps reduce that. Require ≥ 10
+// distinct (per the dispatch), which is easily met if any agent drew.
+if nonzero < 10 {
+    throw "test_agents_render: expected >= 10 non-background pixels, got " + str(nonzero);
+}
+
+print("PASS: " + str(N) + " agents rendered, " + str(nonzero) + " non-background pixels");

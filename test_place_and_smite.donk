@@ -1,0 +1,67 @@
+// tests/test_place_and_smite.donk
+// Kill semantics: alive -> DEAD on the first tick after the kill (no longer
+// counted by agents_alive) -> REMOVED (task == -1) after DK_AG_DEAD_TICKS more
+// ticks, no longer rendered.
+//
+// Why "agent_task == -1" and not "agents_alive == 9 again": agents_alive
+// already dropped to 9 when the agent became DEAD. Re-asserting it after 20
+// more ticks would pass whether or not the removal ever happened.
+
+import "lib/world.donk";
+
+let W = 32;
+let H = 32;
+let N = 10;
+
+print("test_place_and_smite: building " + str(W) + "x" + str(H) + " world");
+
+let world = world_new(W, H, 42);
+world_generate(world);
+agents_init(world, N);
+agents_place(world);   // drop all N agents onto the terrain surface
+
+// ---- all 10 alive before any tick ----
+let alive0 = agents_alive(world);
+if alive0 != 10 {
+    throw "test_place_and_smite: expected 10 alive at spawn, got " + str(alive0);
+}
+
+// ---- kill agent 3 ----
+// agents_kill only sets hp = 0; task is still WANDER at this instant, so the
+// alive count is unchanged until the next agents_tick observes hp <= 0.
+let k = agent_kill(world, 3);
+if k != 1 {
+    throw "test_place_and_smite: agent_kill(3) returned " + str(k) + ", expected 1";
+}
+let alive_after_kill = agents_alive(world);
+if alive_after_kill != 10 {
+    throw "test_place_and_smite: expected 10 alive immediately after kill (no tick yet), got " + str(alive_after_kill);
+}
+
+// ---- tick once: hp <= 0 observed, task -> DEAD, not counted alive ----
+world_tick(world);
+let alive_t1 = agents_alive(world);
+if alive_t1 != 9 {
+    throw "test_place_and_smite: expected 9 alive after 1 tick, got " + str(alive_t1);
+}
+let task3_t1 = agent_task(world, 3);
+if task3_t1 != 5 {                       // 5 = DK_AG_DEAD
+    throw "test_place_and_smite: agent 3 task after 1 tick = " + str(task3_t1) + ", expected 5 (DEAD)";
+}
+
+// ---- tick 20 more times (21 total) ----
+// After 16 more DEAD ticks the age counter reaches DK_AG_DEAD_TICKS = 15, and
+// the tick after that flips task to -1. 21 total ticks is comfortably past it.
+let t = 0;
+while t < 20 { world_tick(world); t = t + 1; }
+
+let alive_final = agents_alive(world);
+if alive_final != 9 {
+    throw "test_place_and_smite: expected 9 alive after 21 ticks, got " + str(alive_final);
+}
+let task3_final = agent_task(world, 3);
+if task3_final != -1 {
+    throw "test_place_and_smite: agent 3 task after 21 ticks = " + str(task3_final) + ", expected -1 (REMOVED); if this is 5 the removal is off by one or the tick loop is short";
+}
+
+print("PASS: kill and removal verified (agent 3: alive -> DEAD at tick 1 -> REMOVED by tick 21)");

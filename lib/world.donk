@@ -1,6 +1,15 @@
 // lib/world.donk — 2D block world management.
 // The world state is a raw mem_alloc'd byte buffer, not a Donky array.
 // Each block is one byte. Block IDs match the C palette.
+//
+// Agent state lives in a second mem_alloc'd buffer, 40 bytes per agent.
+// Layout: x@0, y@4, vx@8, vy@12, hp@16, age@20, task@24,
+//         target_x@28, target_y@32, carry@36  (all int32 LE)
+// task: 0=wander 1=gather 2=build 3=idle 4=flee 5=dead -1=removed
+
+// ---------------------------------------------------------------------------
+// World primitives
+// ---------------------------------------------------------------------------
 
 fn world_new(width, height, seed) {
     let nbytes = width * height;
@@ -21,26 +30,12 @@ fn world_generate(world) {
     while x < world["width"] {
         let y = 0;
         while y < world["height"] {
-            print("world_gen chunk at " + str(x) + "," + str(y));
             world_gen(world["ptr"], world["width"], world["height"],
                       world["seed"], x, y);
             y = y + chunk;
         }
         x = x + chunk;
     }
-    return world;
-}
-
-print("World width: " + str(world["width"]) + " height: " + str(world["height"]));
-
-fn world_render(world, cam_x, cam_y, view_w, view_h, view_ptr) {
-    world_mesh(world["ptr"], world["width"], world["height"],
-               cam_x, cam_y, view_w, view_h, view_ptr);
-    return view_ptr;
-}
-
-fn world_tick(world) {
-    world["tick"] = world["tick"] + 1;
     return world;
 }
 
@@ -51,4 +46,164 @@ fn world_block(world, x, y) {
 
 fn world_set_block(world, x, y, id) {
     return world_set(world["ptr"], world["width"], world["height"], x, y, id);
+}
+
+// ---------------------------------------------------------------------------
+// Agent field readers (int32 LE at fixed offsets in the agent buffer)
+// ---------------------------------------------------------------------------
+
+// ffi_peek(ptr, 4) returns an UNSIGNED 32-bit value, so a removed agent's task (-1) would read as
+// 4294967295. These readers convert to a signed int32, matching the layout comment above.
+fn agent_i32(world, i, off) {
+    let v = ffi_peek(world["agents_ptr"] + i * 40 + off, 4);
+    if v >= 2147483648 { v = v - 4294967296; }
+    return v;
+}
+
+fn agent_x(world, i)    { return agent_i32(world, i, 0); }
+fn agent_y(world, i)    { return agent_i32(world, i, 4); }
+fn agent_task(world, i) { return agent_i32(world, i, 24); }
+
+// ---------------------------------------------------------------------------
+// Agent allocation + placement
+// ---------------------------------------------------------------------------
+
+// Row of the first non-air cell in column x (the top of the terrain, water included), or -1 if the
+// column is empty air all the way down.
+fn world_top_y(world, x) {
+    let y = 0;
+    while y < world["height"] {
+        if world_block(world, x, y) != 0 { return y; }
+        y = y + 1;
+    }
+    return -1;
+}
+
+// x itself if the top of its column is dry land (not water); otherwise the next dry column to the
+// right, wrapping around. Falls back to x if the whole world is water.
+fn world_dry_column(world, x) {
+    let w = world["width"];
+    let cx = x;
+    let tries = 0;
+    while tries < w {
+        let ty = world_top_y(world, cx);
+        if ty >= 0 && world_block(world, cx, ty) != 4 { return cx; }
+        cx = cx + 1;
+        if cx >= w { cx = 0; }
+        tries = tries + 1;
+    }
+    return x;
+}
+
+// Allocate `count` agents and stand them on the terrain, at rest.
+// Agents are spread evenly across the width (with a small deterministic jitter), moved off any
+// lake onto the nearest dry column, and snapped onto the surface by agents_place before this
+// function returns, so the very first tick finds every agent standing on solid ground.
+// The world must already be generated.
+fn agents_init(world, count) {
+    let ptr = agents_new(count);
+    if ptr == 0 { throw "agents_init: agents_new(" + str(count) + ") failed"; }
+    world["agents_ptr"] = ptr;
+    world["agents_n"]   = count;
+
+    let w = world["width"];
+    let spacing = floor(w / count);
+    let i = 0;
+    while i < count {
+        let x = floor((i * 2 + 1) * w / (count * 2));
+        if spacing > 1 { x = x + (i * 7919) % spacing - floor(spacing / 2); }
+        if x < 0 { x = 0; }
+        if x >= w { x = w - 1; }
+        x = world_dry_column(world, x);
+        ffi_poke(ptr + i * 40 + 0,  4, x);
+        ffi_poke(ptr + i * 40 + 4,  4, 0);
+        ffi_poke(ptr + i * 40 + 16, 4, 100); // hp
+        ffi_poke(ptr + i * 40 + 24, 4, 0);   // task = wander
+        i = i + 1;
+    }
+    agents_place(world);                     // snap onto the surface, vx = vy = 0
+    return world;
+}
+
+// Place every agent on the surface of `world` (column scan from the top down
+// to the first solid cell, agent goes one cell above it). Returns the number
+// of agents whose (x, y) changed.
+fn agents_place(world) {
+    if world["agents_ptr"] == null { return 0; }
+    return agents_place_on_surface(world["agents_ptr"], world["agents_n"],
+                                   world["ptr"], world["width"], world["height"]);
+}
+
+// ---------------------------------------------------------------------------
+// Tick + render: world physics + agent tick, world mesh + agent render
+// ---------------------------------------------------------------------------
+
+// Advance world physics and agents by one tick. Returns a map:
+//   physics_changed   cells the physics pass changed (0 on odd ticks: physics runs on even frames)
+//   agents_moved      agents whose position changed this tick
+//   tick              the tick number just completed
+// The two counts are different units, so they are reported separately.
+fn world_tick(world) {
+    world["tick"] = world["tick"] + 1;
+    let changed = world_physics(world["ptr"], world["width"], world["height"], world["tick"]);
+    let moved = 0;
+    if world["agents_ptr"] != null {
+        moved = agents_tick(world["agents_ptr"], world["agents_n"],
+                            world["ptr"], world["width"], world["height"], world["tick"]);
+    }
+    let r = {};
+    r["physics_changed"] = changed;
+    r["agents_moved"]    = moved;
+    r["tick"]            = world["tick"];
+    return r;
+}
+
+// Render world, then agents on top. Returns view_ptr.
+fn world_render(world, cam_x, cam_y, view_w, view_h, view_ptr) {
+    world_mesh(world["ptr"], world["width"], world["height"],
+               cam_x, cam_y, view_w, view_h, view_ptr);
+    if world["agents_ptr"] != null {
+        agents_render(world["agents_ptr"], world["agents_n"],
+                      view_ptr, view_w, view_h, cam_x, cam_y);
+    }
+    return view_ptr;
+}
+
+// ---------------------------------------------------------------------------
+// Agent queries / commands
+// ---------------------------------------------------------------------------
+
+fn agents_alive(world) {
+    if world["agents_ptr"] == null { return 0; }
+    return agents_count_alive(world["agents_ptr"], world["agents_n"]);
+}
+
+fn agent_kill(world, index) {
+    if world["agents_ptr"] == null { return 0; }
+    return agents_kill(world["agents_ptr"], index, world["agents_n"]);
+}
+
+// Smite every live agent whose body centre is within `radius` cells of (px, py).
+// An agent's position is its FEET cell and the sprite is ~7 cells tall, so the centre is taken
+// 3 cells above it. Dead bodies and removed slots are left alone. agents_kill only sets hp = 0:
+// the next tick turns the agent into a body (task 5), and DEAD_TICKS (15) ticks after that the
+// slot is removed. Returns how many agents were smitten.
+fn agents_smite(world, px, py, radius) {
+    if world["agents_ptr"] == null { return 0; }
+    let killed = 0;
+    let r2 = radius * radius;
+    let n = world["agents_n"];
+    let j = 0;
+    while j < n {
+        let t = agent_task(world, j);
+        if t >= 0 && t < 5 {
+            let dx = agent_x(world, j) - px;
+            let dy = (agent_y(world, j) - 3) - py;
+            if dx * dx + dy * dy <= r2 {
+                killed = killed + agent_kill(world, j);
+            }
+        }
+        j = j + 1;
+    }
+    return killed;
 }

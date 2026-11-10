@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Block World</title>
+<style>
+  html, body { margin: 0; background: #0a0a0c; color: #ccc; font-family: monospace; }
+  canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: crosshair; }
+  #hud { position: fixed; top: 8px; left: 8px; font-size: 12px; color: #aaa; font-family: monospace; z-index: 9; }
+  #toolbar {
+    position: fixed; top: 8px; right: 8px; z-index: 10;
+    display: flex; gap: 6px;
+    background: #141416; border: 1px solid #2a2a2e; border-radius: 8px; padding: 6px;
+  }
+  .blockbtn {
+    appearance: none; background: #1b1b1e; color: #d8cfc5; border: 1px solid #2a2a2e;
+    border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .blockbtn:hover { border-color: #e08e4a; color: #f2b872; }
+  .blockbtn[aria-pressed="true"] { border-color: #e08e4a; color: #f2b872; background: #2a1e12; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading…</div>
+<div id="toolbar">
+  <button data-block="1" class="blockbtn">Dirt</button>
+  <button data-block="5" class="blockbtn">Sand</button>
+  <button data-block="2" class="blockbtn">Stone</button>
+  <button data-block="4" class="blockbtn">Water</button>
+</div>
+<script>
+(async function () {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const hud = document.getElementById("hud");
+
+  const info = await (await fetch("/worldinfo", { cache: "no-store" })).json();
+  const VIEW_W = info.width;
+  const VIEW_H = info.height;
+  canvas.width  = VIEW_W;
+  canvas.height = VIEW_H;
+
+  let currentBlock = 1;
+  const blockBtns = document.querySelectorAll(".blockbtn");
+  function setBlock(b) {
+    currentBlock = b;
+    blockBtns.forEach(btn => btn.setAttribute("aria-pressed", Number(btn.dataset.block) === b ? "true" : "false"));
+  }
+  blockBtns.forEach(btn => btn.addEventListener("click", () => setBlock(Number(btn.dataset.block))));
+  setBlock(1);
+
+  function screenToWorld(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.floor((clientX - rect.left) / rect.width * VIEW_W),
+      y: Math.floor((clientY - rect.top) / rect.height * VIEW_H)
+    };
+  }
+
+  // Single click handler: Issue GET to /place with query params
+  canvas.addEventListener("click", async (e) => {
+    const w = screenToWorld(e.clientX, e.clientY);
+    if (w.x < 0 || w.x >= VIEW_W || w.y < 0 || w.y >= VIEW_H) return;
+    try {
+      await fetch(`/place?x=${w.x}&y=${w.y}&b=${currentBlock}`);
+    } catch (_) {}
+  });
+
+  // Right click: Issue GET to /smite with query params
+  canvas.addEventListener("contextmenu", async (e) => {
+    e.preventDefault();
+    const w = screenToWorld(e.clientX, e.clientY);
+    if (w.x < 0 || w.x >= VIEW_W || w.y < 0 || w.y >= VIEW_H) return;
+    try {
+      await fetch(`/smite?x=${w.x}&y=${w.y}`);
+    } catch (_) {}
+  });
+
+  let running = true;
+  let frameCount = 0;
+  let lastTick = 0, lastChanged = 0, agentCount = 0;
+
+  async function loop() {
+    if (!running) return;
+    try {
+      const tickResp = await fetch("/tick", { cache: "no-store" });
+      if (tickResp.ok) {
+        const t = await tickResp.json();
+        lastTick = t.tick;
+        lastChanged = t.physics_changed;   // <-- fixed
+        if (typeof t.agents === "number") agentCount = t.agents;
+      }
+
+      const frameResp = await fetch("/frame.rgba", { cache: "no-store" });
+      const buf = await frameResp.arrayBuffer();
+      if (buf.byteLength === VIEW_W * VIEW_H * 4) {
+        const pixels = new Uint8ClampedArray(buf);
+        const img = ctx.createImageData(VIEW_W, VIEW_H);
+        img.data.set(pixels);
+        ctx.putImageData(img, 0, 0);
+      }
+
+      hud.textContent =
+        "tick " + lastTick +
+        " · changed " + lastChanged +
+        " · agents " + agentCount +
+        " · frame " + (++frameCount) +
+        " · block " + currentBlock;
+    } catch (e) {
+      hud.textContent = "error: " + e.message;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>
