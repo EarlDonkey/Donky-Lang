@@ -3320,6 +3320,27 @@ uint64_t donky_mem_free(uint64_t ptr_val, uint64_t size_val) {
     return 0;
 }
 
+// ptr_add.c -- INSERT into runtime_template.c immediately after the closing brace of donky_mem_free,
+// before the "// ---- POSIX process control" comment. No new includes.
+
+// ptr_add(p, offset) -> p + offset: address arithmetic on a raw address (a number, as ffi_peek takes).
+// `offset` is in bytes and may be negative; a fraction is truncated toward zero, like ffi_peek's address.
+// Throws if either argument is not a number (NaN and infinity count as "not a number") or if p is null (0).
+// There is deliberately no range or overflow check: the caller must stay inside the allocation. The
+// addition wraps in 64 bits, and the result is a double, so addresses above 2^53 lose low bits
+// (user-space addresses are below 2^47, so real pointers are exact).
+uint64_t donky_ptr_add(uint64_t p_val, uint64_t off_val) {
+    char msg[96];
+    if (!is_number(p_val))   { snprintf(msg, sizeof msg, "ptr_add: p must be a number, got %s", dk_type_name(p_val));          return dk_ffi_err(msg); }
+    if (!is_number(off_val)) { snprintf(msg, sizeof msg, "ptr_add: offset must be a number, got %s", dk_type_name(off_val));   return dk_ffi_err(msg); }
+    if (!isfinite(as_number(p_val)) || !isfinite(as_number(off_val)))
+        return dk_ffi_err("ptr_add: p and offset must be finite numbers, got NaN or infinity");
+    uint64_t base = dk_ffi_to_u64(p_val);
+    if (base == 0) return dk_ffi_err("ptr_add: p is null");
+    uint64_t sum = base + (uint64_t)dk_ffi_to_i64(off_val);        // unsigned: wraps, no UB
+    return make_number((double)sum);
+}
+
 // ---- POSIX process control: fork / exec / wait / pipe / dup2 / mmap / munmap ---------------
 // Windows has no equivalent of these (CreateProcessA & co. are reachable through dll_call_sig
 // on kernel32.dll), so every function below throws there. As elsewhere in this file: bad
@@ -4504,6 +4525,299 @@ uint64_t donky_tensor_sgd_step(uint64_t weights, uint64_t grads, uint64_t lr) {
     for (size_t i = 0; i < pw->len; i++)
         pw->data[i] = make_number(as_number(pw->data[i]) - rate * as_number(pg->data[i]));
     return weights;
+}
+
+
+// ---- Trainer: a tiny 6 -> 16 (ReLU) -> 4 (softmax) classifier, trained in C -------------------------
+// Example layout in the dataset: 6 input floats, then 4 target floats (one-hot) = 10 floats / 40 bytes.
+// Weights (float32, row-major):  w1[16*6], b1[16], w2[4*16], b2[4]   (180 floats = 720 bytes).
+// The state is a malloc'd struct handed to Donky as a number. Every handle is checked against a small
+// registry, so a stale/double-freed/garbage handle throws instead of crashing.
+//
+// NOT tensor_sgd_step: that builtin works on boxed Donky arrays, and boxing 180 weights per example
+// (2.5M examples) would cost far more than the training itself, so dk_sgd_f32 below does the same
+// `w -= lr * grad` directly on the float buffers.
+#define DK_TR_IN   6
+#define DK_TR_HID  16
+#define DK_TR_OUT  4
+#define DK_TR_EX   (DK_TR_IN + DK_TR_OUT)                 // floats per example
+#define DK_TR_NW   (DK_TR_HID * DK_TR_IN + DK_TR_HID + DK_TR_OUT * DK_TR_HID + DK_TR_OUT)   // 180
+#define DK_TR_MAX_EXAMPLES (1u << 24)
+#define DK_TR_MAX_HANDLES  256
+
+typedef struct DkTrainer {
+    float* w1; float* b1; float* w2; float* b2;           // malloc'd weight buffers
+    float* dataset;                                       // num_examples * 10 floats, zero-initialised
+    size_t num_examples;
+    uint64_t rng;                                         // splitmix64 state: init and every shuffle
+    int busy;                                             // set while train() runs
+} DkTrainer;
+
+static DkTrainer* dk_trainers[DK_TR_MAX_HANDLES];
+static volatile int dk_tr_lock_flag = 0;
+static void dk_tr_lock(void)   { while (__sync_lock_test_and_set(&dk_tr_lock_flag, 1)) { } }
+static void dk_tr_unlock(void) { __sync_lock_release(&dk_tr_lock_flag); }
+
+static inline uint64_t dk_tr_next(DkTrainer* t) {         // splitmix64
+    uint64_t z = (t->rng += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+static inline float dk_tr_uniform(DkTrainer* t, float limit) {      // uniform in [-limit, limit)
+    float u = (float)((double)(dk_tr_next(t) >> 40) * (1.0 / 16777216.0));
+    return (2.0f * u - 1.0f) * limit;
+}
+
+// Resolves a handle to a live trainer. Throws and returns NULL if it is not one.
+// With claim_busy the trainer is also marked busy (train / load), failing if it already is.
+static DkTrainer* dk_tr_get(const char* who, uint64_t ptr_val, int claim_busy) {
+    char msg[96];
+    if (!is_number(ptr_val)) { snprintf(msg, sizeof msg, "%s: trainer must be a number, got %s", who, dk_type_name(ptr_val)); dk_ffi_err(msg); return NULL; }
+    uintptr_t p = (uintptr_t)dk_ffi_to_u64(ptr_val);
+    DkTrainer* t = NULL;
+    int busy = 0;
+    dk_tr_lock();
+    for (int i = 0; i < DK_TR_MAX_HANDLES; i++) if (p && (uintptr_t)dk_trainers[i] == p) { t = dk_trainers[i]; break; }
+    if (t) { busy = t->busy; if (claim_busy && !busy) t->busy = 1; }
+    dk_tr_unlock();
+    if (!t)   { snprintf(msg, sizeof msg, "%s: not a live trainer handle (never created, or already freed)", who); dk_ffi_err(msg); return NULL; }
+    if (busy) { snprintf(msg, sizeof msg, "%s: trainer is busy (training in another thread)", who); dk_ffi_err(msg); return NULL; }
+    return t;
+}
+static void dk_tr_release(DkTrainer* t) { dk_tr_lock(); t->busy = 0; dk_tr_unlock(); }
+
+// trainer_init(seed, num_examples) -> handle (a number)
+// Weights are He-uniform (+-sqrt(6/fan_in)) from `seed`, biases start at 0: the same seed always gives
+// the same weights and the same shuffle sequence. The dataset has room for num_examples examples (the
+// brief's 5,000 is just the usual value) and is zero-filled; put data in with trainer_load or
+// trainer_data_ptr before training.
+uint64_t donky_trainer_init(uint64_t seed_val, uint64_t n_val) {
+    const char* who = "trainer_init";
+    char msg[96];
+    if (!is_number(seed_val)) { snprintf(msg, sizeof msg, "%s: seed must be a number, got %s", who, dk_type_name(seed_val)); return dk_ffi_err(msg); }
+    if (!is_number(n_val))    { snprintf(msg, sizeof msg, "%s: num_examples must be a number, got %s", who, dk_type_name(n_val)); return dk_ffi_err(msg); }
+    double dn = as_number(n_val);
+    if (!(dn >= 1.0) || dn > (double)DK_TR_MAX_EXAMPLES || dn != floor(dn)) {
+        snprintf(msg, sizeof msg, "%s: num_examples must be a whole number in [1, %u]", who, DK_TR_MAX_EXAMPLES);
+        return dk_ffi_err(msg);
+    }
+    size_t n = (size_t)dn;
+    DkTrainer* t = (DkTrainer*)calloc(1, sizeof *t);
+    if (!t) return dk_ffi_err("trainer_init: out of memory");
+    t->w1 = (float*)malloc(DK_TR_HID * DK_TR_IN * sizeof(float));
+    t->b1 = (float*)calloc(DK_TR_HID, sizeof(float));
+    t->w2 = (float*)malloc(DK_TR_OUT * DK_TR_HID * sizeof(float));
+    t->b2 = (float*)calloc(DK_TR_OUT, sizeof(float));
+    t->dataset = (float*)calloc(n * DK_TR_EX, sizeof(float));
+    if (!t->w1 || !t->b1 || !t->w2 || !t->b2 || !t->dataset) {
+        free(t->w1); free(t->b1); free(t->w2); free(t->b2); free(t->dataset); free(t);
+        return dk_ffi_err("trainer_init: out of memory");
+    }
+    t->num_examples = n;
+    t->rng = dk_ffi_to_u64(seed_val) ^ 0xD1B54A32D192ED03ULL;      // so seed 0 is not a degenerate state
+    const float lim1 = sqrtf(6.0f / DK_TR_IN), lim2 = sqrtf(6.0f / DK_TR_HID);
+    for (int i = 0; i < DK_TR_HID * DK_TR_IN; i++)  t->w1[i] = dk_tr_uniform(t, lim1);
+    for (int i = 0; i < DK_TR_OUT * DK_TR_HID; i++) t->w2[i] = dk_tr_uniform(t, lim2);
+
+    int slot = -1;
+    dk_tr_lock();
+    for (int i = 0; i < DK_TR_MAX_HANDLES; i++) if (!dk_trainers[i]) { dk_trainers[i] = t; slot = i; break; }
+    dk_tr_unlock();
+    if (slot < 0) {
+        free(t->w1); free(t->b1); free(t->w2); free(t->b2); free(t->dataset); free(t);
+        snprintf(msg, sizeof msg, "%s: too many live trainers (max %d)", who, DK_TR_MAX_HANDLES);
+        return dk_ffi_err(msg);
+    }
+    return make_number((double)(uint64_t)(uintptr_t)t);
+}
+
+// trainer_data_ptr(trainer) -> address (a number) of the dataset buffer: num_examples * 10 float32s,
+// one example after another (6 inputs, then 4 one-hot targets). Fill it with ffi_poke_f32 or a file read.
+// The address is valid until trainer_free.
+uint64_t donky_trainer_data_ptr(uint64_t ptr_val) {
+    DkTrainer* t = dk_tr_get("trainer_data_ptr", ptr_val, 0);
+    if (!t) return TAG_BASE;
+    return make_number((double)(uint64_t)(uintptr_t)t->dataset);
+}
+
+// trainer_load(trainer, data) -> number of examples loaded. `data` is a flat array of numbers holding
+// whole examples (10 values each, 6 inputs then 4 targets); it must hold exactly num_examples of them.
+// Every value must be finite.
+uint64_t donky_trainer_load(uint64_t ptr_val, uint64_t data_val) {
+    const char* who = "trainer_load";
+    char msg[160];
+    DkTrainer* t = dk_tr_get(who, ptr_val, 1);
+    if (!t) return TAG_BASE;
+    uint64_t result = TAG_BASE;
+    if (get_tag(data_val) != TAG_ARRAY) {
+        snprintf(msg, sizeof msg, "%s: data must be an array of numbers, got %s", who, dk_type_name(data_val));
+        dk_ffi_err(msg);
+    } else {
+        Array* a = (Array*)as_index(data_val);
+        size_t want = t->num_examples * DK_TR_EX;
+        if (a->len != want) {
+            snprintf(msg, sizeof msg, "%s: expected %zu values (%zu examples x %d), got %zu", who, want, t->num_examples, DK_TR_EX, a->len);
+            dk_ffi_err(msg);
+        } else {
+            size_t i = 0;
+            for (; i < want; i++) {
+                uint64_t v = a->data[i];
+                if (!is_number(v) || !isfinite(as_number(v))) {
+                    snprintf(msg, sizeof msg, "%s: data[%zu] (example %zu) must be a finite number, got %s", who, i, i / DK_TR_EX,
+                             is_number(v) ? "nan/inf" : dk_type_name(v));
+                    dk_ffi_err(msg);
+                    break;
+                }
+            }
+            if (i == want) {
+                for (size_t k = 0; k < want; k++) t->dataset[k] = (float)as_number(a->data[k]);
+                result = make_number((double)t->num_examples);
+            }
+        }
+    }
+    dk_tr_release(t);
+    return result;
+}
+
+// w -= lr * grad, in place, over n floats (what tensor_sgd_step does to boxed arrays).
+static inline void dk_sgd_f32(float* w, const float* grad, int n, float lr) {
+    for (int i = 0; i < n; i++) w[i] -= lr * grad[i];
+}
+
+// trainer_train(trainer, epochs, lr) -> mean cross-entropy over the LAST epoch (a number; NaN if it diverged).
+// Plain per-example SGD, examples reshuffled every epoch (Fisher-Yates from the trainer's own RNG, so
+// runs are reproducible):
+//   h = relu(w1 x + b1);  p = softmax(w2 h + b2);  loss = -sum_k y_k log p_k;  d_out = p - y
+//   dw2 = d_out h^T, db2 = d_out;  dh = w2^T d_out;  d1 = dh * (z1 > 0);  dw1 = d1 x^T, db1 = d1
+// (softmax + cross-entropy collapse to d_out = p - y, so "backprop through the softmax" is that identity.)
+// dh uses the weights from BEFORE this example's update. Loss uses a log-sum-exp, so it is finite
+// whenever the logits are. Throws if the dataset holds a NaN/inf.
+uint64_t donky_trainer_train(uint64_t ptr_val, uint64_t epochs_val, uint64_t lr_val) {
+    const char* who = "trainer_train";
+    char msg[128];
+    if (!is_number(epochs_val)) { snprintf(msg, sizeof msg, "%s: epochs must be a number, got %s", who, dk_type_name(epochs_val)); return dk_ffi_err(msg); }
+    if (!is_number(lr_val))     { snprintf(msg, sizeof msg, "%s: learning_rate must be a number, got %s", who, dk_type_name(lr_val)); return dk_ffi_err(msg); }
+    double de = as_number(epochs_val), dl = as_number(lr_val);
+    if (!(de >= 1.0) || de > 1e9 || de != floor(de)) return dk_ffi_err("trainer_train: epochs must be a whole number >= 1");
+    if (!isfinite(dl) || dl < 0.0)                    return dk_ffi_err("trainer_train: learning_rate must be a finite number >= 0");
+    DkTrainer* t = dk_tr_get(who, ptr_val, 1);
+    if (!t) return TAG_BASE;
+
+    const size_t n = t->num_examples;
+    for (size_t i = 0; i < n * DK_TR_EX; i++) {
+        if (!isfinite(t->dataset[i])) {
+            snprintf(msg, sizeof msg, "%s: dataset value %zu (example %zu) is nan/inf", who, i, i / DK_TR_EX);
+            dk_tr_release(t);
+            return dk_ffi_err(msg);
+        }
+    }
+    uint32_t* order = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!order) { dk_tr_release(t); return dk_ffi_err("trainer_train: out of memory"); }
+    for (size_t i = 0; i < n; i++) order[i] = (uint32_t)i;
+
+    const long epochs = (long)de;
+    const float lr = (float)dl;
+    double last_loss = 0.0;
+    float z1[DK_TR_HID], h[DK_TR_HID], d1[DK_TR_HID];
+    float gw1[DK_TR_HID * DK_TR_IN], gb1[DK_TR_HID], gw2[DK_TR_OUT * DK_TR_HID], gb2[DK_TR_OUT];
+    for (long ep = 0; ep < epochs; ep++) {
+        for (size_t i = n; i > 1; i--) {                                    // Fisher-Yates
+            size_t j = (size_t)(dk_tr_next(t) % i);
+            uint32_t tmp = order[i - 1]; order[i - 1] = order[j]; order[j] = tmp;
+        }
+        double total = 0.0;
+        for (size_t s = 0; s < n; s++) {
+            const float* x = t->dataset + (size_t)order[s] * DK_TR_EX;
+            const float* y = x + DK_TR_IN;
+            // forward
+            for (int j = 0; j < DK_TR_HID; j++) {
+                float a = t->b1[j];
+                const float* w = t->w1 + j * DK_TR_IN;
+                for (int i = 0; i < DK_TR_IN; i++) a += w[i] * x[i];
+                z1[j] = a; h[j] = a > 0.0f ? a : 0.0f;
+            }
+            float z2[DK_TR_OUT], p[DK_TR_OUT], m = -INFINITY;
+            for (int k = 0; k < DK_TR_OUT; k++) {
+                float a = t->b2[k];
+                const float* w = t->w2 + k * DK_TR_HID;
+                for (int j = 0; j < DK_TR_HID; j++) a += w[j] * h[j];
+                z2[k] = a; if (a > m) m = a;
+            }
+            double sum = 0.0;
+            for (int k = 0; k < DK_TR_OUT; k++) sum += exp((double)z2[k] - (double)m);
+            const double logsum = log(sum);
+            double loss = 0.0;
+            for (int k = 0; k < DK_TR_OUT; k++) {
+                p[k] = (float)(exp((double)z2[k] - (double)m - logsum));
+                loss -= (double)y[k] * ((double)z2[k] - (double)m - logsum);
+            }
+            total += loss;
+            // backward: gradients first (dh needs the OLD w2), then one SGD step per weight buffer
+            float d2[DK_TR_OUT];
+            for (int k = 0; k < DK_TR_OUT; k++) d2[k] = p[k] - y[k];
+            for (int j = 0; j < DK_TR_HID; j++) {
+                float dh = 0.0f;
+                for (int k = 0; k < DK_TR_OUT; k++) dh += t->w2[k * DK_TR_HID + j] * d2[k];
+                d1[j] = z1[j] > 0.0f ? dh : 0.0f;
+            }
+            for (int k = 0; k < DK_TR_OUT; k++) {
+                gb2[k] = d2[k];
+                for (int j = 0; j < DK_TR_HID; j++) gw2[k * DK_TR_HID + j] = d2[k] * h[j];
+            }
+            for (int j = 0; j < DK_TR_HID; j++) {
+                gb1[j] = d1[j];
+                for (int i = 0; i < DK_TR_IN; i++) gw1[j * DK_TR_IN + i] = d1[j] * x[i];
+            }
+            dk_sgd_f32(t->w1, gw1, DK_TR_HID * DK_TR_IN, lr);
+            dk_sgd_f32(t->b1, gb1, DK_TR_HID, lr);
+            dk_sgd_f32(t->w2, gw2, DK_TR_OUT * DK_TR_HID, lr);
+            dk_sgd_f32(t->b2, gb2, DK_TR_OUT, lr);
+        }
+        last_loss = total / (double)n;
+    }
+    free(order);
+    dk_tr_release(t);
+    return make_number(last_loss);
+}
+
+// trainer_save(trainer, path) -> true / false. Writes w1, b1, w2, b2 as raw little-endian float32
+// (180 floats = 720 bytes, in that order). false if the file cannot be written (a partial file is removed).
+uint64_t donky_trainer_save(uint64_t ptr_val, uint64_t path_val) {
+    const char* who = "trainer_save";
+    char msg[96];
+    if (get_tag(path_val) != TAG_STRING) { snprintf(msg, sizeof msg, "%s: path must be a string, got %s", who, dk_type_name(path_val)); return dk_ffi_err(msg); }
+    DkTrainer* t = dk_tr_get(who, ptr_val, 1);
+    if (!t) return TAG_BASE;
+    const char* path = (const char*)as_index(path_val);
+    uint8_t buf[DK_TR_NW * 4];
+    const float* parts[4] = { t->w1, t->b1, t->w2, t->b2 };
+    const int counts[4] = { DK_TR_HID * DK_TR_IN, DK_TR_HID, DK_TR_OUT * DK_TR_HID, DK_TR_OUT };
+    size_t o = 0;
+    for (int s = 0; s < 4; s++)
+        for (int i = 0; i < counts[s]; i++) {
+            uint32_t bits; memcpy(&bits, &parts[s][i], 4);
+            buf[o++] = (uint8_t)bits; buf[o++] = (uint8_t)(bits >> 8); buf[o++] = (uint8_t)(bits >> 16); buf[o++] = (uint8_t)(bits >> 24);
+        }
+    dk_tr_release(t);
+    FILE* f = fopen(path, "wb");
+    if (!f) return BOOL_FALSE_BITS;
+    int ok = fwrite(buf, 1, sizeof buf, f) == sizeof buf;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(path); return BOOL_FALSE_BITS; }
+    return BOOL_TRUE_BITS;
+}
+
+// trainer_free(trainer): frees the four weight buffers, the dataset and the state. A handle that is not
+// live (already freed, never created) throws; it never double-frees. Returns null.
+uint64_t donky_trainer_free(uint64_t ptr_val) {
+    DkTrainer* t = dk_tr_get("trainer_free", ptr_val, 1);
+    if (!t) return TAG_BASE;
+    dk_tr_lock();
+    for (int i = 0; i < DK_TR_MAX_HANDLES; i++) if (dk_trainers[i] == t) { dk_trainers[i] = NULL; break; }
+    dk_tr_unlock();
+    free(t->w1); free(t->b1); free(t->w2); free(t->b2); free(t->dataset); free(t);
+    return TAG_BASE;
 }
 
 // ---- Transformer primitives -------------------------------------------------

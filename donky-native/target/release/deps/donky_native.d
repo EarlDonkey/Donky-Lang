@@ -1,6 +1,6 @@
-C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\donky_native.d: src\main.rs src\lexer.rs src\parser.rs src\ast.rs src\interpreter.rs src\vm.rs src\heap.rs src\package.rs src\repl.rs src\profiler.rs src\aot.rs src\runtime_template.c
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\donky_native.d: src\main.rs src\lexer.rs src\parser.rs src\ast.rs src\interpreter.rs src\vm.rs src\heap.rs src\package.rs src\repl.rs src\profiler.rs src\aot.rs src\typecheck.rs src\runtime_template.c
 
-C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\donky_native.exe: src\main.rs src\lexer.rs src\parser.rs src\ast.rs src\interpreter.rs src\vm.rs src\heap.rs src\package.rs src\repl.rs src\profiler.rs src\aot.rs src\runtime_template.c
+C:\Users\user\Desktop\Donky-Lang\donky-native\target\release\deps\donky_native.exe: src\main.rs src\lexer.rs src\parser.rs src\ast.rs src\interpreter.rs src\vm.rs src\heap.rs src\package.rs src\repl.rs src\profiler.rs src\aot.rs src\typecheck.rs src\runtime_template.c
 
 src\main.rs:
 src\lexer.rs:
@@ -13,6 +13,7 @@ src\package.rs:
 src\repl.rs:
 src\profiler.rs:
 src\aot.rs:
+src\typecheck.rs:
 src\runtime_template.c:
 
 # env-dep:CARGO_PKG_VERSION=3.2.0

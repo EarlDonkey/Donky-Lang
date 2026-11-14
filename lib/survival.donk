@@ -1,0 +1,117 @@
+// lib/survival.donk — the agents' survival policy: a 6 -> 16 -> 4 MLP evaluated in Donky by
+// survival_forward below (the runtime has no mlp_forward builtin).
+//
+// The weight file is exactly 720 bytes of little-endian float32, in this order:
+//   w1 (96 floats = 6*16)   at byte   0
+//   b1 (16 floats)          at byte 384
+//   w2 (64 floats = 16*4)   at byte 448
+//   b2 (4 floats)           at byte 704
+// Donky strings are NUL-terminated, so the file is mapped with mmap_model and read with ffi_peek_f32
+// instead of read_file.
+//
+// Actions the model chooses between: 0 wander, 1 gather, 2 idle, 3 flee.
+// NOTE: those are NOT the agent task codes used by the C simulation (0 wander, 1 gather, 2 build,
+// 3 idle, 4 flee, 5 dead). Use survival_task_for_action to convert.
+
+fn survival_param_count() { return 180; }       // 96 + 16 + 64 + 4
+
+// Load the weights, store them (key "survival_model") and return the map {w1, b1, w2, b2}.
+fn survival_load(path) {
+    if type(path) != "string" { throw "survival_load: path must be a string"; }
+    if !file_exists(path) { throw "survival_load: no such file: " + path; }
+    let mm = mmap_model(path);
+    if mm == null { throw "survival_load: could not map " + path; }
+    let want = survival_param_count() * 4;
+    if mm["size"] != want {
+        throw "survival_load: " + path + " is " + str(mm["size"]) + " bytes, expected " + str(want) + " (6*16 + 16 + 16*4 + 4 float32 values)";
+    }
+    let base = mm["addr"];
+    let m = {};
+    m["w1"] = ffi_peek_f32(base,         96.0);
+    m["b1"] = ffi_peek_f32(base + 384.0, 16.0);
+    m["w2"] = ffi_peek_f32(base + 448.0, 64.0);
+    m["b2"] = ffi_peek_f32(base + 704.0, 4.0);
+    global_set("survival_model", m);
+    return m;
+}
+
+fn survival_loaded() {
+    let m = global_get("survival_model");
+    if m == null { return false; }
+    return true;
+}
+
+// Index of the largest value (first one wins ties).
+fn survival_argmax(v) {
+    let best = 0;
+    let i = 1;
+    while i < len(v) {
+        if v[i] > v[best] { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+// Forward pass, written in Donky because the runtime has no mlp_forward builtin. It mirrors the
+// trainer's forward exactly (donky_trainer_train):
+//   h = relu(w1 x + b1)      w1 is 16 rows of 6, row j = hidden unit j  (w1[j*6 + i])
+//   z = w2 h + b2            w2 is 4 rows of 16, row k = output k       (w2[k*16 + j])
+// Returns the 4 raw scores (logits). Softmax is not needed: argmax of logits = argmax of probabilities.
+fn survival_forward(m, x) {
+    let w1 = m["w1"];
+    let b1 = m["b1"];
+    let w2 = m["w2"];
+    let b2 = m["b2"];
+    let h = [];
+    let j = 0;
+    while j < 16 {
+        let a = b1[j];
+        let i = 0;
+        while i < 6 {
+            a = a + w1[j * 6 + i] * x[i];
+            i = i + 1;
+        }
+        if a < 0 { a = 0.0; }
+        push(h, a);
+        j = j + 1;
+    }
+    let out = [];
+    let k = 0;
+    while k < 4 {
+        let z = b2[k];
+        let jj = 0;
+        while jj < 16 {
+            z = z + w2[k * 16 + jj] * h[jj];
+            jj = jj + 1;
+        }
+        push(out, z);
+        k = k + 1;
+    }
+    return out;
+}
+
+// state_vec = [hp, age_norm, is_carrying, has_ground, dx, dy]  ->  action 0..3
+fn survival_action(state_vec) {
+    if type(state_vec) != "array" || len(state_vec) != 6 {
+        throw "survival_action: state_vec must be an array of 6 numbers";
+    }
+    let m = global_get("survival_model");
+    if m == null { throw "survival_action: call survival_load(path) first"; }
+    return survival_argmax(survival_forward(m, state_vec));
+}
+
+// Model action -> agent task code used by agents_tick.
+fn survival_task_for_action(action) {
+    if action == 0 { return 0; }    // wander
+    if action == 1 { return 1; }    // gather
+    if action == 2 { return 3; }    // idle   (task 2 is BUILD)
+    if action == 3 { return 4; }    // flee   (task 4)
+    throw "survival_task_for_action: bad action " + str(action);
+}
+
+fn survival_action_name(action) {
+    if action == 0 { return "wander"; }
+    if action == 1 { return "gather"; }
+    if action == 2 { return "idle"; }
+    return "flee";
+}

@@ -30,7 +30,7 @@ const NULL_BITS:       i64 = TAG_BASE as i64;
 #[allow(dead_code)] const NUM_TRUE_BITS: i64 = 0x3FF0_0000_0000_0000;
 #[allow(dead_code)] const TYPE_KEY: &str = "__type__";
 
-pub const STDLIB_BUILTINS: [(&str, &str, usize); 103] = [    
+pub const STDLIB_BUILTINS: [(&str, &str, usize); 110] = [    
     ("sys_cwd", "donky_sys_cwd", 0),
     ("sys_chdir", "donky_sys_chdir", 1),
     ("sys_getenv", "donky_sys_getenv", 1),
@@ -134,6 +134,13 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 103] = [
     ("agents_count_alive", "donky_agents_count_alive", 2),
     ("agents_kill",        "donky_agents_kill",        3),   // 3, not 2: added count
     ("agents_place_on_surface", "donky_agents_place_on_surface", 5),
+    ("trainer_init",     "donky_trainer_init",     2),
+    ("trainer_train",    "donky_trainer_train",    3),
+    ("trainer_save",     "donky_trainer_save",     2),
+    ("trainer_free",     "donky_trainer_free",     1),
+    ("trainer_load",     "donky_trainer_load",     2),
+    ("trainer_data_ptr", "donky_trainer_data_ptr", 1),
+    ("ptr_add", "donky_ptr_add", 2),
 ];
 
 #[derive(Clone, Copy)]
@@ -169,7 +176,7 @@ pub struct RuntimeFuncs {
     pub dll_calli_id: FuncId, pub ffi_cstr_id: FuncId,
     pub json_decode_id: FuncId, pub json_encode_id: FuncId,
     pub json_pretty_id: FuncId, pub json_error_id: FuncId,
-    pub stdlib_ids: [FuncId; 103], pub fdiv_id: FuncId,
+    pub stdlib_ids: [FuncId; 110], pub fdiv_id: FuncId,
     pub alloc_function_id: FuncId, pub call_function_id: FuncId,
 }
 
@@ -270,7 +277,7 @@ impl AotCompiler {
             module.declare_function(name, Linkage::Import, &sig).unwrap()
         };
 
-        let stdlib_ids: [FuncId; 103] = std::array::from_fn(|i| {
+        let stdlib_ids: [FuncId; 110] = std::array::from_fn(|i| {
             let (_, cname, n) = STDLIB_BUILTINS[i];
             declare(cname, &vec![types::I64; n], Some(types::I64))
         });
@@ -1694,6 +1701,7 @@ fn resolve_imports(
                     .map_err(|e| format!("Lex error in {}: {}", full.display(), e))?;
                 let imported = crate::parser::Parser::new(toks).parse()
                     .map_err(|e| format!("Parse error in {}: {}", full.display(), e))?;
+                crate::typecheck::check_program(&imported, &full.display().to_string(), &source)?;
                 let new_base = full.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
                 resolve_imports(&imported, &new_base, all_funcs, visited)?;
             }

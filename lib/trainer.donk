@@ -1,0 +1,89 @@
+// lib/trainer.donk — Donky wrappers around Agent 4's C survival-policy trainer.
+//
+// C builtins used (Donky name -> C function):
+//   trainer_init(seed, count)   -> donky_trainer_init        returns the trainer pointer
+//   trainer_load(ptr, array)    -> donky_trainer_load        takes a flat array of floats (10 per example)
+//   trainer_train(ptr, epochs, lr) -> donky_trainer_train    returns the final loss
+//   trainer_save(ptr, path)     -> donky_trainer_save        writes the 720-byte float32 weight file
+//   trainer_data_ptr(ptr)       -> donky_trainer_data_ptr    raw pointer to the dataset buffer
+//   trainer_free(ptr)           -> donky_trainer_free
+// I did NOT have Agent 4's C file, so the names come from the dispatch and the argument lists above are
+// my best reading of it: check each call against the real C signatures.
+//
+// The CSV (data/survival.csv) has 10 comma-separated numbers per line and no header:
+//   hp, age_norm, is_carrying, has_ground, dx, dy, a0, a1, a2, a3   (a0..a3 one-hot: wander, gather, idle, flee)
+//
+// A Donky function shadows a builtin of the same name, so there is deliberately no Donky fn called
+// trainer_free, trainer_save, trainer_load or trainer_train here: it would call itself forever. Call
+// trainer_free(ptr) directly (it is the builtin); trainer_dispose below is the same thing with a check.
+
+// Allocate a trainer with room for `count` samples.
+fn trainer_new(seed, count) {
+    if type(seed) != "number" { throw "trainer_new: seed must be a number"; }
+    if type(count) != "number" || count < 1 || count != floor(count) {
+        throw "trainer_new: count must be a whole number >= 1";
+    }
+    let ptr = trainer_init(seed, count);
+    if is_null_handle(ptr) { throw "trainer_new: the C trainer could not allocate " + str(count) + " samples"; }
+    return ptr;
+}
+
+// Parse the CSV at `path` into one flat array of numbers, row after row (10 per line, so 5,000 lines
+// give 50,000 elements). Blank lines are skipped (split drops them). Throws on a missing file, a line
+// without exactly 10 fields, or a field that is not a number.
+fn trainer_parse_csv(path) {
+    if type(path) != "string" { throw "trainer_parse_csv: path must be a string"; }
+    if !file_exists(path) { throw "trainer_parse_csv: no such file: " + path; }
+    let text = read_file(path);
+    if text == null { throw "trainer_parse_csv: could not read " + path; }
+    let lines = split(text, "\r\n");     // splits on \n; \r is in the set so CRLF files parse too
+    let data = [];
+    let li = 0;
+    while li < len(lines) {
+        let f = split(lines[li], ",");
+        if len(f) != 10 {
+            throw "trainer_parse_csv: " + path + " row " + str(li + 1) + ": expected 10 fields, got " + str(len(f));
+        }
+        let k = 0;
+        while k < 10 {
+            let v = num(f[k]);
+            if v != v { throw "trainer_parse_csv: " + path + " row " + str(li + 1) + ": field " + str(k + 1) + " is not a number"; }
+            push(data, v);
+            k = k + 1;
+        }
+        li = li + 1;
+    }
+    return data;
+}
+
+// Load the CSV at `path` into the trainer: parse it in Donky, then hand the flat array to the C builtin
+// trainer_load(handle, array). Returns whatever trainer_load returns.
+fn trainer_load_dataset(handle, path) {
+    let data = trainer_parse_csv(path);
+    return trainer_load(handle, data);
+}
+
+// Train for `epochs` epochs at learning rate `lr`; returns the final loss.
+fn trainer_run(ptr, epochs, lr) {
+    if type(epochs) != "number" || epochs < 1 || epochs != floor(epochs) {
+        throw "trainer_run: epochs must be a whole number >= 1";
+    }
+    if type(lr) != "number" || !(lr > 0) { throw "trainer_run: lr must be a positive number"; }
+    return trainer_train(ptr, epochs, lr);
+}
+
+// Write the trained weights (720 bytes: w1[96] b1[16] w2[64] b2[4], float32) to `path`.
+fn trainer_save_weights(ptr, path) {
+    if type(path) != "string" { throw "trainer_save_weights: path must be a string"; }
+    return trainer_save(ptr, path);
+}
+
+// Raw pointer to the trainer's dataset buffer.
+fn trainer_dataset_ptr(ptr) {
+    return trainer_data_ptr(ptr);
+}
+
+// Release the trainer (calls the builtin trainer_free).
+fn trainer_dispose(ptr) {
+    return trainer_free(ptr);
+}

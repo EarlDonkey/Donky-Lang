@@ -8,6 +8,8 @@ mod package;
 mod repl;
 mod profiler;
 mod aot;
+mod typecheck;
+
 
 use std::env;
 use std::fs;
@@ -41,6 +43,7 @@ fn main() {
             let source = match fs::read_to_string(path) { Ok(s) => s, Err(e) => { eprintln!("Runtime Error: build-exe: {}", e); return; } };
             let tokens = match lexer::Lexer::new(&source).tokenize() { Ok(t) => t, Err(e) => { eprintln!("Lex Error: {}", e); return; } };
             let ast = match parser::Parser::new(tokens).parse() { Ok(a) => a, Err(e) => { eprintln!("Parse Error: {}", e); return; } };
+            if let Err(e) = typecheck::check_program(&ast, path, &source) { eprint!("{}", e); return; }
 
             println!("Compiling to object file...");
             let aot = aot::AotCompiler::new();
@@ -267,6 +270,7 @@ fn run_file(path: &str) -> Result<(), String> {
     let source = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let tokens = lexer::Lexer::new(&source).tokenize()?;
     let ast = parser::Parser::new(tokens).parse()?;
+    typecheck::check_program(&ast, path, &source)?;
 
     let aot = aot::AotCompiler::new();
     let obj_path = "test_app.obj";

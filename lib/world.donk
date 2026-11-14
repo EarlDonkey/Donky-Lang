@@ -1,3 +1,5 @@
+import "survival.donk";
+
 // lib/world.donk — 2D block world management.
 // The world state is a raw mem_alloc'd byte buffer, not a Donky array.
 // Each block is one byte. Block IDs match the C palette.
@@ -14,7 +16,7 @@
 fn world_new(width, height, seed) {
     let nbytes = width * height;
     let ptr = mem_alloc(nbytes);
-    if ptr == 0 { throw "world_new: mem_alloc(" + str(nbytes) + ") failed"; }
+    if is_null_handle(ptr) { throw "world_new: mem_alloc(" + str(nbytes) + ") failed"; }
     let w = {};
     w["ptr"]    = ptr;
     w["width"]  = width;
@@ -102,7 +104,7 @@ fn world_dry_column(world, x) {
 // The world must already be generated.
 fn agents_init(world, count) {
     let ptr = agents_new(count);
-    if ptr == 0 { throw "agents_init: agents_new(" + str(count) + ") failed"; }
+    if is_null_handle(ptr) { throw "agents_init: agents_new(" + str(count) + ") failed"; }
     world["agents_ptr"] = ptr;
     world["agents_n"]   = count;
 
@@ -115,10 +117,10 @@ fn agents_init(world, count) {
         if x < 0 { x = 0; }
         if x >= w { x = w - 1; }
         x = world_dry_column(world, x);
-        ffi_poke(ptr + i * 40 + 0,  4, x);
-        ffi_poke(ptr + i * 40 + 4,  4, 0);
-        ffi_poke(ptr + i * 40 + 16, 4, 100); // hp
-        ffi_poke(ptr + i * 40 + 24, 4, 0);   // task = wander
+        ffi_poke(ptr_add(ptr, i * 40 + 0), 4, x);
+        ffi_poke(ptr_add(ptr, i * 40 + 4), 4, 0);
+        ffi_poke(ptr_add(ptr, i * 40 + 16), 4, 100); // hp
+        ffi_poke(ptr_add(ptr, i * 40 + 24), 4, 0);   // task = wander
         i = i + 1;
     }
     agents_place(world);                     // snap onto the surface, vx = vy = 0
@@ -135,6 +137,130 @@ fn agents_place(world) {
 }
 
 // ---------------------------------------------------------------------------
+// Survival brain: the agents' decisions come from the MLP in lib/survival.donk
+// ---------------------------------------------------------------------------
+
+// Scan window for the nearest gatherable block, in cells either side of the agent.
+fn brain_radius() { return 5; }
+
+// Blocks an agent can pick up: dirt (1) and sand (5), the same set agents_tick gathers.
+fn block_gatherable(b) {
+    if b == 1 || b == 5 { return true; }
+    return false;
+}
+
+fn brain_clamp01(v) {
+    if v < 0 { return 0.0; }
+    if v > 1 { return 1.0; }
+    return v;
+}
+
+// The 6-value state vector the policy sees. It matches data/survival.csv (gen_survival.py) exactly:
+//   0 hp            hp / 100, clamped to 0..1
+//   1 age_norm      age / 1000, clamped to 0..1
+//   2 is_carrying   1 if it holds a block, else 0
+//   3 has_ground    1 if the cell below its feet is solid (not air, not water), else 0
+//   4 dx, 5 dy      integer offset (other.x - x, other.y - y) to the NEAREST OTHER live agent within
+//                   4 cells in both axes (-4..4); (0, 0) when there is none. +dx is right, +dy is down.
+// Other agents count only while alive: dead bodies (task 5), removed slots (-1) and hp <= 0 are ignored.
+fn agent_state_vec(world, i) {
+    let x = agent_x(world, i);
+    let y = agent_y(world, i);
+    let v = [];
+    push(v, brain_clamp01(agent_i32(world, i, 16) / 100.0));
+    push(v, brain_clamp01(agent_i32(world, i, 20) / 1000.0));
+    if agent_i32(world, i, 36) != 0 { push(v, 1.0); } else { push(v, 0.0); }
+
+    let below = 2;
+    if y + 1 < world["height"] { below = world_block(world, x, y + 1); }
+    if below != 0 && below != 4 { push(v, 1.0); } else { push(v, 0.0); }
+
+    let best_d = 1000000;
+    let best_dx = 0;
+    let best_dy = 0;
+    let n = world["agents_n"];
+    let j = 0;
+    while j < n {
+        if j != i {
+            let t = agent_task(world, j);
+            if t >= 0 && t != 5 && agent_i32(world, j, 16) > 0 {
+                let dx = agent_x(world, j) - x;
+                let dy = agent_y(world, j) - y;
+                if dx >= -4 && dx <= 4 && dy >= -4 && dy <= 4 {
+                    let d = dx * dx + dy * dy;
+                    if d < best_d {
+                        best_d = d;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                }
+            }
+        }
+        j = j + 1;
+    }
+    push(v, best_dx * 1.0);
+    push(v, best_dy * 1.0);
+    return v;
+}
+
+// Turn the brain on: load the 720-byte weight file and let the model choose every live agent's task
+// after each tick. Throws if the file is missing or the wrong size (nothing is switched on then).
+fn agents_use_brain(world, path) {
+    survival_load(path);
+    world["brain"] = 1;
+    return world;
+}
+
+fn agents_brain_off(world) {
+    world["brain"] = 0;
+    return world;
+}
+
+// Ask the model for every live agent's next task and write it into the agent buffer. agents_tick's C
+// code then runs that task (wander / gather / idle / flee) exactly as before. Dead bodies, removed
+// slots and agents with hp <= 0 are left alone. Returns how many agents changed task.
+fn agents_decide(world) {
+    if world["brain"] != 1 { return 0; }
+    if world["agents_ptr"] == null { return 0; }
+    let ptr = world["agents_ptr"];
+    let n = world["agents_n"];
+    let changed = 0;
+    let i = 0;
+    while i < n {
+        let t = agent_task(world, i);
+        if t >= 0 && t != 5 && agent_i32(world, i, 16) > 0 {
+            let action = survival_action(agent_state_vec(world, i));
+            let nt = survival_task_for_action(action);
+            if nt != t {
+                ffi_poke(ptr + i * 40 + 24, 4, nt);
+                changed = changed + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return changed;
+}
+
+// Count of agents per task: {"wander": n, "gather": n, "build": n, "idle": n, "flee": n, "dead": n}.
+fn agents_task_counts(world) {
+    let c = {};
+    c["wander"] = 0; c["gather"] = 0; c["build"] = 0; c["idle"] = 0; c["flee"] = 0; c["dead"] = 0;
+    if world["agents_ptr"] == null { return c; }
+    let i = 0;
+    while i < world["agents_n"] {
+        let t = agent_task(world, i);
+        if t == 0 { c["wander"] = c["wander"] + 1; }
+        if t == 1 { c["gather"] = c["gather"] + 1; }
+        if t == 2 { c["build"]  = c["build"]  + 1; }
+        if t == 3 { c["idle"]   = c["idle"]   + 1; }
+        if t == 4 { c["flee"]   = c["flee"]   + 1; }
+        if t == 5 { c["dead"]   = c["dead"]   + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------------------
 // Tick + render: world physics + agent tick, world mesh + agent render
 // ---------------------------------------------------------------------------
 
@@ -142,6 +268,7 @@ fn agents_place(world) {
 //   physics_changed   cells the physics pass changed (0 on odd ticks: physics runs on even frames)
 //   agents_moved      agents whose position changed this tick
 //   tick              the tick number just completed
+// With the brain on (agents_use_brain), the survival model then sets every live agent's task.
 // The two counts are different units, so they are reported separately.
 fn world_tick(world) {
     world["tick"] = world["tick"] + 1;
@@ -151,6 +278,10 @@ fn world_tick(world) {
         moved = agents_tick(world["agents_ptr"], world["agents_n"],
                             world["ptr"], world["width"], world["height"], world["tick"]);
     }
+    // The model picks each agent's NEXT task at the end of the tick, so the frame rendered after
+    // this tick shows the task the agent will carry out on the following one (agents_tick may flip
+    // idle -> wander on its own, and deciding afterwards puts the model's choice back).
+    if world["brain"] == 1 { agents_decide(world); }
     let r = {};
     r["physics_changed"] = changed;
     r["agents_moved"]    = moved;

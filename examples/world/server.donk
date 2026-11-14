@@ -8,10 +8,11 @@ let VIEW_H = 256;
 let world = world_new(VIEW_W, VIEW_H, 42);
 world_generate(world);
 agents_init(world, 200);
+agents_use_brain(world, "data/survival.weights");
 global_set("world", world);
 
 let view_ptr = mem_alloc(VIEW_W * VIEW_H * 4);
-if view_ptr == 0 { throw "view buffer alloc failed"; }
+if is_null_handle(view_ptr) { throw "view buffer alloc failed"; }
 
 fn respond(client, status, mime, body) {
     let resp = "HTTP/1.1 " + status + "\r\n"

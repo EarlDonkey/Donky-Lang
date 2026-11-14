@@ -1,0 +1,17 @@
+// tests/test_raw_type.donk -- MUST be rejected at compile time:
+// `p` is a number, and mem_free requires a `raw` pointer.
+// Expected: error: expected `raw`, got `number`   (at 12:18)
+
+fn release_buffer(n) {
+    let p = 4096;
+    if n > 0 {
+        let q = n * 2;
+        print(q);
+        // p is a plain number that merely looks like a pointer
+        let unused = 1;
+        mem_free(p, 1024);
+    }
+    return 0;
+}
+
+release_buffer(1);

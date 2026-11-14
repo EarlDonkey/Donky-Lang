@@ -1,0 +1,29 @@
+// tests/test_raw_type_ok.donk -- correct raw usage; must compile and run.
+let p = mem_alloc(64);
+if is_null_handle(p) { throw "mem_alloc failed"; }
+mem_write(p, [72, 105, 0]);
+print(ffi_peek_str(p, 2));
+print("raw address: " + str(p));      // str() of a raw is fine (debugging)
+let q = p;                            // raw -> raw copy
+if q == p { print("same pointer"); }  // raw == raw
+mem_protect(p, 64, 1);
+let n = 3;
+n = n + 1;                            // plain number arithmetic is untouched
+let m = {};
+m["ptr"] = p;                         // stored in a map: type erased, allowed
+mem_free(m["ptr"], 64);
+
+// ptr_add: raw + number -> raw; truthiness of a raw is allowed (same as is_null_handle)
+let base = mem_alloc(128);
+let field = ptr_add(base, 4 * 10 + 8);
+ffi_poke(field, 4, 7);
+if !base { throw "alloc failed"; }
+if base { print("have buffer"); }
+mem_free(base, 128);
+
+// mmap_model returns a map {addr, size}: its fields are unchecked
+write_file("raw_type_ok.tmp", "abcdefgh12345678");
+let mm = mmap_model("raw_type_ok.tmp");
+let addr = mm["addr"];
+print(ffi_peek_str(addr, 4));                     // abcd
+print(ffi_peek_str(ptr_add(addr, 8), 4));         // 1234 (ptr_add on an unchecked value: allowed)
