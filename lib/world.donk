@@ -103,7 +103,7 @@ fn world_dry_column(world, x) {
 // function returns, so the very first tick finds every agent standing on solid ground.
 // The world must already be generated.
 fn agents_init(world, count) {
-    let ptr = agents_new(count);
+    let ptr = agents_new(count, world["ptr"], world["width"], world["height"]);
     if is_null_handle(ptr) { throw "agents_init: agents_new(" + str(count) + ") failed"; }
     world["agents_ptr"] = ptr;
     world["agents_n"]   = count;
@@ -291,8 +291,9 @@ fn world_tick(world) {
 
 // Render world, then agents on top. Returns view_ptr.
 fn world_render(world, cam_x, cam_y, view_w, view_h, view_ptr) {
+    let capacity = view_w * view_h * 4;
     world_mesh(world["ptr"], world["width"], world["height"],
-               cam_x, cam_y, view_w, view_h, view_ptr);
+               cam_x, cam_y, view_w, view_h, view_ptr, capacity);
     if world["agents_ptr"] != null {
         agents_render(world["agents_ptr"], world["agents_n"],
                       view_ptr, view_w, view_h, cam_x, cam_y);

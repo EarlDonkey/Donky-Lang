@@ -6370,19 +6370,24 @@ uint64_t donky_world_gen(uint64_t ptr_val, uint64_t width_val, uint64_t height_v
 }
 
 // ----------------------------------------------------------------- world_mesh
-// world_mesh(ptr, width, height, cam_x, cam_y, view_w, view_h, out_ptr) -> pixels written
-// Fills out_ptr[0..view_w*view_h*4) with RGBA. Blocks outside the grid render
+// world_mesh(ptr, width, height, cam_x, cam_y, view_w, view_h, out_ptr, out_capacity) -> pixels written
+// Fills out_ptr[0..view_w*view_h*4) with RGBA. out_capacity is the size of the out_ptr
+// allocation IN BYTES; the call throws, before writing anything, if view_w*view_h*4 does not
+// fit ("world_mesh: output buffer too small (need N bytes, have M)"). Blocks outside the grid render
 // as stone; rows fully above the grid render as black. Colors come from
 // DK_PALETTE via a per-block uint32 lookup (autovectorized by the compiler; a
 // memcpy-of-uniform-rows fast path would need a scan to prove uniformity and
 // is not implemented — see the handoff note).
 uint64_t donky_world_mesh(uint64_t ptr_val, uint64_t width_val, uint64_t height_val,
                           uint64_t cam_x_val, uint64_t cam_y_val,
-                          uint64_t view_w_val, uint64_t view_h_val, uint64_t out_ptr_val) {
+                          uint64_t view_w_val, uint64_t view_h_val, uint64_t out_ptr_val,
+                          uint64_t out_capacity_val) {
     const char* who = "world_mesh";
     char msg[128];
     if (!is_number(ptr_val) || !is_number(out_ptr_val))
         return dk_ffi_err("world_mesh: ptr and out_ptr must be numbers");
+    if (!is_number(out_capacity_val))
+        return dk_ffi_err("world_mesh: out_capacity must be a number");
     if (!is_number(width_val) || !is_number(height_val) ||
         !is_number(cam_x_val) || !is_number(cam_y_val) ||
         !is_number(view_w_val) || !is_number(view_h_val))
@@ -6402,6 +6407,18 @@ uint64_t donky_world_mesh(uint64_t ptr_val, uint64_t width_val, uint64_t height_
     const uint8_t* grid = (const uint8_t*)(uintptr_t)(uint64_t)as_number(ptr_val);
     uint8_t* out = (uint8_t*)(uintptr_t)(uint64_t)as_number(out_ptr_val);
     if (!grid || !out) return dk_ffi_err("world_mesh: null grid or out buffer");
+
+    // The view is VW*VH RGBA pixels. Check it fits BEFORE the first pixel is written.
+    // VW, VH <= 1e7, so need <= 4e14: no uint64 overflow, and it is exact as a double.
+    double dcap = as_number(out_capacity_val);
+    if (!(dcap >= 0.0))
+        return dk_ffi_err("world_mesh: out_capacity must be a non-negative number");
+    uint64_t need_bytes = (uint64_t)VW * (uint64_t)VH * 4u;
+    if ((double)need_bytes > dcap) {
+        snprintf(msg, sizeof msg, "world_mesh: output buffer too small (need %.0f bytes, have %.0f)",
+                 (double)need_bytes, dcap);
+        return dk_ffi_err(msg);
+    }
 
     // Lookup table: 256 uint32 entries, indexed by block id (only 0..8 are used;
     // every other block id in the grid is treated as stone by world_set, so it
@@ -6631,21 +6648,44 @@ static inline uint32_t dk_ag_rand(uint32_t agent, uint32_t tick) {
 }
 
 // ------------------------------------------------------------------ agents_new
-// agents_new(count) -> pointer (number) | throws
-// Allocates count * 40 bytes via mem_alloc and returns the address. Each agent is
-// placed at a random air tile in the upper half of "the world", hp = 100, task =
-// WANDER, age = 0, vx = vy = 0, carry = 0, target = -1. There is no world yet at
-// this point, so "air" is not checked: agents spawn in open air above a 512x256
-// world and fall under agents_tick gravity. Throws on count <= 0.
-uint64_t donky_agents_new(uint64_t count_val) {
+// agents_new(count, world_ptr, world_w, world_h) -> pointer (number) | throws
+// Allocates count * 40 bytes via mem_alloc and returns the address. Each agent gets a random
+// column x in [0, world_w) and is stood on the surface of that column: the world grid is scanned
+// from row 0 downward, the first non-air cell (water counts) is the surface, and the agent is
+// placed one cell above it (y = surface_row - 1, clamped to 0 if the surface is row 0). A column
+// that is air all the way down places the agent at y = 0. hp = 100, task = WANDER, age = 0,
+// vx = vy = 0, carry = 0, target = -1.
+// x depends only on the agent index and world_w (same count and width -> same columns), so
+// spawns are reproducible. Throws on count outside [1, 1e7], on a null/invalid world_ptr, and on
+// world_w/world_h that are not whole numbers in [1, 1e7]. All of that is checked BEFORE the agent
+// buffer is allocated, so a throw never leaks it. The world is only read.
+// (agents_place_on_surface re-snaps an existing population, e.g. after regenerating the world;
+// note that it skips water when looking for the surface, this function does not.)
+uint64_t donky_agents_new(uint64_t count_val, uint64_t world_ptr_val,
+                          uint64_t world_w_val, uint64_t world_h_val) {
     const char* who = "agents_new";
+    char msg[160];
     if (!is_number(count_val)) return dk_ffi_err("agents_new: count must be a number");
+    if (!is_number(world_ptr_val) || !is_number(world_w_val) || !is_number(world_h_val))
+        return dk_ffi_err("agents_new: world_ptr, world_w and world_h must be numbers");
     double dc = as_number(count_val);
     if (!(dc >= 1.0) || dc > 1.0e7 || dc != floor(dc))
         return dk_ffi_err("agents_new: count must be a whole number in [1, 1e7]");
     size_t count = (size_t)dc;
     if (count > SIZE_MAX / DK_AG_SIZE) return dk_ffi_err("agents_new: count is too large");
     size_t bytes = count * DK_AG_SIZE;
+
+    // Validate the world BEFORE allocating anything.
+    double dp = as_number(world_ptr_val);
+    if (!(dp >= 1.0)) return dk_ffi_err("agents_new: null or invalid world pointer");   // 0, negative, NaN
+    const uint8_t* world = (const uint8_t*)(uintptr_t)(uint64_t)dp;
+    double dw = as_number(world_w_val), dh = as_number(world_h_val);
+    if (!(dw >= 1.0) || dw > 1.0e7 || dw != floor(dw) ||
+        !(dh >= 1.0) || dh > 1.0e7 || dh != floor(dh)) {
+        snprintf(msg, sizeof msg, "%s: world_w/world_h must be whole numbers in [1, 1e7]", who);
+        return dk_ffi_err(msg);
+    }
+    size_t W = (size_t)dw, H = (size_t)dh;
 
     // Use mem_alloc so the caller can mem_free the same size later.
     // (This calls into the runtime, not the GC.)
@@ -6657,15 +6697,16 @@ uint64_t donky_agents_new(uint64_t count_val) {
     }
     uint8_t* buf = (uint8_t*)(uintptr_t)(uint64_t)as_number(ptr);
 
-    // Place agents at random positions in a loose 512x128 box, above any world
-    // height we know about. This is deliberately not tied to a specific world size:
-    // the acceptance test is 512x256, but the function takes no world dimensions,
-    // so "the upper half" is a fixed 512x128 region. If you spawn against a world
-    // wider than 512, the right edge will be empty until agents wander into it.
     for (size_t i = 0; i < count; i++) {
         uint32_t r = dk_ag_rand((uint32_t)i, 1);
-        int32_t x = (int32_t)(r % 512);
-        int32_t y = (int32_t)((r >> 16) % 128);
+        int32_t x = (int32_t)(r % (uint32_t)W);          // random column in [0, world_w); W <= 1e7 fits
+        int32_t y = 0;                                   // all-air column -> row 0
+        for (size_t row = 0; row < H; row++) {           // first non-air cell from the top = surface
+            if (world[row * W + (size_t)x] != BLK_AIR) {
+                y = (row > 0) ? (int32_t)row - 1 : 0;    // one cell above it (row 0 surface clamps to 0)
+                break;
+            }
+        }
         dk_ag_set(buf, i, DK_AG_X,        x);
         dk_ag_set(buf, i, DK_AG_Y,        y);
         dk_ag_set(buf, i, DK_AG_VX,       0);

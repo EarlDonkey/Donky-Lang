@@ -124,13 +124,13 @@ pub const STDLIB_BUILTINS: [(&str, &str, usize); 110] = [
     ("tensor_rope_base", "donky_tensor_rope_base", 3),
     ("tensor_attention_decode", "donky_tensor_attention_decode", 7),
     ("world_gen",   "donky_world_gen",   6),   // ptr, w, h, seed, chunk_x, chunk_y
-    ("world_mesh",  "donky_world_mesh",  8),   // ptr, w, h, cam_x, cam_y, vw, vh, out_ptr
+    ("world_mesh",  "donky_world_mesh",  9),   // ptr, w, h, cam_x, cam_y, vw, vh, out_ptr, out_capacity
     ("world_set",   "donky_world_set",   6),   // ptr, w, h, x, y, block
     ("world_physics", "donky_world_physics", 4),
     ("tcp_write_bytes", "donky_tcp_write_bytes", 3),
-    ("agents_new",         "donky_agents_new",         1),
+    ("agents_new",         "donky_agents_new",         4),   // count, world_ptr, world_w, world_h
     ("agents_tick",        "donky_agents_tick",        6),
-    ("agents_render",      "donky_agents_render",      9),
+    ("agents_render",      "donky_agents_render",      7),
     ("agents_count_alive", "donky_agents_count_alive", 2),
     ("agents_kill",        "donky_agents_kill",        3),   // 3, not 2: added count
     ("agents_place_on_surface", "donky_agents_place_on_surface", 5),

@@ -40,6 +40,7 @@ const PENDING_BUILTINS: &[&str] = &["ptr_add"];
 /// Positions beyond 0 (marked below) are not in the written spec: they were read off the call sites
 /// in lib/world.donk and the table comments in aot.rs. `tcp_write_bytes` is an ASSUMED (conn, ptr, len).
 pub const RAW_PARAMS: &[(&str, &[usize])] = &[
+    ("agents_new", &[1]),
     // free functions
     ("mem_free", &[0]), ("munmap", &[0]), ("trainer_free", &[0]),
     // world / agents
